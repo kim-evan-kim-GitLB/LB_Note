@@ -23,11 +23,15 @@ from src.audio_io import load_audio  # noqa: E402
 from src.stt import get_backend  # noqa: E402
 
 AUDIO = Path("samples/ax과제회의(클로바노트)_음성파일.m4a")
-WINDOWS = [(20, 80, "보존(정상발화)"), (3100, 3160, "제거(반복97%)")]
+WINDOWS = [
+    (20, 80, "보존A(정상발화)"),
+    (50, 110, "보존B(정상발화)"),
+    (3100, 3160, "제거(반복97%)"),
+]
 CONFIGS = [
     ("baseline", {}),
     ("rp1.2", {"repetition_penalty": 1.2}),
-    ("rp1.3+norep3", {"repetition_penalty": 1.3, "no_repeat_ngram_size": 3}),
+    ("rp1.3", {"repetition_penalty": 1.3}),
 ]
 MAX_NEW_TOKENS = 512
 
