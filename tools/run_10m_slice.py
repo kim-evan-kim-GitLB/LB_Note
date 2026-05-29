@@ -31,6 +31,10 @@ OVERLAP_SEC = 5.0
 # pos_emb 인덱스 초과 → device-side assert (modeling_cohere_asr.py:387) 로 크래시했다.
 # 프롬프트 prefix 여유를 두고 1024 미만으로 cap → 크래시 차단 + 정상 출력 영향 없음.
 MAX_NEW_TOKENS = 1000
+# 반복 hallucination(무음/저정보 구간에서 greedy 디코더가 한 토큰에 갇힘) 억제.
+# A/B 검증(tools/test_rep_penalty.py): 최악 반복 구간(97%) → 0%, 정상 발화 보존.
+# 1.3+no_repeat_ngram_size 는 이름 garbling 증가 + 정당한 짧은 반복 손상 위험이라 1.2 단독 채택.
+REPETITION_PENALTY = 1.2
 ANSWER_JSON = Path("/home/evan/Claude_workspace/lb-note-archive/samples/ko_office_answer.json")
 SOURCE_DUR = 182.091
 GAP = 0.5
@@ -59,7 +63,9 @@ def transcribe_slice(backend, samples, sr, language="ko"):
     aci = inputs.get("audio_chunk_index")
     inputs = inputs.to(backend._model.device, dtype=backend._model.dtype)
     with torch.inference_mode():
-        outputs = backend._model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+        outputs = backend._model.generate(
+            **inputs, max_new_tokens=MAX_NEW_TOKENS, repetition_penalty=REPETITION_PENALTY
+        )
     text = backend._processor.decode(
         outputs, skip_special_tokens=True, audio_chunk_index=aci, language=language
     )

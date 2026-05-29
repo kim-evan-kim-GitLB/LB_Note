@@ -16,6 +16,9 @@ from src.types import Segment
 class CohereASRBackend(STTBackend):
     name = "cohere"
 
+    # 반복 hallucination 억제 (A/B 검증: 반복 97%→0%, 정상발화 보존). tools/test_rep_penalty.py 참조.
+    REPETITION_PENALTY = 1.2
+
     def __init__(self, model_path: Path, dtype: str = "bfloat16", quantization: str = ""):
         self.model_path = Path(model_path)
         self.dtype_name = dtype
@@ -86,7 +89,9 @@ class CohereASRBackend(STTBackend):
         inputs = inputs.to(self._model.device, dtype=self._model.dtype)
 
         with torch.inference_mode():
-            outputs = self._model.generate(**inputs, max_new_tokens=256)
+            outputs = self._model.generate(
+                **inputs, max_new_tokens=256, repetition_penalty=self.REPETITION_PENALTY
+            )
 
         text = self._processor.decode(
             outputs,
@@ -113,7 +118,9 @@ class CohereASRBackend(STTBackend):
         inputs = inputs.to(self._model.device, dtype=self._model.dtype)
 
         with torch.inference_mode():
-            outputs = self._model.generate(**inputs, max_new_tokens=512)
+            outputs = self._model.generate(
+                **inputs, max_new_tokens=512, repetition_penalty=self.REPETITION_PENALTY
+            )
 
         text = self._processor.decode(
             outputs,

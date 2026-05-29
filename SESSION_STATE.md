@@ -56,7 +56,15 @@ output/text-ax과제회의(클로바노트)_음성파일.json       ← 메타 +
 - 처리: 50.35분(3020.75s), RTFx 1.65, VRAM peak 4168MB, 100/100 청크, CUDA assert 0건
 - 한국어 회의 본문 정상 추출 확인
 
-**참고**: `answer/ax_tf_클로바.txt` 가 클로바노트 정답 transcript → 향후 WER 평가에 reference 로 사용 가능.
+**10분 슬라이스 결과 (2026-05-29, fix 검증 겸)**:
+```
+output/transcript-ax과제회의(클로바노트)_음성파일_slice10m.md   ← 본문 53,108자
+output/text-ax과제회의(클로바노트)_음성파일_slice10m.json
+```
+- 9/9 슬라이스 통과(크래시 0), elapsed 3470.8s, RTFx 1.44, VRAM peak 6032MB
+- 클로바 reference 대비 WER 0.890 / 반복 28.7% (60s pipeline 1.073 / 36.0% 보다 우위)
+
+**참고**: `answer/ax_tf_클로바.txt` 가 클로바노트 정답 transcript → WER 평가 reference (git 추적 포함).
 
 ---
 
@@ -75,9 +83,18 @@ output/text-ax과제회의(클로바노트)_음성파일.json       ← 메타 +
 
 ---
 
+## 반복 hallucination 제거 (✅ 2026-05-29 적용)
+
+A/B 검증(`tools/test_rep_penalty.py`, 2구간×3설정):
+- **3100-3160s (반복 97%)** → rp1.2 적용 시 **0%**, 묻혀있던 실제 발화 복구 (garbage 1526자 → 내용 377자)
+- **20-80s (정상 발화)** → 보존됨(오히려 더 완전). 오인식은 baseline에도 있던 모델 고유 현상.
+- `no_repeat_ngram_size=3` 은 이름 garbling↑ + 정당한 짧은 반복 손상 위험 → 제외, **`repetition_penalty=1.2` 단독 채택**.
+- 적용: `tools/run_10m_slice.py:REPETITION_PENALTY`, `src/backends/cohere.py:CohereASRBackend.REPETITION_PENALTY` (3개 generate 호출 전부).
+- 이 커밋이 **feat/vad 분기 base** (다른 세션이 이 위에서 VAD 분기·검증).
+
 ## 다음 할 일 (우선순위)
 
-1. **반복 hallucination 제거** (핵심): `src/backends/cohere.py` 와 `tools/run_10m_slice.py` 의 `generate()` 에 `repetition_penalty`(예 1.2) + `no_repeat_ngram_size`(예 3) 추가. 짧은 구간 A/B 로 정상발화 보존 확인 후 적용. 반복이 빠지면 절대 WER 이 비로소 의미를 가짐.
+1. **(검증) 전체 m4a 재실행**: rp1.2 적용본으로 9/9 통과 유지 + 전체 반복률 하락 + 속도 개선(루프 조기 종료) 확인. → 최종 transcript 갱신.
 2. **(선택) 합성 wav 회귀**: `long_synth_120m.wav` 재실행 → 13/13 + WER 0.054 유지 확인 (max_new 1000 이 합성 정상 청크를 truncate 안 하는지 — 이론상 안전하나 미검증).
 3. **VAD 통합** (다른 세션 논의 중): 무음 제거로 반복 트리거 자체 감소. `audio_io.load_audio` 직후 ~ `chunk_audio` 전에 삽입. 타임스탬프 재정렬 필요.
 
@@ -98,7 +115,7 @@ cd /home/evan/Claude_workspace/lb-note
 # 60s pipeline (현재 안전 경로)
 uv run python run.py "samples/<파일>" --pipeline --out output
 
-# 10분 슬라이스 (현재 2번째 슬라이스에서 깨짐 — 다음 세션 수정 대상)
+# 10분 슬라이스 (2026-05-29 fix 후 안정, 최고 정확도)
 uv run python tools/run_long_slice10m.py "samples/<파일>" --out output
 
 # 스모크: audio_io 로딩만 검증
@@ -110,9 +127,21 @@ uv run python run.py "samples/<파일>" --pipeline --reference "answer/ax_tf_클
 
 ---
 
+## 버전 관리 / 배포 (2026-05-29 신규)
+
+- **독립 git 레포** 로 init 완료 (`main` 브랜치). 워크스페이스 레포와 분리.
+- 추적: 코드·문서·설정 39개 파일(~660K) + `answer/ax_tf_클로바.txt`(평가 reference, 소유자 판단 포함).
+- **git 제외**: `models/`(3.9G)·`samples/`(음성, wav/m4a)·`output/`·`.env`·`.omc/`. `answer/*` 는 제외하되 클로바 정답 1건만 `!` 로 허용.
+- **데이터 이동 정책**: 모델·음성은 git 아닌 **Google Drive 로 별도 이동**. README 에 모델 다운로드(`CohereLabs/cohere-transcribe-03-2026`, `hf download`) 문서화.
+- **배포 계획**: GitHub **private** push 예정(코드만). 이후 Docker 이미지화(CUDA12.1 base, 4090 이전) — Dockerfile 미작성.
+- 미결정: 모델 bake vs 볼륨 / 앱코드 bake vs 마운트.
+
+---
+
 ## 관련 문서
 
-- 구현 플랜: `/home/evan/.claude/plans/10-sparkling-sparrow.md`
+- 사용법·모델 다운로드: `README.md` (이번 세션 신규)
+- 구현 플랜(⚠️ SUPERSEDED, 오진 보존용): `/home/evan/.claude/plans/10-sparkling-sparrow.md`
 - 모듈화 플랜: `docs/modularization-plan.md`
 - 청크 전략 실측: 메모리 `project-stt-chunking-cohere`
 - 프로젝트 개요: 메모리 `project-lb-note-phase0`
