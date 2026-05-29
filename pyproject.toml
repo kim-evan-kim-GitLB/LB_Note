@@ -1,0 +1,38 @@
+[project]
+name = "lb-note"
+version = "0.0.1"
+description = "Cohere transcribe-03-2026 전용 STT venv (transformers 5.x, trust_remote_code)"
+requires-python = ">=3.12"
+dependencies = [
+    "transformers==5.5.0",
+    "torch>=2.4,<2.6",
+    "accelerate>=1.0.0",
+    "bitsandbytes>=0.45.0",
+    "librosa>=0.11.0",
+    "soundfile>=0.13.1",
+    "sentencepiece>=0.2.1",
+    "protobuf>=7.35.0",
+    "python-dotenv>=1.2.2",
+    "safetensors>=0.7.0",
+    "tqdm>=4.67.3",
+    "nara-wpe>=0.0.11",
+    "matplotlib>=3.10.9",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.14",
+]

@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+.env.local
+output/
+!output/.gitkeep
+.idea/
+
+# 대용량 자산 — git 부적합 (별도 볼륨/복사로 관리)
+models/
+samples/
+*.zip
+*.wav
+*.m4a
+*.mp3
+
+# 평가용 reference: answer/ 내용물은 기본 제외하되, 회의 정답 transcript 1건은 소유자 판단으로 포함
+# (디렉토리째 'answer/' 로 제외하면 negation 이 안 먹으므로 'answer/*' 사용)
+answer/*
+!answer/ax_tf_클로바.txt
+
+# OMC 상태 / 시크릿 (커밋 금지)
+.omc/
+secrets.env
