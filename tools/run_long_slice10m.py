@@ -20,9 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch  # noqa: E402
 
+from src import config  # noqa: E402
 from src.audio_io import duration_seconds, load_audio  # noqa: E402
 from src.chunker import merge_segments  # noqa: E402
-from src.stt import get_backend  # noqa: E402
+from src.preprocess import preprocess, remap_time  # noqa: E402
+from src.stt import get_backend, get_enhancer, get_vad  # noqa: E402
 from src.types import Segment  # noqa: E402
 from tools.run_10m_slice import (  # noqa: E402
     MAX_NEW_TOKENS,
@@ -38,6 +40,9 @@ def main() -> int:
     ap.add_argument("audio", type=Path, help="입력 파일 (wav/mp3/mp4/m4a/etc.)")
     ap.add_argument("--out", type=Path, default=Path("output"), help="출력 디렉토리")
     ap.add_argument("--language", default="ko")
+    ap.add_argument("--dereverb", action="store_true", help="WPE dereverb 적용")
+    ap.add_argument("--denoise", action="store_true", help="GTCRN denoise 적용")
+    ap.add_argument("--vad", action="store_true", help="Silero VAD 무음압축 적용")
     args = ap.parse_args()
 
     args.out.mkdir(exist_ok=True)
@@ -49,7 +54,22 @@ def main() -> int:
     duration = duration_seconds(samples, sr)
     print(f"[slice10m] audio_load={load_elapsed:.1f}s duration={duration:.2f}s sr={sr}")
 
-    slices = slice_audio(samples, sr, SLICE_SEC, OVERLAP_SEC)
+    # 프론트엔드 전처리 (opt-in, 기본 OFF). pipeline 과 동일한 공유 모듈.
+    enhancers = [n for n, on in (("wpe", args.dereverb), ("gtcrn", args.denoise)) if on]
+    pre = preprocess(
+        samples, sr,
+        enhancers=[get_enhancer(n) for n in enhancers],
+        vad=get_vad("silero" if args.vad else None),
+        vad_pad_sec=config.VAD_PAD_SEC,
+        vad_max_silence_sec=config.VAD_MAX_SILENCE_SEC,
+    )
+    if pre.applied:
+        print(f"[slice10m] preprocess applied={pre.applied} "
+              f"{pre.original_sec:.1f}s→{pre.compressed_sec:.1f}s "
+              f"speech_regions={len(pre.speech_regions)}")
+    proc_samples = pre.samples
+
+    slices = slice_audio(proc_samples, sr, SLICE_SEC, OVERLAP_SEC)
     print(f"[slice10m] n_slices={len(slices)} (slice={SLICE_SEC}s overlap={OVERLAP_SEC}s)")
 
     backend = get_backend("cohere")
@@ -87,6 +107,15 @@ def main() -> int:
         backend.unload()
 
     merged = merge_segments(raw_segments)
+    # VAD 무음압축 시 슬라이스 타임스탬프(압축 타임라인) → 원본 타임라인 remap
+    merged = [
+        Segment(
+            start=round(remap_time(pre.offset_map, s.start), 2),
+            end=round(remap_time(pre.offset_map, s.end), 2),
+            text=s.text, confidence=s.confidence, speaker=s.speaker, meta=s.meta,
+        )
+        for s in merged
+    ]
     transcript = " ".join(s.text for s in merged if s.text).strip()
     rtfx = duration / elapsed if elapsed > 0 else None
     print(
@@ -103,6 +132,11 @@ def main() -> int:
             "source_path": str(args.audio),
             "duration_seconds": round(duration, 2),
             "audio_load_seconds": round(load_elapsed, 2),
+        },
+        "preprocess": {
+            "applied": pre.applied,
+            "n_speech_regions": len(pre.speech_regions),
+            "compressed_seconds": pre.compressed_sec,
         },
         "pipeline": {
             "slice_sec": SLICE_SEC,

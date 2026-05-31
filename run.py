@@ -26,15 +26,23 @@ def main() -> int:
                     help="출력 디렉토리. 지정 시 자동으로 파이프라인 모드")
     ap.add_argument("--chunk-sec", type=float, default=60.0)
     ap.add_argument("--overlap-sec", type=float, default=10.0)
+    ap.add_argument("--dereverb", action="store_true", help="WPE dereverb 적용(파이프라인)")
+    ap.add_argument("--denoise", action="store_true", help="GTCRN denoise 적용(파이프라인)")
+    ap.add_argument("--vad", action="store_true", help="Silero VAD 무음압축 적용(파이프라인)")
     args = ap.parse_args()
 
     if not args.audio.exists():
         print(f"입력 파일 없음: {args.audio}", file=sys.stderr)
         return 2
 
-    use_pipeline = args.pipeline or args.reference is not None or args.out is not None
+    # 전처리 플래그가 있으면 자동으로 파이프라인 모드
+    use_pipeline = (
+        args.pipeline or args.reference is not None or args.out is not None
+        or args.dereverb or args.denoise or args.vad
+    )
     if use_pipeline:
         from src.pipeline import run_pipeline
+        enhancers = [n for n, on in (("wpe", args.dereverb), ("gtcrn", args.denoise)) if on]
         run_pipeline(
             audio_path=args.audio,
             reference_path=args.reference,
@@ -42,6 +50,8 @@ def main() -> int:
             chunk_sec=args.chunk_sec,
             overlap_sec=args.overlap_sec,
             language=args.language,
+            enhancers=enhancers,
+            vad="silero" if args.vad else None,
         )
         return 0
 
