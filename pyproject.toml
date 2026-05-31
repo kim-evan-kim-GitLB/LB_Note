@@ -17,10 +17,14 @@ dependencies = [
     "tqdm>=4.67.3",
     "nara-wpe>=0.0.11",
     "matplotlib>=3.10.9",
+    "silero-vad>=5.1",
+    "torchaudio>=2.5,<2.6",
+    "einops>=0.7",
 ]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu121" }
+torchaudio = { index = "pytorch-cu121" }
 
 [[tool.uv.index]]
 name = "pytorch-cu121"

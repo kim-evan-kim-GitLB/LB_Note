@@ -12,6 +12,7 @@ output/
 # 대용량 자산 — git 부적합 (별도 볼륨/복사로 관리)
 models/
 samples/
+/samples
 *.zip
 *.wav
 *.m4a

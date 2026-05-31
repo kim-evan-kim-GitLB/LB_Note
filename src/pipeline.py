@@ -18,10 +18,11 @@ from src.chunker import (
     chunk_audio,
     merge_segments,
 )
-from src.stt import get_backend
+from src.preprocess import PreprocessResult, preprocess, remap_time
+from src.stt import get_backend, get_enhancer, get_vad
 from src.types import Segment
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 def _build_payload(
@@ -36,6 +37,7 @@ def _build_payload(
     vram_peak: int | None,
     merged: list[Segment],
     transcript: str,
+    pre: PreprocessResult | None = None,
 ) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -50,6 +52,11 @@ def _build_payload(
             "backend": backend_name,
             "name": Path(str(config.COHERE_MODEL_PATH)).name,
             "quantization": backend_quant or "bf16",
+        },
+        "preprocess": {
+            "applied": pre.applied if pre else [],
+            "n_speech_regions": len(pre.speech_regions) if pre else 0,
+            "compressed_seconds": pre.compressed_sec if pre else round(duration, 3),
         },
         "pipeline": {
             "chunk_seconds": chunk_sec,
@@ -82,6 +89,8 @@ def run_pipeline(
     overlap_sec: float = DEFAULT_OVERLAP_SEC,
     backend_name: str = "cohere",
     language: str | None = None,
+    enhancers: list[str] | None = None,
+    vad: str | None = None,
 ) -> dict:
     out_dir = Path(out_dir) if out_dir else config.OUTPUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -93,7 +102,23 @@ def run_pipeline(
     duration = duration_seconds(samples, sr)
     print(f"[pipeline] duration={duration:.2f}s sr={sr}")
 
-    chunks = chunk_audio(samples, sr=sr, chunk_sec=chunk_sec, overlap_sec=overlap_sec)
+    # 프론트엔드 전처리 (opt-in). 기본값이면 no-op → 기존 동작 보존.
+    enhancers = enhancers if enhancers is not None else config.parse_enhancers(config.ENHANCERS)
+    vad = vad if vad is not None else (config.VAD_BACKEND or None)
+    pre = preprocess(
+        samples, sr,
+        enhancers=[get_enhancer(n) for n in enhancers],
+        vad=get_vad(vad),
+        vad_pad_sec=config.VAD_PAD_SEC,
+        vad_max_silence_sec=config.VAD_MAX_SILENCE_SEC,
+    )
+    if pre.applied:
+        print(f"[pipeline] preprocess applied={pre.applied} "
+              f"{pre.original_sec:.1f}s→{pre.compressed_sec:.1f}s "
+              f"speech_regions={len(pre.speech_regions)}")
+    proc_samples = pre.samples
+
+    chunks = chunk_audio(proc_samples, sr=sr, chunk_sec=chunk_sec, overlap_sec=overlap_sec)
     print(f"[pipeline] n_chunks={len(chunks)} (chunk={chunk_sec}s, overlap={overlap_sec}s)")
 
     config.assert_cuda_or_raise()
@@ -121,6 +146,16 @@ def run_pipeline(
         backend.unload()
 
     merged = merge_segments(raw_segments)
+    # VAD 무음압축 시 청크 타임스탬프는 압축 타임라인 → 원본 타임라인으로 remap
+    # (offset_map 항등이면 no-op). 향후 diarization 정렬 호환.
+    merged = [
+        Segment(
+            start=round(remap_time(pre.offset_map, s.start), 2),
+            end=round(remap_time(pre.offset_map, s.end), 2),
+            text=s.text, confidence=s.confidence, speaker=s.speaker, meta=s.meta,
+        )
+        for s in merged
+    ]
     transcript = " ".join(s.text for s in merged if s.text).strip()
 
     payload = _build_payload(
@@ -135,6 +170,7 @@ def run_pipeline(
         vram_peak=vram_peak,
         merged=merged,
         transcript=transcript,
+        pre=pre,
     )
 
     if reference_path:
@@ -190,11 +226,16 @@ def main() -> int:
     ap.add_argument("--chunk-sec", type=float, default=DEFAULT_CHUNK_SEC)
     ap.add_argument("--overlap-sec", type=float, default=DEFAULT_OVERLAP_SEC)
     ap.add_argument("--language", default=config.STT_LANGUAGE)
+    ap.add_argument("--dereverb", action="store_true", help="WPE dereverb 적용")
+    ap.add_argument("--denoise", action="store_true", help="GTCRN denoise 적용")
+    ap.add_argument("--vad", action="store_true", help="Silero VAD 무음압축 적용")
     args = ap.parse_args()
 
     if not args.audio.exists():
         print(f"입력 파일 없음: {args.audio}", file=sys.stderr)
         return 2
+
+    enhancers = [n for n, on in (("wpe", args.dereverb), ("gtcrn", args.denoise)) if on]
 
     run_pipeline(
         audio_path=args.audio,
@@ -203,6 +244,8 @@ def main() -> int:
         chunk_sec=args.chunk_sec,
         overlap_sec=args.overlap_sec,
         language=args.language,
+        enhancers=enhancers,
+        vad="silero" if args.vad else None,
     )
     return 0
 

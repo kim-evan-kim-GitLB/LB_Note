@@ -1,0 +1,39 @@
+# 빌드 컨텍스트에서 제외 (이미지에 안 들어가야 하거나 불필요한 것)
+# 주의: models/ 는 *제외하지 않음* — 모델을 bake 해야 하므로 컨텍스트에 포함되어야 함.
+
+# 로컬 가상환경 (호스트 arch 의 venv 가 이미지에 섞이면 안 됨)
+.venv/
+
+# git / 메타
+.git/
+.gitignore
+.dockerignore
+
+# 파이썬 캐시
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# 에디터 / OMC / 시크릿
+.vscode/
+.idea/
+.omc/
+.env
+.env.local
+secrets.env
+
+# 런타임 산출물 / 대용량 입력 (입력 음성은 런타임에 볼륨 마운트)
+output/
+samples/
+*.wav
+*.m4a
+*.mp3
+*.aac
+*.amr
+
+# 평가 reference / 문서 (이미지에 불필요)
+answer/
+docs/
+*.md
