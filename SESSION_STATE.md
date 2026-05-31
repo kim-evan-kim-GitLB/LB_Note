@@ -9,8 +9,12 @@
 
 - **목표**: 다양한 음성 파일을 Cohere transcribe 모델로 텍스트 변환하는 파이프라인.
 - **현재 상태**: m4a 회의 음성(83.2분) transcript 확보 — 60s pipeline + **10분 슬라이스 둘 다 동작**.
-- **✅ 해결됨 (2026-05-29)**: 10분 슬라이스 2번째 슬라이스 CUDA assert. **진짜 원인은 "mask invariant"가 아니라 디코더 position embedding(1024행) 인덱스 초과** — 반복 루프 청크가 max_new_tokens=4096 동안 1024 토큰을 넘겨서 발생. fix = `MAX_NEW_TOKENS 4096→1000`. m4a 9/9 통과 검증.
-- **다음 할 일**: 반복 hallucination 제거(`repetition_penalty`/`no_repeat_ngram_size`). 두 모드 모두 반복 28~36% 잔존 → 절대 WER 무의미. + (선택) 합성 wav 회귀 13/13 재확인.
+- **✅ 해결됨 (2026-05-29) — 2가지 모두 완료**:
+  1. **10분 슬라이스 CUDA assert**: 진짜 원인 = 디코더 position embedding(1024행) 인덱스 초과(기존 mask-invariant 진단은 오진). fix = `MAX_NEW_TOKENS 4096→1000`. m4a 9/9 통과.
+  2. **반복 hallucination**: `repetition_penalty=1.2` (1.3 불필요 검증). 반복 28.7→0%, WER 0.890→0.529, RTFx 1.44→2.75.
+  - 공정 비교(rp1.2 동일조건): 10분슬라이스(0.529/0%) > 60s pipeline(0.652/3%) = 청크 경계 적을수록 좋은 구조적 이점.
+- **현재 git**: 독립 레포 `main`, HEAD `421f7ae`. feat/vad 분기 base = `677c4ff`(=10분청킹+rp1.2). push 보류(VAD 후).
+- **다음 할 일**: ① feat/vad 분기(다른 세션) ② GitHub private push(VAD 후) ③ Dockerfile(모델 bake vs 볼륨 미결정) ④ (선택) 합성 wav 회귀 13/13 재확인.
 
 ---
 
