@@ -5,7 +5,6 @@ description = "Cohere transcribe-03-2026 전용 STT venv (transformers 5.x, trus
 requires-python = ">=3.12"
 dependencies = [
     "transformers==5.5.0",
-    "torch>=2.4,<2.6",
     "accelerate>=1.0.0",
     "bitsandbytes>=0.45.0",
     "librosa>=0.11.0",
@@ -18,17 +17,37 @@ dependencies = [
     "nara-wpe>=0.0.11",
     "matplotlib>=3.10.9",
     "silero-vad>=5.1",
-    "torchaudio>=2.5,<2.6",
     "einops>=0.7",
 ]
 
+# torch/torchaudio 는 GPU 아키텍처별 휠이 달라 상호 배타 extra 로 분리.
+#   cu121 → RTX 4090 (Ada, 160 서버),  cu128 → RTX PRO 6000 (Blackwell, 171 서버)
+# 로컬/도커 모두 반드시 한쪽 선택: `uv sync --extra cu121` 또는 `--extra cu128`.
+[project.optional-dependencies]
+cu121 = ["torch>=2.4,<2.6", "torchaudio>=2.5,<2.6"]
+cu128 = ["torch>=2.7", "torchaudio>=2.7"]
+
+[tool.uv]
+conflicts = [[{ extra = "cu121" }, { extra = "cu128" }]]
+
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
-torchaudio = { index = "pytorch-cu121" }
+torch = [
+    { index = "pytorch-cu121", extra = "cu121" },
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+torchaudio = [
+    { index = "pytorch-cu121", extra = "cu121" },
+    { index = "pytorch-cu128", extra = "cu128" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu121"
 url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.ruff]

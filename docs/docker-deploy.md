@@ -32,9 +32,11 @@ mkdir -p models/gtcrn && cp /tmp/gtcrn_src/checkpoints/model_trained_on_dns3.tar
 
 ## 2. 빌드
 ```bash
-./docker/build.sh cu121     # 160용 (현재 pyproject 그대로)
-./docker/build.sh cu128     # 171용 (※ Phase 1: cu128 extra + relock 선행 필요)
+./docker/build.sh cu121     # 160용 (torch 2.5/cu121, --extra cu121)
+./docker/build.sh cu128     # 171용 (torch 2.7+/cu128, --extra cu128)
 ```
+> cu121/cu128 extras 는 `pyproject.toml` 에 설정 완료, `uv.lock` 에 양쪽 변종 포함됨.
+> cu121 은 노트북에서 빌드 검증 완료(14.1GB). cu128 은 **Blackwell GPU(171)에서 런타임 검증 필요**.
 
 ## 3. 171 로 이미지 전송 (모델이 이미지 안에 있으니 이미지만 옮기면 됨)
 ```bash
@@ -61,14 +63,17 @@ IMAGE=lb-note:cu128 ./docker/run.sh \
 - 모델은 안 바뀌는 고정 릴리스라 재빌드 부담 없음(모델 레이어 캐시 고정 → 코드 수정 시 몇 초 재빌드).
 - 모델만 따로 빼고 싶어지면 .dockerignore 에 `models/` 추가 + 런타임 `-v` 볼륨 마운트로 전환 가능.
 
-## cu128(171) 선결 작업 — Phase 1
-현재 `pyproject.toml` 은 `torch>=2.4,<2.6` + cu121 고정이라 Blackwell 에서 안 돎.
-cu128 빌드 전에 conflicting extras 로 재구성 + `uv lock` 재생성 필요:
+## cu128(171) 멀티 CUDA extras — ✅ 설정 완료
+`pyproject.toml` 에 conflicting extras + extra별 index 매핑 적용, `uv.lock` 재생성 완료:
 ```toml
 [project.optional-dependencies]
-cu121 = ["torch>=2.4,<2.6", "torchaudio>=2.5,<2.6"]
-cu128 = ["torch>=2.7",      "torchaudio>=2.7"]
+cu121 = ["torch>=2.4,<2.6", "torchaudio>=2.5,<2.6"]   # → torch 2.5.1+cu121
+cu128 = ["torch>=2.7",      "torchaudio>=2.7"]          # → torch 2.11.0+cu128
 [tool.uv]
 conflicts = [[{ extra = "cu121" }, { extra = "cu128" }]]
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu121", extra = "cu121" }, { index = "pytorch-cu128", extra = "cu128" }]
 ```
-이후 `uv sync --extra cu128` 로 한 번 WER 동일성 검증(handoff §5: trust_remote_code, GTCRN istft).
+- 로컬 dev: `uv sync --extra cu121` (extra 없이는 torch 미설치).
+- cu121 검증: `--extra cu121` → torch 2.5.1+cu121 (기존과 동일, 회귀 0) 확인됨.
+- **남은 검증(171에서)**: `--extra cu128` 빌드 후 Blackwell 런타임 + WER 동일성(handoff §5: trust_remote_code, GTCRN istft).

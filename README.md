@@ -22,9 +22,12 @@
 ```bash
 # 시스템 의존성
 sudo apt-get install -y ffmpeg
-# 파이썬 의존성 (torch cu121 인덱스 포함, pyproject.toml/uv.lock 기준)
-uv sync
+# 파이썬 의존성 — torch/torchaudio 는 GPU 별 extra 라 반드시 하나 선택:
+uv sync --extra cu121    # RTX 4090 등 Ada (CUDA 12.1)
+# uv sync --extra cu128  # RTX PRO 6000 등 Blackwell (CUDA 12.8+)
 ```
+
+> `uv sync` (extra 없이) 는 torch 가 설치되지 않습니다 — 멀티 GPU 지원 위해 cu121/cu128 을 상호 배타 extra 로 분리했기 때문.
 
 ---
 

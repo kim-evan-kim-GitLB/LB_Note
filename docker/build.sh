@@ -16,13 +16,13 @@ VARIANT="${1:-cu121}"
 case "$VARIANT" in
   cu121)
     BASE="nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04"
-    EXTRA=""
+    EXTRA="cu121"
     ;;
   cu128)
     BASE="nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04"
     EXTRA="cu128"
-    echo ">> cu128 은 pyproject.toml 에 [cu128] extra + uv.lock 재생성이 선행되어야 합니다."
-    echo ">> (아직 안 했으면 빌드가 'unknown extra' 로 실패합니다 — Phase 1 먼저.)"
+    echo ">> cu128: torch 2.7+/cu128 로 빌드됩니다(Blackwell). lock 에 cu128 변종 포함됨."
+    echo ">> 실제 런타임 동작은 Blackwell GPU(171)에서 검증 필요 — 노트북엔 해당 GPU 없음."
     ;;
   *)
     echo "usage: $0 [cu121|cu128]" >&2; exit 1

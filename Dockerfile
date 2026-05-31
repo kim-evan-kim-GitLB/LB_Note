@@ -3,7 +3,7 @@
 # lb-note — Cohere STT 파이프라인 (모델 bake 포함, 자기완결 이미지)
 #
 # 빌드 변종:
-#   cu121 (RTX 4090 / Ada)      : BASE_IMAGE=nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04, TORCH_EXTRA=""
+#   cu121 (RTX 4090 / Ada)      : BASE_IMAGE=nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04, TORCH_EXTRA="cu121"
 #   cu128 (RTX PRO 6000 / Blackwell): BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04, TORCH_EXTRA="cu128"
 #
 # 빌드는 docker/build.sh 로 하는 것을 권장.
@@ -14,8 +14,9 @@
 ARG BASE_IMAGE=nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 FROM ${BASE_IMAGE}
 
-# 어느 torch extra 로 동기화할지. ""=현재 pyproject(cu121) 그대로, "cu128"=Blackwell용 extra(별도 셋업 필요)
-ARG TORCH_EXTRA=""
+# 어느 torch extra 로 동기화할지 (pyproject 의 optional-dependencies). cu121=Ada, cu128=Blackwell.
+# torch/torchaudio 는 base deps 가 아닌 extra 라 반드시 하나 지정해야 설치됨.
+ARG TORCH_EXTRA=cu121
 
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy \
