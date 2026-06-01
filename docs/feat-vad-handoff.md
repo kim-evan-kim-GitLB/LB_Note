@@ -128,7 +128,7 @@ uv run python tools/score_frontend.py output/<dir>/text-*.json --label "<라벨>
 
 ## 6. 남은 작업 (우선순위)
 
-1. **🔴 풀스택 83분 전체 완주** — 로컬 팅김으로 미완. **Docker 환경**에서 `tools/run_long_slice10m.py "samples/ax...m4a" --dereverb --denoise --vad` 완주 → `score_frontend.py` 로 클로바 ref WER 측정. **rp1.2 baseline(메모리상 10분슬라이스 0.529) 대비 Δ 확정**이 목표.
+1. **✅ 풀스택 83분 전체 완주 — 완료(2026-06-01)**. 160(cu121)·171(cu128) docker 양쪽에서 `tools/run_long_slice10m.py "samples/ax...m4a" --dereverb --denoise --vad` 9/9 슬라이스 완주(크래시 0). `score_frontend.py` 채점 결과 **WER 160=0.4460 / 171=0.4467 (클로바 baseline 0.529 대비 Δ-0.083), CER 0.325, rep 0%, tok_ratio 0.927**. 풀스택(WPE+GTCRN+VAD) 개선 확정 + 양 서버 parity. 상세 `docs/2026-06-01-server-deploy-validation.md`.
 2. **🟡 Dockerfile** — 미결정: **모델 bake vs 볼륨**. 권장 = **하이브리드**(Cohere 3.9G 볼륨 마운트, GTCRN 566KB·코드 bake, Silero 는 런타임 캐시/오프라인 주의). GPU 런타임(`--gpus all`), CUDA 12.1 base.
 3. **🟡 feat/vad 커밋** — 아직 미커밋. `samples` 심볼릭 링크 제외하고 add. 커밋 메시지에 담당자/행번호 표현 금지(워크스페이스 규칙).
 4. **🟢 GitHub private push** — VAD 완료 후(다른 세션 대기 항목).

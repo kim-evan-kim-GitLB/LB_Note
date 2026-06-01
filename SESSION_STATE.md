@@ -1,7 +1,7 @@
 # SESSION STATE — lb-note STT 작업 이어가기
 
 > 세션을 정리하고 돌아와도 이 문서만 읽으면 작업을 그대로 이어갈 수 있도록 정리한 진행 노트.
-> 최종 갱신: 2026-05-29
+> 최종 갱신: 2026-06-01
 
 ---
 
@@ -14,7 +14,8 @@
   2. **반복 hallucination**: `repetition_penalty=1.2` (1.3 불필요 검증). 반복 28.7→0%, WER 0.890→0.529, RTFx 1.44→2.75.
   - 공정 비교(rp1.2 동일조건): 10분슬라이스(0.529/0%) > 60s pipeline(0.652/3%) = 청크 경계 적을수록 좋은 구조적 이점.
 - **현재 git**: 독립 레포 `main`, HEAD `421f7ae`. feat/vad 분기 base = `677c4ff`(=10분청킹+rp1.2). push 보류(VAD 후).
-- **다음 할 일**: ① feat/vad 분기(다른 세션) ② GitHub private push(VAD 후) ③ Dockerfile(모델 bake vs 볼륨 미결정) ④ (선택) 합성 wav 회귀 13/13 재확인.
+- **✅ 2026-06-01 서버 배포·풀스택 검증 완료**: 160(RTX4090/cu121)·171(Blackwell/cu128) 양쪽 docker에서 풀스택(`--dereverb --denoise --vad`) 83분 완주(9/9, 크래시 0). **WER 160=0.4460 / 171=0.4467 (클로바 baseline 0.529 대비 Δ-0.083), rep 0%, parity 확인.** GPU ASR 속도: 4090=rtfx 335(14.9s) vs Blackwell=rtfx 354(14.1s) → 171이 ~5% 빠름(단 전체 wall-time은 CPU WPE 전처리가 지배라 사실상 비슷). 상세 `docs/2026-06-01-server-deploy-validation.md`.
+- **다음 할 일**: ① (선택) 합성 wav 회귀 13/13 재확인 ② 단계격리 A/B(전체, +GTCRN/+WPE/+VAD) ③ 운영: 컨테이너 재생성 시 데이터·`.env` 재배포(서버 노트 참조).
 
 ---
 
