@@ -65,6 +65,13 @@ docker cp /home/evan/LB_note_data/answer/. lbnote_dev:/app/answer/
 # .env 는 /app 경로로 교정해서 주입 (위 §4)
 ```
 
+## 6. 레포 이전 (2026-06-01)
+
+- 구 `litbig-git/LB_Note` 는 회사 정책 확정 전까지 **폐기 예정** → 관리는 **`kim-evan-kim-GitLB/LB_Note`** (https://github.com/kim-evan-kim-GitLB/LB_Note.git) 로 이전.
+- 로컬·160·171 의 `origin` 전부 신 레포로 전환 완료(HEAD 동기).
+- ⚠️ **서버 deploy key**: GitHub deploy key 는 키당 1레포 제약이라 구 키(`id_ed25519_lbnote`, 옛 레포 묶임)를 재사용 불가 → 서버마다 **신규 키 `id_ed25519_lbnote_new` 발급**, 신 레포에 read-only deploy key 등록(server-160-4090 / server-171-blackwell). 각 서버 repo 는 `git config core.sshCommand "ssh -i ~/.ssh/id_ed25519_lbnote_new -o IdentitiesOnly=yes"` 로 신 키 사용.
+- 레포 내 파일엔 옛 URL 하드코딩 없음(docker 스크립트는 `~/LB_Note` 경로만 참조) → 코드 수정 불필요.
+
 ## 관련
 - WER/청크 전략: 메모리 `project-stt-chunking-cohere`, `SESSION_STATE.md`
 - feat/vad: `docs/feat-vad-handoff.md`
