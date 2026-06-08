@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import tempfile
@@ -38,6 +39,7 @@ from src.postprocess.backends.base import LLMBackend, LLMCapabilities
 
 DEFAULT_MODEL = "sonnet"
 DEFAULT_TIMEOUT = 120
+DEFAULT_RETRIES = 2  # 일시 실패(타임아웃/비정상종료) 시 재시도 횟수. 긴 배치 보호용.
 
 
 def _join_role(messages: list[dict], role: str) -> str:
@@ -115,35 +117,52 @@ class AgentCLIBackend(LLMBackend):
             )
 
         timeout = int(os.environ.get("AGENT_CLI_TIMEOUT", DEFAULT_TIMEOUT))
+        retries = int(os.environ.get("AGENT_CLI_RETRIES", DEFAULT_RETRIES))
         # 오케스트레이션 노이즈/지연 차단: OMC 킬스위치 + 중립 cwd(프로젝트 CLAUDE.md 회피).
         sub_env = dict(os.environ)
         sub_env.setdefault("DISABLE_OMC", "1")
         sub_env.setdefault("OMC_SKIP_HOOKS", "1")
-        try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                env=sub_env,
-                cwd=tempfile.gettempdir(),
-            )
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError(
-                f"agent_cli 호출이 {timeout}s 안에 끝나지 않았습니다(AGENT_CLI_TIMEOUT). "
-                f"program={program}"
-            ) from e
+        # .venv 가 root 소유라 파이프라인은 sudo(root)로 돌지만, claude OAuth 자격증명은
+        # 호출자(evan) 소유다. root 의 HOME(/root)에선 못 찾아 "Not logged in"(exit 1) →
+        # SUDO_USER 의 HOME 으로 교정해 구독 인증을 살린다(claude 가 ~user/.claude 를 읽음).
+        sudo_user = os.environ.get("SUDO_USER")
+        if os.geteuid() == 0 and sudo_user:
+            try:
+                sub_env["HOME"] = pwd.getpwnam(sudo_user).pw_dir
+            except KeyError:
+                pass
 
-        if proc.returncode != 0:
-            err = (proc.stderr or "").strip()[:500]
-            raise RuntimeError(
-                f"agent_cli 호출 실패(exit={proc.returncode}, program={program}): {err}"
-            )
+        # 일시 실패(타임아웃/비정상종료)는 재시도. 긴 배치(수백 콜)가 한 번의 blip 으로
+        # 통째로 죽지 않게 한다(설계 §: backend 재요청 훅). 소진하면 RuntimeError 로 드러냄.
+        last_err = ""
+        for attempt in range(retries + 1):
+            try:
+                proc = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                    env=sub_env,
+                    cwd=tempfile.gettempdir(),
+                    # claude -p 는 stdin 을 읽으려 대기한다(positional prompt 가 있어도).
+                    # EOF 를 즉시 줘서 "no stdin data received in 3s" 지연/실패 차단.
+                    stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired:
+                last_err = f"타임아웃({timeout}s)"
+                continue
+            if proc.returncode != 0:
+                last_err = f"exit={proc.returncode}: {(proc.stderr or '').strip()[:300]}"
+                continue
+            # claude -p --output-format text 는 모델 본문만 stdout 으로 낸다. 양끝 공백만
+            # 제거. 구분자(<<<SEGMENT>>>)가 echo 되면 CleanStage 가 _unwrap 한다. 빈
+            # 출력은 에러로 보지 않는다(CleanStage 가 original 로 폴백) — 재시도 낭비 방지.
+            return (proc.stdout or "").strip()
 
-        # claude -p --output-format text 는 모델 본문만 stdout 으로 낸다.
-        # 양끝 공백만 제거. 구분자(<<<SEGMENT>>>)가 echo 되면 CleanStage 가 _unwrap 한다.
-        return (proc.stdout or "").strip()
+        raise RuntimeError(
+            f"agent_cli 호출 실패(program={program}, {retries + 1}회 시도): {last_err}"
+        )
 
     def capabilities(self) -> LLMCapabilities:
         """claude CLI 기준 능력.
