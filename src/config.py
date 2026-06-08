@@ -45,6 +45,22 @@ GTCRN_MODEL_PATH = Path(
     )
 )
 
+# --- P2 반복-환각 collapse (결정적 후처리 백스톱, 기본 ON) ---
+# "1"=on. 디코딩 분포 불변, 임계 미만 no-op라 켜두는 게 안전(정상 발화 보존).
+REPETITION_GUARD = os.getenv("REPETITION_GUARD", "1") not in ("", "0", "false", "False")
+# 연속 반복을 이 횟수까지 허용("하 하 하"); 초과분만 접음.
+REPETITION_MAX_REPEAT = int(os.getenv("REPETITION_MAX_REPEAT", "3"))
+# 폭주 길이 제한: VAD 청크 길이(초)×이 값 = max_new_tokens 상한(폭주를 짧게 자름).
+REPETITION_TOKENS_PER_SEC = int(os.getenv("REPETITION_TOKENS_PER_SEC", "16"))
+REPETITION_MNT_FLOOR = int(os.getenv("REPETITION_MNT_FLOOR", "256"))
+REPETITION_MNT_CEIL = int(os.getenv("REPETITION_MNT_CEIL", "1024"))
+
+# --- P5 증거기반 향상 라우팅 (opt-in, 기본 OFF) ---
+# "1"=on. 켜면 enhancers 명시 안 했을 때만 품질 측정→decide_enhancers 로 자동 선택.
+AUTO_ENHANCE = os.getenv("AUTO_ENHANCE", "") not in ("", "0", "false", "False")
+AUTO_ENHANCE_SNR_LO = float(os.getenv("AUTO_ENHANCE_SNR_LO", "12.0"))
+AUTO_ENHANCE_CUTOFF_OK_HZ = float(os.getenv("AUTO_ENHANCE_CUTOFF_OK_HZ", "7000.0"))
+
 
 def parse_enhancers(spec: str | None) -> list[str]:
     """ENHANCERS 스펙 문자열 → 정규화된 이름 리스트."""

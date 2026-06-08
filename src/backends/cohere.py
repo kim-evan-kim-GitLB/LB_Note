@@ -138,6 +138,68 @@ class CohereASRBackend(STTBackend):
             text=text.strip(),
         )]
 
+    def transcribe_arrays(
+        self,
+        audios: list[np.ndarray],
+        sr: int = 16000,
+        start_offsets: list[float] | None = None,
+        language: str = "Korean",
+        batch_size: int = 8,
+        max_new_tokens: int = 1024,
+    ) -> list[Segment]:
+        """청크 배열들을 배치로 디코딩(순서 보존). 청크당 Segment 1개 반환.
+
+        tools/vad_chunk_ax_clova.py 의 decode_chunks 포팅. 각 청크 ≤target<35s 라
+        내부 재분할 없음(배치 row 1개 = 청크 1개). greedy 라 배치 여부와 결과 무관.
+        batch_size<=1 이면 단일 경로(decode_chunk 미러) 폴백.
+        """
+        assert self._model is not None and self._processor is not None, "load() 먼저 호출"
+        lang = "ko" if language.lower() in ("korean", "ko") else language.lower()
+        n = len(audios)
+        offsets = start_offsets if start_offsets is not None else [0.0] * n
+        texts: list[str] = []
+
+        if batch_size <= 1:                       # 안전 폴백(단일 경로)
+            for cw in audios:
+                inputs = self._processor(
+                    cw, sampling_rate=sr, return_tensors="pt", language=lang
+                )
+                aci = inputs.get("audio_chunk_index")
+                inputs = inputs.to(self._model.device, dtype=self._model.dtype)
+                with torch.inference_mode():
+                    outputs = self._model.generate(
+                        **inputs, max_new_tokens=max_new_tokens,
+                        repetition_penalty=self.REPETITION_PENALTY,
+                    )
+                text = self._processor.decode(
+                    outputs, skip_special_tokens=True,
+                    audio_chunk_index=aci, language=lang,
+                )
+                if isinstance(text, list):
+                    text = text[0] if text else ""
+                texts.append(text.strip())
+        else:
+            for i in range(0, n, batch_size):
+                batch = audios[i:i + batch_size]
+                inputs = self._processor(
+                    batch, sampling_rate=sr, return_tensors="pt", language=lang
+                )
+                inputs = inputs.to(self._model.device, dtype=self._model.dtype)
+                with torch.inference_mode():
+                    outputs = self._model.generate(
+                        **inputs, max_new_tokens=max_new_tokens,
+                        repetition_penalty=self.REPETITION_PENALTY,
+                    )
+                decoded = self._processor.batch_decode(outputs, skip_special_tokens=True)
+                texts.extend((t or "").strip() for t in decoded)
+                print(f"[pipeline]   decoded {min(i + batch_size, n)}/{n}")
+
+        segments: list[Segment] = []
+        for audio, off, text in zip(audios, offsets, texts):
+            duration = len(audio) / float(sr)
+            segments.append(Segment(start=off, end=off + duration, text=text))
+        return segments
+
     def vram_peak_mb(self) -> int | None:
         if not torch.cuda.is_available():
             return None

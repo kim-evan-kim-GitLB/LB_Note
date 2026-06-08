@@ -161,15 +161,45 @@ def decode_chunk(backend, wav, lang="ko") -> str:
     return text.strip()
 
 
+def decode_chunks(backend, chunk_wavs, batch_size: int, lang="ko") -> list[str]:
+    """청크들을 배치로 디코딩(순서 보존). 각 청크 ≤target<35s 라 내부 재분할 없음 →
+    배치 row 1개 = 청크 1개. greedy 라 배치 여부와 무관하게 결과 동일."""
+    if batch_size <= 1:   # 안전 폴백(단일 경로)
+        out = []
+        for i, cw in enumerate(chunk_wavs):
+            out.append(decode_chunk(backend, cw, lang=lang))
+            if (i + 1) % 25 == 0 or i + 1 == len(chunk_wavs):
+                print(f"[vadchunk]   decoded {i + 1}/{len(chunk_wavs)}")
+        return out
+    texts: list[str] = []
+    n = len(chunk_wavs)
+    for i in range(0, n, batch_size):
+        batch = chunk_wavs[i:i + batch_size]
+        inputs = backend._processor(batch, sampling_rate=16000, return_tensors="pt", language=lang)
+        inputs = inputs.to(backend._model.device, dtype=backend._model.dtype)
+        with torch.inference_mode():
+            outputs = backend._model.generate(
+                **inputs, max_new_tokens=MAX_NEW_TOKENS,
+                repetition_penalty=backend.REPETITION_PENALTY,
+            )
+        decoded = backend._processor.batch_decode(outputs, skip_special_tokens=True)
+        texts.extend((t or "").strip() for t in decoded)
+        print(f"[vadchunk]   decoded {min(i + batch_size, n)}/{n}")
+    return texts
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--target-sec", type=float, default=TARGET_SEC)
     ap.add_argument("--enhancers", default="",
                     help="쉼표 구분 향상 순서(분할 전 파형에 적용). 예: 'wpe,gtcrn' | '' (none)")
+    ap.add_argument("--vad", default="silero", help="경계 검출 VAD: silero | energy(~15x 빠름)")
+    ap.add_argument("--batch-size", type=int, default=8,
+                    help="청크 디코딩 배치 크기(>1=배치 디코딩으로 가속, greedy 라 결과 동일)")
     args = ap.parse_args()
     target = args.target_sec
     enh_names = config.parse_enhancers(args.enhancers)
-    tag = "_enh" if enh_names else ""
+    tag = ("_enh" if enh_names else "") + ("" if args.vad == "silero" else f"_{args.vad}")
 
     out_json = ROOT / "output" / f"text-ax_vad_chunk{tag}.json"
     out_score = ROOT / "output" / f"score-ax_vad_chunk{tag}.md"
@@ -207,12 +237,15 @@ def main() -> int:
         print(f"[vadchunk] enhance={pre_t:.1f}s applied={applied}")
 
     # --- VAD 발화 구간 검출 → 청크 경계 결정 (비파괴: 압축 아님, 분할) ---
-    vad = get_vad("silero")
+    vad_t0 = time.perf_counter()
+    vad = get_vad(args.vad)
     vad.load()
     try:
         regions = vad.detect(wav, sr=16000)
     finally:
         vad.unload()
+    vad_t = time.perf_counter() - vad_t0
+    print(f"[vadchunk] VAD={args.vad} detect={vad_t:.1f}s")
     speech_sec = sum(e - s for s, e in regions)
     chunks = build_chunks(regions, duration, target, PAD_SEC, OVERLAP_SEC)
     seam_count = sum(1 for c in chunks if c[2])
@@ -222,14 +255,10 @@ def main() -> int:
           f"(overlap-seam={seam_count}, 평균 {sum(chunk_lens)/len(chunk_lens):.1f}s, "
           f"max {max(chunk_lens):.1f}s)")
 
-    # --- 청크별 디코딩 (순차, 경계가 항상 무음이라 단어 절단 없음) ---
+    # --- 청크 디코딩 (배치, 경계가 항상 무음이라 단어 절단 없음) ---
     gen_t0 = time.perf_counter()
-    texts: list[str] = []
-    for i, (s, e, _) in enumerate(chunks):
-        a, b = int(round(s * 16000)), int(round(e * 16000))
-        texts.append(decode_chunk(backend, wav[a:b]))
-        if (i + 1) % 25 == 0 or i + 1 == len(chunks):
-            print(f"[vadchunk]   decoded {i + 1}/{len(chunks)}")
+    chunk_wavs = [wav[int(round(s * 16000)):int(round(e * 16000))] for s, e, _ in chunks]
+    texts = decode_chunks(backend, chunk_wavs, batch_size=max(1, args.batch_size))
     gen_t = time.perf_counter() - gen_t0
 
     text, word_times = merge_texts(texts, chunks)
@@ -284,7 +313,9 @@ def main() -> int:
         "preprocess": {"enhancers_applied": applied, "enhance_seconds": round(pre_t, 2),
                        "note": "분할 전 파형에 적용(압축 아님). 빈 리스트면 향상 없음."},
         "chunking": {
-            "method": "silero_vad_segmentation",
+            "method": f"{args.vad}_vad_segmentation",
+            "vad_backend": args.vad,
+            "batch_size": max(1, args.batch_size),
             "target_sec": target,
             "pad_sec": PAD_SEC,
             "overlap_sec": OVERLAP_SEC,
@@ -297,6 +328,7 @@ def main() -> int:
             "note": "각 청크 ≤target<35s → 모델 내부 에너지 청커 재분할 없음. 컷은 항상 VAD 무음 경계.",
         },
         "performance": {"elapsed_seconds": round(elapsed, 2),
+                        "vad_seconds": round(vad_t, 2),
                         "decode_seconds": round(gen_t, 2),
                         "rtfx": rtfx, "vram_peak_mb": vram},
         "evaluation": {
