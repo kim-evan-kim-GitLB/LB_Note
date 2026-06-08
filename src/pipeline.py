@@ -368,7 +368,8 @@ def main() -> int:
     ap.add_argument("--chunk-sec", type=float, default=DEFAULT_CHUNK_SEC)
     ap.add_argument("--overlap-sec", type=float, default=DEFAULT_OVERLAP_SEC)
     ap.add_argument("--language", default=config.STT_LANGUAGE)
-    ap.add_argument("--dereverb", action="store_true", help="WPE dereverb 적용")
+    ap.add_argument("--dereverb", action=argparse.BooleanOptionalAction, default=True,
+                    help="WPE dereverb 적용(기본 ON: WPE→VAD→모델). 끄려면 --no-dereverb")
     ap.add_argument("--denoise", action="store_true", help="GTCRN denoise 적용")
     ap.add_argument("--vad", action="store_true", help="Silero VAD 무음압축 적용(분할과 무관)")
     # --- VAD 분할 청킹(기본 vad_chunk) ---
