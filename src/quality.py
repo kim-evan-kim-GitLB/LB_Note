@@ -3,11 +3,13 @@
 `tools/audio_quality_report.py` 의 무참조 지표 계산을 라이브러리로 추출해 파이프라인이
 in-memory 로 재사용한다(이미 로드된 16k samples 대상, 추가 디코딩 없음).
 
-핵심 설계(메모리 검증 결과 반영): **향상(WPE/GTCRN)은 net-negative** — 병목이 노이즈가
-아니라 6kHz 대역제한이기 때문. 따라서 "품질 낮음→향상"이 아니라:
-  - 대역제한(cutoff 낮음)  → 향상 건너뛰고 VAD 직행 (denoise 해도 손실 못 복구, 역효과)
-  - 노이즈우세 + 대역양호 → denoise(gtcrn)만 적용
-  - 그 외(클린)           → 향상 없음
+핵심 설계(메모리 검증 결과 반영): WPE(울림 제거)는 **표준 베이스라인** — 대역제한 음원에서도
+WER 개선·반복환각 억제 검증됨(asr test.m4a: WER 0.39→0.36, 환각 2→0). 선형예측 기반이라
+잘려나간 고역을 환각하지 않아 안전. 반면 GTCRN(denoise)은 없는 고역을 환각해 대역제한에
+net-negative([[ax-stt-enhancement-net-negative]]). 따라서 "품질 낮음→denoise"가 아니라:
+  - 대역제한(cutoff 낮음)  → ["wpe"]만 (GTCRN 제외)
+  - 노이즈우세 + 대역양호 → ["wpe","gtcrn"] (denoise 추가)
+  - 그 외(클린)           → ["wpe"]만
 결정과 측정값을 모두 노출해 감사 가능하게 한다.
 """
 from __future__ import annotations
@@ -111,18 +113,21 @@ def decide_enhancers(
 ) -> tuple[list[str], str]:
     """품질 지표 → 적용할 enhancer 리스트 + 사유(증거기반).
 
-    - 대역제한(cutoff < cutoff_ok_hz): 향상 net-negative([[ax-stt-enhancement-net-negative]])
-      → [] (VAD 직행). denoise 는 노이즈만 줄일 뿐 잘려나간 고역을 복구 못 함.
-    - 노이즈우세(snr < snr_lo) + 대역양호: ["gtcrn"] (denoise 만; WPE 는 검증상 역효과라 제외).
-    - 그 외: [] (클린 — 손대지 않음).
+    WPE(울림 제거)는 표준 베이스라인이라 모든 경우에 포함한다 — 대역제한 음원에서도 net-positive
+    검증됨(asr test.m4a: WER 0.39→0.36, 반복환각 2→0; [[ax-stt-enhancement-net-negative]]).
+    GTCRN(denoise)만 조건부로 추가:
+    - 대역제한(cutoff < cutoff_ok_hz): ["wpe"] (GTCRN 제외 — 없는 고역 환각해 net-negative).
+    - 노이즈우세(snr < snr_lo) + 대역양호: ["wpe","gtcrn"] (denoise 추가).
+    - 그 외(클린·대역양호): ["wpe"].
+    측정 실패 시에도 ["wpe"](기본 파이프라인 ENHANCERS=wpe 와 일치).
     """
     snr = metrics.get("snr", {}).get("snr_db")
     cutoff = metrics.get("spectrum", {}).get("highfreq_cutoff_hz") or 0
 
     if snr is None:
-        return [], "지표없음(측정실패)→향상생략"
+        return ["wpe"], "지표없음(측정실패)→WPE만(기본)"
     if cutoff < cutoff_ok_hz:
-        return [], f"대역제한(cutoff={cutoff}Hz<{cutoff_ok_hz:.0f})→향상생략(net-negative)"
+        return ["wpe"], f"대역제한(cutoff={cutoff}Hz<{cutoff_ok_hz:.0f})→WPE만(GTCRN 제외:net-negative)"
     if snr < snr_lo:
-        return ["gtcrn"], f"노이즈우세(SNR={snr}dB<{snr_lo})+대역양호→denoise"
-    return [], f"클린(SNR={snr}dB,cutoff={cutoff}Hz)→향상불필요"
+        return ["wpe", "gtcrn"], f"노이즈우세(SNR={snr}dB<{snr_lo})+대역양호→WPE+denoise"
+    return ["wpe"], f"클린(SNR={snr}dB,cutoff={cutoff}Hz)→WPE만"

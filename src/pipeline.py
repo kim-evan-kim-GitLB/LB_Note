@@ -123,15 +123,13 @@ def run_pipeline(
     duration = duration_seconds(samples, sr)
     print(f"[pipeline] duration={duration:.2f}s sr={sr}")
 
-    # 프론트엔드 전처리 (opt-in). 기본값이면 no-op → 기존 동작 보존.
-    enhancers = enhancers if enhancers is not None else config.parse_enhancers(config.ENHANCERS)
+    # 전처리 enhancer 결정 — 우선순위: 명시 enhancers > auto-enhance 측정 > config 기본(['wpe']).
+    # (주의: config 기본을 먼저 채우면 auto-enhance 가 무력화되므로, enhancers is None 으로 분기한다.)
     vad = vad if vad is not None else (config.VAD_BACKEND or None)
-
-    # P5: 증거기반 향상 라우팅(opt-in). enhancers 가 명시되지 않은 경우에만 자동 판단.
-    # "품질 낮음→향상"이 아니라 대역제한이면 향상 생략(net-negative), 노이즈우세+대역양호만 denoise.
     auto_enhance = config.AUTO_ENHANCE if auto_enhance is None else auto_enhance
     quality_info: dict | None = None
-    if auto_enhance and not enhancers:
+    if enhancers is None and auto_enhance:
+        # P5: 품질 측정 후 결정. WPE(울림)는 표준 베이스라인, 노이즈우세+대역양호일 때만 GTCRN 추가.
         from src.quality import compute_quality_metrics, decide_enhancers
         metrics = compute_quality_metrics(samples, sr)
         chosen, reason = decide_enhancers(
@@ -145,6 +143,8 @@ def run_pipeline(
               f"speech={metrics['snr']['speech_ratio_pct']}% → enhancers={chosen} ({reason})")
         enhancers = chosen
         quality_info = {"metrics": metrics, "decision": chosen, "reason": reason}
+    elif enhancers is None:
+        enhancers = config.parse_enhancers(config.ENHANCERS)  # 기본 ['wpe']: WPE→VAD→모델
 
     pre = preprocess(
         samples, sr,
@@ -390,7 +390,11 @@ def main() -> int:
         print(f"입력 파일 없음: {args.audio}", file=sys.stderr)
         return 2
 
-    enhancers = [n for n, on in (("wpe", args.dereverb), ("gtcrn", args.denoise)) if on]
+    # --auto-enhance 면 enhancers=None 으로 넘겨 P5 측정이 결정(WPE 기본+조건부 GTCRN). 수동 플래그는
+    # auto 가 아닐 때만 반영(--dereverb 기본 ON → 기본 ['wpe'], --no-dereverb → [], --denoise → +gtcrn).
+    enhancers = None if args.auto_enhance else [
+        n for n, on in (("wpe", args.dereverb), ("gtcrn", args.denoise)) if on
+    ]
 
     run_pipeline(
         audio_path=args.audio,
