@@ -169,7 +169,11 @@ def delete_meeting(meeting_id: str) -> dict:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "clean_backend": CLEAN_BACKEND}
+    return {
+        "ok": True,
+        "clean_backend": CLEAN_BACKEND,
+        "stt_model": "Cohere transcribe-03-2026",
+    }
 
 
 # ---------- 정적 프론트 서빙(컨테이너; dev에서는 비활성) ----------
