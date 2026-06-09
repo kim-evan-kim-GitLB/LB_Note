@@ -25,6 +25,7 @@ from src.postprocess.glossary import (
     load_glossary,
     load_glossary_version,
 )
+from src.postprocess.homophone import apply_homophone
 from src.postprocess.schema import CleanedSegment, CleanResult, normalize_segments
 from src.postprocess.stages.clean import CleanStage, load_prompt_version
 from src.postprocess.validate import FLAG_REVIEW, SemanticCheck, repair_or_degrade
@@ -44,12 +45,18 @@ def _glossary_block(glossary: dict[str, str]) -> str:
 def _apply_glossary(
     segments: list[dict], glossary: dict[str, str]
 ) -> tuple[list[dict], list[list[str]]]:
-    """[A] 각 정규화 segment.text 에 결정적 교정. (교정된 segments, segment별 적용용어) 반환."""
+    """[A] 각 정규화 segment.text 에 결정적 교정. (교정된 segments, segment별 적용용어) 반환.
+
+    glossary 교정 후 숫자↔한글 동음 오인식 화이트리스트(homophone.apply_homophone)도 같은
+    [A] 결정적 단계에서 적용한다 → 정제 백엔드(passthrough 포함)와 무관하게 항상 5탐→오탐 류를
+    교정한다. 결정적이라 게이트 면제(validate)에 의존하지 않고 LLM 비용도 들지 않는다.
+    """
     corrected: list[dict] = []
     applied_per_seg: list[list[str]] = []
     for seg in segments:
         text = seg.get("text", "")
         new_text, applied = apply_corrections(text, glossary)
+        new_text = apply_homophone(new_text)
         new_seg = dict(seg)
         new_seg["text"] = new_text
         corrected.append(new_seg)

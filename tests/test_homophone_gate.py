@@ -80,6 +80,19 @@ def test_gate_still_reverts_real_number_drop() -> None:
     assert out.flag == "확인필요", out.flag
 
 
+def test_apply_glossary_applies_homophone_deterministically() -> None:
+    """[A] 결정적 단계가 백엔드 무관하게 5탐→오탐 교정(passthrough 에서도 작동)."""
+    from src.postprocess.pipeline import _apply_glossary
+
+    segs = [
+        {"id": 0, "start": 0.0, "end": 1.0, "text": "FP가 5탐이니까 5탐을 줄이자"},
+        {"id": 1, "start": 1.0, "end": 2.0, "text": "1차 때는 5분 걸렸어"},  # 진짜 숫자 불변
+    ]
+    corrected, _applied = _apply_glossary(segs, {})
+    assert corrected[0]["text"] == "FP가 오탐이니까 오탐을 줄이자", corrected[0]["text"]
+    assert corrected[1]["text"] == "1차 때는 5분 걸렸어", corrected[1]["text"]
+
+
 def _run() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
