@@ -13,9 +13,13 @@
 DISABLE_OMC=1·OMC_SKIP_HOOKS=1 ② `--disable-slash-commands`(스킬 트리거 차단)
 ③ 중립 cwd(임시 디렉터리)에서 실행(프로젝트 CLAUDE.md 자동탐색 회피)을 적용한다.
 
-**경계(중요):** claude/codex 경유는 내용을 Anthropic/OpenAI 클라우드로 보낸다 →
-온프렘/PII 전제와 충돌. 따라서 이 백엔드는 **품질 게이트·벤치마크 전용**이며(설계 §8
-졸업 판정용), 실제 운영 정제는 로컬 백엔드(local_vllm/ollama)로 졸업시킨다.
+**경계(2026-06-09 갱신):** claude/codex 경유는 내용을 Anthropic/OpenAI 클라우드로 보낸다.
+종전엔 온프레미스/PII 전제와 충돌해 **게이트·벤치마크 전용**이었으나, CEO 가 클라우드 반출을
+승인해 **운영 백엔드로도 허용**된다. 다만 비용은 콜 수에 좌우된다 — 추출(ExtractStage)은
+회의당 1콜이라 클라우드도 ≈$0.06 으로 사실상 무시 가능하지만, 정제(CleanStage)는 segment당
+1콜이라 claude -p 의 하니스 오버헤드(~25k/콜)로 ≈$4~5/회의가 든다. 따라서 대량 정제를
+클라우드로 돌릴 거면 하니스 오버헤드가 없는 직접 API 백엔드(anthropic/openai)나 로컬
+백엔드(ollama 등)가 비용·결정성 면에서 유리하다.
 
 환경변수:
   - AGENT_CLI_PROGRAM : 호출할 CLI (claude[기본] | codex | omc). claude 외엔

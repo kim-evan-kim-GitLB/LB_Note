@@ -24,8 +24,11 @@ from pydantic import BaseModel
 from src.web.service import process_audio_to_contract
 from src.web.store import MeetingStore
 
-# 정제 백엔드(plan D1=passthrough). 환경변수로 v2 로컬 LLM 교체 가능.
+# 정제 백엔드(plan D1=passthrough). 환경변수로 클라우드(agent_cli)·로컬 LLM(ollama 등) 교체 가능.
 CLEAN_BACKEND = os.environ.get("WEB_CLEAN_BACKEND", "passthrough")
+# 추출 백엔드. 정제와 분리(미지정 시 정제 백엔드를 따름). 추출은 회의당 1콜이라 클라우드도
+# 저비용 → "정제=passthrough, 추출=agent_cli" 구성 가능(WEB_EXTRACT_BACKEND=agent_cli).
+EXTRACT_BACKEND = os.environ.get("WEB_EXTRACT_BACKEND", CLEAN_BACKEND)
 # 빌드된 프론트 정적 경로(컨테이너). 없으면 정적 서빙 비활성(dev=Vite).
 FRONTEND_DIST = os.environ.get("WEB_FRONTEND_DIST", "")
 
@@ -75,7 +78,10 @@ def _run_ai_job(job_id: str, audio_bytes: bytes, mime_type: str | None) -> None:
     """STT+정제 → 잡 결과(contract) 저장. 실패해도 멈추지 않고 status=error(설계 폴백 원칙)."""
     try:
         contract = process_audio_to_contract(
-            audio_bytes, mime_type=mime_type, backend_name=CLEAN_BACKEND
+            audio_bytes,
+            mime_type=mime_type,
+            backend_name=CLEAN_BACKEND,
+            extract_backend_name=EXTRACT_BACKEND,
         )
         result = {
             "summary": contract.get("summary", ""),

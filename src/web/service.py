@@ -19,6 +19,7 @@ from pathlib import Path
 
 from src.pipeline import run_pipeline
 from src.postprocess.backends import get_llm_backend
+from src.postprocess.extract_schema import seconds_to_timestamp
 from src.postprocess.glossary import load_glossary
 from src.postprocess.pipeline import _apply_glossary, _glossary_block, gate_segments
 from src.postprocess.schema import CleanResult, normalize_segments
@@ -109,6 +110,12 @@ def extract_action_items(
     ]
     backend = get_llm_backend(backend_name)
     result = ExtractStage().run(ex_input, backend)
+    # anchor 결정적 산출: LLM 출력 anchor 는 신뢰하지 않는다(보통 null/추측). 계약대로
+    # evidence_seg_ids 의 최소 start 에서 호출부가 직접 MM:SS 로 채운다(설계 §5, ActionItem.anchor).
+    start_by_id = {s["id"]: s["start"] for s in ex_input}
+    for it in result.items:
+        ev_starts = [start_by_id[sid] for sid in it.evidence_seg_ids if sid in start_by_id]
+        it.anchor = seconds_to_timestamp(min(ev_starts)) if ev_starts else None
     return _action_items_from_payload(result.to_dict())
 
 
@@ -118,8 +125,15 @@ def process_audio_to_contract(
     mime_type: str | None = None,
     filename: str | None = None,
     backend_name: str = "passthrough",
+    extract_backend_name: str | None = None,
 ) -> dict:
-    """오디오 bytes → 웹 Meeting 계약 {summary, actionItems, transcript} (+ _duration_seconds)."""
+    """오디오 bytes → 웹 Meeting 계약 {summary, actionItems, transcript} (+ _duration_seconds).
+
+    backend_name 은 정제(CleanStage) 백엔드. extract_backend_name 은 추출 백엔드로 **정제와
+    독립 설정**할 수 있다(미지정 시 정제 백엔드를 따른다). 분리 이유: 정제는 segment당 1콜이라
+    클라우드면 비싸지만(≈$4~5/회의), 추출은 회의당 1콜이라 클라우드도 ≈$0.06 → "정제=passthrough,
+    추출=agent_cli" 같은 저비용 구성이 가능. 백엔드는 backend-agnostic(추후 ollama 로 교체 용이).
+    """
     raw_segments, duration = transcribe_bytes(
         audio_bytes, mime_type=mime_type, filename=filename
     )
@@ -129,9 +143,10 @@ def process_audio_to_contract(
         for s in final.segments
     ]
     # 액션아이템 추출: passthrough 는 추출 불가(빈 값) 이므로 건너뛰고, 실 백엔드면 ExtractStage 가동.
+    ex_backend = extract_backend_name or backend_name
     action_items: list[dict] = []
-    if backend_name != "passthrough":
-        action_items = extract_action_items(seg_dicts, backend_name=backend_name)
+    if ex_backend != "passthrough":
+        action_items = extract_action_items(seg_dicts, backend_name=ex_backend)
     # summary 는 SummarizeStage 미구현 → "" 유지(추출과 별개 스테이지).
     contract = build_meeting_contract_from_segments(
         seg_dicts, action_items=action_items, summary=""
