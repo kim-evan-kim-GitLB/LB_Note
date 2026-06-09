@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from src.web.service import process_audio_to_contract
+from src.web.service import extract_action_items, process_audio_to_contract
 from src.web.store import MeetingStore
 
 # 정제 백엔드(plan D1=passthrough). 환경변수로 클라우드(agent_cli)·로컬 LLM(ollama 등) 교체 가능.
@@ -133,8 +133,23 @@ def ai_job(job_id: str) -> dict:
 
 @app.post("/api/ai/extract-actions")
 def ai_extract_actions(req: ExtractRequest) -> list[str]:
-    """v1: 빈 배열(액션 추출은 LLM 필요 → v2에서 ExtractStage 연결)."""
-    return []
+    """텍스트 붙여넣기 → 액션아이템 string[](프론트 계약: Promise<string[]>).
+
+    입력이 raw text 한 덩어리라 segment/timestamp 가 없다 → anchor/evidence/owner 는 만들 수 없고
+    **item.text 만 평탄화**해서 반환한다(계약 결정 2026-06-09). 줄 단위로 pseudo-segment 를 만들어
+    ExtractStage(EXTRACT_BACKEND)에 넣는다. passthrough/실패 → 빈 배열(graceful).
+    """
+    text = (req.text or "").strip()
+    if not text or EXTRACT_BACKEND == "passthrough":
+        return []
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()] or [text]
+    segs = [{"id": i, "start": 0.0, "end": 0.0, "text": ln} for i, ln in enumerate(lines)]
+    try:
+        items = extract_action_items(segs, backend_name=EXTRACT_BACKEND)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return []
+    return [it["text"] for it in items if it.get("text")]
 
 
 # ---------- 영속 엔드포인트 (meetingService 대체) ----------
