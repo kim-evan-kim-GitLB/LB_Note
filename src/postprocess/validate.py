@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from typing import Callable
 
+from src.postprocess.homophone import excused_digits
 from src.postprocess.schema import CleanedSegment
 from src.scoring import levenshtein
 
@@ -82,8 +83,14 @@ def number_tokens_preserved(original: str, cleaned: str) -> float:
 
     분모 = original 의 고유 숫자 토큰 수. 분자 = cleaned 에도 있는 수.
     original 에 숫자가 없으면 1.0.
+
+    예외(동음 오인식 교정): 화이트리스트(homophone.HOMOPHONE_MAP)로 설명되는 숫자
+    (예: 5탐→오탐 의 '5')는 정당하게 한글로 바뀐 것이므로 분모에서 제외한다 → 등재된
+    숫자 오인식 교정을 '숫자 누락'으로 오판해 게이트가 되돌리지 않게 한다. 미등재 숫자는
+    종전과 동일하게 보존을 강제한다(1차/5분/6월 등 진짜 숫자 보호).
     """
-    orig_nums = {t for t in _tokens(original) if t.isdigit()}
+    excused = excused_digits(original, cleaned)
+    orig_nums = {t for t in _tokens(original) if t.isdigit() and t not in excused}
     if not orig_nums:
         return 1.0
     cleaned_nums = {t for t in _tokens(cleaned) if t.isdigit()}
