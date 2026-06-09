@@ -2,10 +2,12 @@
 
 흐름: audio bytes → (임시파일) run_pipeline(온프렘 STT) → segments
           → normalize → [A]glossary 교정 → CleanStage(backend) → [D]게이트
+          → ExtractStage(backend, 회의 단위 액션아이템)
           → build_meeting_contract_from_segments → {summary, actionItems, transcript}
 
-v1(plan D1=passthrough): CleanStage가 정제를 안 하므로 transcript=원문(+glossary 교정),
-actionItems/summary는 빈 값. v2에서 backend_name을 로컬 LLM으로 바꾸면 정제·추출이 살아난다.
+backend_name="passthrough"(기본): CleanStage가 정제를 안 하므로 transcript=원문(+glossary 교정),
+추출도 건너뜀(actionItems=[]). 실 백엔드(agent_cli/로컬 LLM)면 정제·추출이 살아난다.
+summary 는 SummarizeStage 미구현이라 항상 "" (추출과는 별개 스테이지).
 
 주의: run_pipeline은 요청마다 Cohere 모델을 load/unload 한다(요청 사이 VRAM 미점유 → 공유 GPU
 친화적, plan 비고). 상주 로드 최적화는 v2.
@@ -21,7 +23,11 @@ from src.postprocess.glossary import load_glossary
 from src.postprocess.pipeline import _apply_glossary, _glossary_block, gate_segments
 from src.postprocess.schema import CleanResult, normalize_segments
 from src.postprocess.stages.clean import CleanStage
-from src.postprocess.web_contract import build_meeting_contract_from_segments
+from src.postprocess.stages.extract import ExtractStage
+from src.postprocess.web_contract import (
+    _action_items_from_payload,
+    build_meeting_contract_from_segments,
+)
 
 # MIME → 확장자(파일명이 없을 때 폴백). load_audio 가 ffmpeg로 디코딩하는 포맷들.
 _MIME_EXT = {
@@ -81,6 +87,31 @@ def clean_segments(raw_segments: list[dict], backend_name: str = "passthrough") 
     return CleanResult(segments=validated)
 
 
+def extract_action_items(
+    cleaned_segments: list[dict], backend_name: str = "passthrough"
+) -> list[dict]:
+    """정제 segment → 웹 actionItems 목록. ExtractStage(회의 단위) 를 backend 로 직접 호출.
+
+    추출은 segment 1:1 이 아니라 회의 전체 transcript 단위다(한 과제가 여러 segment에 걸침).
+    ExtractStage 입력은 [{id, text}] — load_cleaned_segments 와 동일하게 정제 본문(cleaned)을
+    text 로 노출한다. ExtractResult → 웹 계약 필드(text/owner/due/anchor/...)로 정규화.
+
+    passthrough 등 JSON 출력이 안 되는 백엔드는 빈 결과가 나오므로 호출부에서 건너뛴다.
+    """
+    ex_input = [
+        {
+            "id": s["id"],
+            "start": s["start"],
+            "end": s["end"],
+            "text": (s.get("cleaned") or s.get("text") or ""),
+        }
+        for s in cleaned_segments
+    ]
+    backend = get_llm_backend(backend_name)
+    result = ExtractStage().run(ex_input, backend)
+    return _action_items_from_payload(result.to_dict())
+
+
 def process_audio_to_contract(
     audio_bytes: bytes,
     *,
@@ -97,7 +128,13 @@ def process_audio_to_contract(
         {"id": s.id, "start": s.start, "end": s.end, "cleaned": s.cleaned, "text": s.original}
         for s in final.segments
     ]
-    # v1: actionItems=[] (extract는 LLM 필요 → v2), summary="" (SummarizeStage 미구현 → v2)
-    contract = build_meeting_contract_from_segments(seg_dicts, action_items=[], summary="")
+    # 액션아이템 추출: passthrough 는 추출 불가(빈 값) 이므로 건너뛰고, 실 백엔드면 ExtractStage 가동.
+    action_items: list[dict] = []
+    if backend_name != "passthrough":
+        action_items = extract_action_items(seg_dicts, backend_name=backend_name)
+    # summary 는 SummarizeStage 미구현 → "" 유지(추출과 별개 스테이지).
+    contract = build_meeting_contract_from_segments(
+        seg_dicts, action_items=action_items, summary=""
+    )
     contract["_duration_seconds"] = duration
     return contract
