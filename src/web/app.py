@@ -29,6 +29,9 @@ CLEAN_BACKEND = os.environ.get("WEB_CLEAN_BACKEND", "passthrough")
 # 추출 백엔드. 정제와 분리(미지정 시 정제 백엔드를 따름). 추출은 회의당 1콜이라 클라우드도
 # 저비용 → "정제=passthrough, 추출=agent_cli" 구성 가능(WEB_EXTRACT_BACKEND=agent_cli).
 EXTRACT_BACKEND = os.environ.get("WEB_EXTRACT_BACKEND", CLEAN_BACKEND)
+# 요약 백엔드. 미지정 시 off(passthrough → 빈 요약). 회의당 1콜이라 클라우드도 저비용 →
+# "정제=passthrough, 요약=agent_cli"만 켜기 가능(WEB_SUMMARIZE_BACKEND=agent_cli). 설계 §6 폴백.
+SUMMARIZE_BACKEND = os.environ.get("WEB_SUMMARIZE_BACKEND", "")
 # 빌드된 프론트 정적 경로(컨테이너). 없으면 정적 서빙 비활성(dev=Vite).
 FRONTEND_DIST = os.environ.get("WEB_FRONTEND_DIST", "")
 
@@ -82,9 +85,10 @@ def _run_ai_job(job_id: str, audio_bytes: bytes, mime_type: str | None) -> None:
             mime_type=mime_type,
             backend_name=CLEAN_BACKEND,
             extract_backend_name=EXTRACT_BACKEND,
+            summarize_backend_name=SUMMARIZE_BACKEND or None,
         )
         result = {
-            "summary": contract.get("summary", ""),
+            "summary": contract.get("summary", {}),  # 구조체(dict) 계약 — 빈 기본값도 객체
             "actionItems": contract.get("actionItems", []),
             "transcript": contract.get("transcript", []),
             "duration": _fmt_duration(contract.get("_duration_seconds")),
@@ -178,6 +182,8 @@ def health() -> dict:
     return {
         "ok": True,
         "clean_backend": CLEAN_BACKEND,
+        "extract_backend": EXTRACT_BACKEND,
+        "summarize_backend": SUMMARIZE_BACKEND or "off",
         "stt_model": "Cohere transcribe-03-2026",
     }
 

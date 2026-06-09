@@ -3,11 +3,12 @@
 흐름: audio bytes → (임시파일) run_pipeline(온프렘 STT) → segments
           → normalize → [A]glossary 교정 → CleanStage(backend) → [D]게이트
           → ExtractStage(backend, 회의 단위 액션아이템)
+          → SummarizeStage(backend, 회의 단위 요약) → ground_summary
           → build_meeting_contract_from_segments → {summary, actionItems, transcript}
 
 backend_name="passthrough"(기본): CleanStage가 정제를 안 하므로 transcript=원문(+glossary 교정),
 추출도 건너뜀(actionItems=[]). 실 백엔드(agent_cli/로컬 LLM)면 정제·추출이 살아난다.
-summary 는 SummarizeStage 미구현이라 항상 "" (추출과는 별개 스테이지).
+summary 는 SummarizeStage 산출(요약 백엔드 미지정 시 off → 빈 구조체).
 
 주의: run_pipeline은 요청마다 Cohere 모델을 load/unload 한다(요청 사이 VRAM 미점유 → 공유 GPU
 친화적, plan 비고). 상주 로드 최적화는 v2.
@@ -15,6 +16,7 @@ summary 는 SummarizeStage 미구현이라 항상 "" (추출과는 별개 스테
 from __future__ import annotations
 
 import tempfile
+import traceback
 from pathlib import Path
 
 from src.pipeline import run_pipeline
@@ -25,6 +27,8 @@ from src.postprocess.pipeline import _apply_glossary, _glossary_block, gate_segm
 from src.postprocess.schema import CleanResult, normalize_segments
 from src.postprocess.stages.clean import CleanStage
 from src.postprocess.stages.extract import ExtractStage
+from src.postprocess.stages.summarize import SummarizeStage
+from src.postprocess.summarize_schema import ground_summary
 from src.postprocess.web_contract import (
     _action_items_from_payload,
     build_meeting_contract_from_segments,
@@ -119,6 +123,31 @@ def extract_action_items(
     return _action_items_from_payload(result.to_dict())
 
 
+def summarize_meeting(
+    cleaned_segments: list[dict], backend_name: str = "passthrough"
+) -> dict:
+    """정제 segment → 회의 요약 구조체(dict). SummarizeStage(회의 단위)를 backend 로 직접 호출.
+
+    요약은 segment 1:1 이 아니라 회의 전체 단위다(안건 목록 + 안건별 상세 논의). anchor/time_range/
+    근거검증은 ground_summary 가 결정적으로 수행(LLM 불신, 설계 §7) — evidence 없는 항목 드롭.
+
+    passthrough 등 JSON 출력이 안 되는 백엔드는 빈 요약이 나오므로 호출부에서 건너뛴다.
+    """
+    sum_input = [
+        {
+            "id": s["id"],
+            "start": s["start"],
+            "end": s["end"],
+            "text": (s.get("cleaned") or s.get("text") or ""),
+        }
+        for s in cleaned_segments
+    ]
+    backend = get_llm_backend(backend_name)
+    summary = SummarizeStage().run(sum_input, backend)
+    summary = ground_summary(summary, sum_input)
+    return summary.to_dict()
+
+
 def process_audio_to_contract(
     audio_bytes: bytes,
     *,
@@ -126,13 +155,14 @@ def process_audio_to_contract(
     filename: str | None = None,
     backend_name: str = "passthrough",
     extract_backend_name: str | None = None,
+    summarize_backend_name: str | None = None,
 ) -> dict:
     """오디오 bytes → 웹 Meeting 계약 {summary, actionItems, transcript} (+ _duration_seconds).
 
-    backend_name 은 정제(CleanStage) 백엔드. extract_backend_name 은 추출 백엔드로 **정제와
-    독립 설정**할 수 있다(미지정 시 정제 백엔드를 따른다). 분리 이유: 정제는 segment당 1콜이라
-    클라우드면 비싸지만(≈$4~5/회의), 추출은 회의당 1콜이라 클라우드도 ≈$0.06 → "정제=passthrough,
-    추출=agent_cli" 같은 저비용 구성이 가능. 백엔드는 backend-agnostic(추후 ollama 로 교체 용이).
+    backend_name 은 정제(CleanStage) 백엔드. extract_backend_name(추출)·summarize_backend_name(요약)은
+    정제와 **독립 설정**할 수 있다(미지정 시: 추출=정제 백엔드, 요약=off). 분리 이유: 정제는 segment당
+    1콜이라 클라우드면 비싸지만(≈$4~5/회의), 추출·요약은 회의당 1콜이라 클라우드도 ≈$0.06 →
+    "정제=passthrough, 추출/요약=agent_cli" 같은 저비용 구성이 가능. 백엔드는 backend-agnostic.
     """
     raw_segments, duration = transcribe_bytes(
         audio_bytes, mime_type=mime_type, filename=filename
@@ -147,9 +177,19 @@ def process_audio_to_contract(
     action_items: list[dict] = []
     if ex_backend != "passthrough":
         action_items = extract_action_items(seg_dicts, backend_name=ex_backend)
-    # summary 는 SummarizeStage 미구현 → "" 유지(추출과 별개 스테이지).
+    # 요약: 미지정 시 off(passthrough). 명시 백엔드일 때만 SummarizeStage 가동(설계 §6 폴백 정책).
+    sum_backend = summarize_backend_name
+    summary: dict | None = None
+    if sum_backend and sum_backend != "passthrough":
+        try:
+            summary = summarize_meeting(seg_dicts, backend_name=sum_backend)
+        except Exception:  # noqa: BLE001
+            # 요약 실패는 회의 전체(정제·추출·transcript)를 죽이지 않는다 → 빈 요약으로
+            # graceful degrade(설계 §6 "멈춤 없음"). 추출도 동일 정책 검토 대상.
+            traceback.print_exc()
+            summary = None
     contract = build_meeting_contract_from_segments(
-        seg_dicts, action_items=action_items, summary=""
+        seg_dicts, action_items=action_items, summary=summary
     )
     contract["_duration_seconds"] = duration
     return contract

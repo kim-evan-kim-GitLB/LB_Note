@@ -51,8 +51,10 @@ def test_contract_shape_and_timestamps() -> None:
         # actionItems 표준 필드 노출
         assert c["actionItems"][0]["text"] == "모델 확정", c
         assert c["actionItems"][0]["anchor"] == "00:12", c
-        # summarize 미구현 → 빈 summary
-        assert c["summary"] == "", c
+        # summary 는 구조체(dict) 계약(string→object). 미제공 → 빈 요약 구조체.
+        assert isinstance(c["summary"], dict), c
+        assert c["summary"]["agenda"] == [] and c["summary"]["agenda_index"] == [], c
+        assert c["summary"]["schema_version"] == "sum-1.0", c
 
 
 def test_contract_without_actionitems() -> None:
