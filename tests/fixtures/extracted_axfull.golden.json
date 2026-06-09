@@ -1,0 +1,24 @@
+{
+  "file": "text-axfull.cleaned.json",
+  "extractor": "fixed-prompt v1 (general-purpose agent, blind)",
+  "run": 1,
+  "n_items": 16,
+  "action_items": [
+    {"text": "로컬 환경에서 모델 확정+음성 텍스트 추출 완료 (페이즈1)", "due": "다음 주 수요일(전사상 5/27로 오기)", "evidence_seg_ids": [103,106,115]},
+    {"text": "선정 2모델을 로컬 환경 회의 녹음 파일로 직접 테스트해 속도·정확도 확인", "evidence_seg_ids": [160,162,178,205,206]},
+    {"text": "텍스트가 PC(로컬)에 자동 저장되는지 동작 체크", "evidence_seg_ids": [205]},
+    {"text": "추출 텍스트 PC 저장 후 Claude 스킬로 액션아이템 도출(페이즈2)", "due": "6월 진행", "evidence_seg_ids": [106,107,113]},
+    {"text": "채택 모델/근거/결과 담은 2페이지 보고 문서 작성해 대표 보고", "due": "내일", "evidence_seg_ids": [69,90]},
+    {"text": "중간 진행상황을 슬랙 채널에 캡처로 대표 공유/회신", "due": "다음 주 중", "evidence_seg_ids": [120]},
+    {"text": "마일스톤 초안 작성해 프로에 보여주고 함께 데드라인 수정·합작", "due": "다음 주 중", "evidence_seg_ids": [121,193]},
+    {"text": "마일스톤을 칸반/간트 차트로 그려서 보여주기", "evidence_seg_ids": [195,210]},
+    {"text": "회의록/액션아이템 양식을 구글 문서 기반으로 잡아 AX 활동 때 함께 보기", "evidence_seg_ids": [117,119,209]},
+    {"text": "추출 텍스트 품질을 클로바노트와 비교하며 품질 의견 제공", "evidence_seg_ids": [178,179]},
+    {"text": "텍스트 추출 후 액션아이템 도출 방식 정하기 위한 별도 회의 진행", "evidence_seg_ids": [160]},
+    {"text": "확보 데이터로 회의 유형별(2인,4~5인) 케이스 테스트 진행", "evidence_seg_ids": [161,165]},
+    {"text": "프로 환경 양호 시 대표 환경에서도 한번 돌려보기", "evidence_seg_ids": [146]},
+    {"text": "로컬 동작 vs 서버(클라우드) 방식·비용 정리해 대표에 제안", "evidence_seg_ids": [149,150]},
+    {"text": "프로 제안 요구사항 분석해 보고 문서에 반영", "evidence_seg_ids": [133]},
+    {"text": "1차 단계 완료 후 추가 요구사항 정립 단계를 마일스톤에 추가 정리", "evidence_seg_ids": [129]}
+  ]
+}
