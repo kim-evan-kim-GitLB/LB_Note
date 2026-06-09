@@ -154,6 +154,24 @@ contract.summary (구조체) + 회의록.md 요약 섹션
 작성일: … | 작성자: …                                              ← meta(푸터)
 ```
 
+## 5.1 출력 형식 정책 — JSON 정본 + MD 렌더 (TXT 보조)
+
+산출물 저장 형식은 **하나를 고르는 문제가 아니라 역할 분리**다. 회의록은 *기계가 다루고 + 사람도
+읽는* 산출물이라, **JSON을 단일 진실원(SSOT)으로 두고 MD를 거기서 파생 렌더**한다.
+
+| 형식 | 역할 | 근거 |
+|---|---|---|
+| **JSON** | **정본(SSOT)** — `text.json`/`cleaned.json`/`actionitems.json`/web contract(`summary` 구조체) | 구조화·필드쿼리·다운스트림(웹·Jira·DB) 계약·스키마검증·회귀채점·**근거(evidence_seg_ids)·anchor·버전·flag 무손실**·부분갱신 |
+| **MD** | **파생 뷰** — `transcript.md`/회의록.md | 사람 가독·배포·인쇄·복붙. JSON에서 렌더(§5). 정본 아님 |
+| **TXT** | **보조** — STT 원시 transcript·로그·grep 대상 | 최소 의존·범용. 구조·메타 소실이라 회의록 정본으로 부적합 |
+
+### 원칙
+1. **정본은 JSON 하나.** MD를 정본 삼으면 evidence/타임스탬프/owner를 구조적으로 못 들고, 검증·
+   부분갱신·DB 연동이 깨진다. MD/TXT 는 **항상 JSON에서 생성**(역방향 금지).
+2. **DB 저장도 JSON.** `src/web/store.py` 는 SQLite `data` 컬럼에 Meeting JSON 을 통째로 보관 →
+   이 정책과 일치. 필드 쿼리 수요가 생기면 **인덱스 컬럼만 추가**(정본은 여전히 JSON blob).
+3. **TXT 는 회의록 산출물의 정본으로 쓰지 않는다**(근거·메타 소실). 원시 입력·로그용으로만.
+
 ## 6. 백엔드·운영 모드
 
 - **`WEB_SUMMARIZE_BACKEND`**(신규): 정제(`WEB_CLEAN_BACKEND`)·추출(`WEB_EXTRACT_BACKEND`)과 **독립**.
