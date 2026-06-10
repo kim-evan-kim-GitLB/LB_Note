@@ -1,0 +1,206 @@
+"""온프렘 로컬 인증 — ID/PW + JWT (프론트 `src/lib/firebase.ts` 계약 충족).
+
+프론트 계약:
+  - POST /api/auth/login {username, password} -> {token, user:{id, username, displayName?, role?}}
+  - GET  /api/auth/me   (Authorization: Bearer <token>) -> user
+  - 모든 /api 요청에 Bearer 자동 주입 → 데이터/AI 엔드포인트도 require_user 로 보호.
+
+설계:
+  - 비밀번호: passlib pbkdf2_sha256(순수 파이썬, bcrypt 백엔드 불필요).
+  - 토큰: PyJWT HS256, 서명키=env JWT_SECRET. 만료=WEB_AUTH_TOKEN_TTL 초(기본 7일).
+  - 사용자: SQLite users 테이블(저장소와 같은 DB 파일). env WEB_AUTH_USERS 가 사용자 목록의
+    단일 진실원천 — "user:pass,user2:pass2" 형식, 부팅 시 upsert(목록에 있으면 비번을 env 값으로
+    동기화). 비어있고 사용자도 없으면 기본 admin/admin 시드(경고 로그) → 운영 전 교체 권장.
+
+무거운 의존성 없이 stdlib + 이미 설치된 PyJWT/passlib 만 사용.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import os
+import sqlite3
+import threading
+
+import jwt
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from passlib.hash import pbkdf2_sha256
+
+from src.web.store import DEFAULT_DB_PATH
+
+
+def _secret() -> str:
+    # import 순서와 무관하게 호출 시점에 읽는다(.env 로드 타이밍 방어).
+    return os.environ.get("JWT_SECRET", "")
+
+
+def _ttl() -> int:
+    return int(os.environ.get("WEB_AUTH_TOKEN_TTL", str(7 * 24 * 3600)))  # 기본 7일
+
+_USERS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    username      TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    display_name  TEXT,
+    role          TEXT DEFAULT 'user',
+    created_at    TEXT
+);
+"""
+
+
+class UserStore:
+    """사용자 CRUD(스레드 안전). 저장소와 동일 DB 파일에 users 테이블."""
+
+    def __init__(self, db_path=None) -> None:
+        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        with self._lock:
+            self._conn.executescript(_USERS_SCHEMA)
+            self._conn.commit()
+
+    def upsert(self, username: str, password: str, *, display_name=None, role="user") -> None:
+        """사용자 생성/비번 갱신(env 동기화용). 기존이면 비번·표시명·역할 갱신."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO users (username, password_hash, display_name, role, created_at) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(username) DO UPDATE SET "
+                "password_hash=excluded.password_hash, display_name=excluded.display_name, "
+                "role=excluded.role",
+                (
+                    username,
+                    pbkdf2_sha256.hash(password),
+                    display_name or username,
+                    role,
+                    dt.datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            self._conn.commit()
+
+    def get(self, username: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT username, password_hash, display_name, role FROM users WHERE username=?",
+                (username,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def count(self) -> int:
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+
+    def usernames(self) -> list[str]:
+        with self._lock:
+            return [r["username"] for r in self._conn.execute("SELECT username FROM users")]
+
+    def delete(self, username: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM users WHERE username=?", (username,))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def verify(self, username: str, password: str) -> dict | None:
+        """ID/PW 검증. 성공 시 공개 user dict, 실패 시 None."""
+        u = self.get(username)
+        if not u or not pbkdf2_sha256.verify(password, u["password_hash"]):
+            return None
+        return public_user(u)
+
+
+def public_user(u: dict) -> dict:
+    """프론트 계약 user 객체(id/username/displayName/role). 비번 해시는 절대 노출 안 함."""
+    return {
+        "id": u["username"],
+        "username": u["username"],
+        "displayName": u.get("display_name") or u["username"],
+        "role": u.get("role") or "user",
+    }
+
+
+def make_token(username: str) -> str:
+    now = dt.datetime.now(dt.timezone.utc)
+    payload = {"sub": username, "iat": now, "exp": now + dt.timedelta(seconds=_ttl())}
+    return jwt.encode(payload, _secret(), algorithm="HS256")
+
+
+def _decode(token: str) -> dict:
+    return jwt.decode(token, _secret(), algorithms=["HS256"])
+
+
+# ---- 모듈 싱글턴: app.py 가 init() 호출 ----
+_store: UserStore | None = None
+
+
+def init(db_path=None) -> UserStore:
+    """UserStore 생성 + env(WEB_AUTH_USERS) 시드/동기화. JWT_SECRET 미설정이면 즉시 실패."""
+    global _store
+    if not _secret():
+        raise RuntimeError("JWT_SECRET 미설정 — 인증 토큰 서명 불가. .env 에 설정하세요.")
+    _store = UserStore(db_path)
+
+    # 정책: 계정은 개발자·어드민만. 자가가입 없음(가입 엔드포인트 미존재) → 발급은 .env 로만.
+    # WEB_AUTH_ADMINS 에 적힌 사용자는 role=admin, 그 외 WEB_AUTH_USERS 사용자는 role=developer.
+    admins = {
+        u.strip() for u in os.environ.get("WEB_AUTH_ADMINS", "admin").split(",") if u.strip()
+    }
+    listed: list[str] = []
+    spec = os.environ.get("WEB_AUTH_USERS", "").strip()
+    if spec:
+        for pair in spec.split(","):
+            pair = pair.strip()
+            if not pair or ":" not in pair:
+                continue
+            username, password = pair.split(":", 1)
+            username, password = username.strip(), password.strip()
+            if not username or not password:
+                continue
+            role = "admin" if username in admins else "developer"
+            _store.upsert(username, password, role=role)
+            listed.append(username)
+
+    # prune: env(WEB_AUTH_USERS)를 계정의 단일 진실원천으로 — 목록에 없는 계정 제거.
+    # (다른 경로로 생긴 계정/구 데모 계정 정리). WEB_AUTH_PRUNE=0 으로 끌 수 있음.
+    pruned: list[str] = []
+    if listed and os.environ.get("WEB_AUTH_PRUNE", "1") != "0":
+        for u in _store.usernames():
+            if u not in listed:
+                _store.delete(u)
+                pruned.append(u)
+
+    if _store.count() == 0:
+        _store.upsert("admin", "admin", role="admin")
+        listed.append("admin")
+        print("[auth] 경고: 사용자가 없어 기본 계정 admin/admin 을 생성했습니다. "
+              "운영 전 WEB_AUTH_USERS 로 교체하세요.", flush=True)
+    print(f"[auth] 사용자 {_store.count()}명 (등록: {', '.join(listed) or '없음'}"
+          f"{' / 제거: ' + ', '.join(pruned) if pruned else ''})", flush=True)
+    return _store
+
+
+def store() -> UserStore:
+    if _store is None:
+        raise RuntimeError("auth.init() 가 호출되지 않았습니다.")
+    return _store
+
+
+# ---- FastAPI 의존성: Bearer 토큰 검증 → 현재 사용자 ----
+_bearer = HTTPBearer(auto_error=False)
+
+
+def require_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> dict:
+    """유효 Bearer 토큰 → 공개 user dict. 없거나 무효/만료/미존재 사용자면 401."""
+    if cred is None or not cred.credentials:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    try:
+        payload = _decode(cred.credentials)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="토큰이 만료되었습니다.")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="토큰이 유효하지 않습니다.")
+    u = store().get(payload.get("sub", ""))
+    if not u:
+        raise HTTPException(status_code=401, detail="사용자를 찾을 수 없습니다.")
+    return public_user(u)

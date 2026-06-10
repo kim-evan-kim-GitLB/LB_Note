@@ -17,12 +17,14 @@ import traceback
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.web.service import extract_action_items, process_audio_to_contract
 from src.web.store import MeetingStore
+# service import 가 config(load_dotenv)를 끌어와 .env 가 로드된 뒤 auth 를 가져온다(순서 주의).
+from src.web import auth
 
 # 정제 백엔드(plan D1=passthrough). 환경변수로 클라우드(agent_cli)·로컬 LLM(ollama 등) 교체 가능.
 CLEAN_BACKEND = os.environ.get("WEB_CLEAN_BACKEND", "passthrough")
@@ -44,6 +46,7 @@ app.add_middleware(
 )
 
 store = MeetingStore()
+users = auth.init()  # users 테이블 준비 + WEB_AUTH_USERS 시드/동기화
 
 
 def _now_iso() -> str:
@@ -68,6 +71,27 @@ class ProcessRequest(BaseModel):
 
 class ExtractRequest(BaseModel):
     text: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+# ---------- 인증 (프론트 src/lib/firebase.ts 계약) ----------
+@app.post("/api/auth/login")
+def auth_login(req: LoginRequest) -> dict:
+    """ID/PW 검증 → {token, user}. 실패는 401(+detail) — 프론트 로그인 폼이 detail 표시."""
+    user = users.verify(req.username.strip(), req.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 올바르지 않습니다.")
+    return {"token": auth.make_token(user["id"]), "user": user}
+
+
+@app.get("/api/auth/me")
+def auth_me(user: dict = Depends(auth.require_user)) -> dict:
+    """Bearer 토큰으로 세션 복원. 무효/만료 토큰은 require_user 가 401."""
+    return user
 
 
 # ---------- 비동기 AI 잡 (STT는 장시간 → 잡 + 폴링) ----------
@@ -102,7 +126,7 @@ def _run_ai_job(job_id: str, audio_bytes: bytes, mime_type: str | None) -> None:
 
 
 @app.post("/api/ai/process")
-def ai_process(req: ProcessRequest) -> dict:
+def ai_process(req: ProcessRequest, user: dict = Depends(auth.require_user)) -> dict:
     """오디오 제출 → 백그라운드 STT 잡 등록 → {jobId} 즉시 반환. 프론트는 GET 잡 폴링."""
     import base64
     try:
@@ -122,7 +146,7 @@ def ai_process(req: ProcessRequest) -> dict:
 
 
 @app.get("/api/ai/jobs/{job_id}")
-def ai_job(job_id: str) -> dict:
+def ai_job(job_id: str, user: dict = Depends(auth.require_user)) -> dict:
     """잡 상태/결과 폴링. status: processing | done(result) | error(error)."""
     with _jobs_lock:
         j = _jobs.get(job_id)
@@ -132,7 +156,7 @@ def ai_job(job_id: str) -> dict:
 
 
 @app.post("/api/ai/extract-actions")
-def ai_extract_actions(req: ExtractRequest) -> list[str]:
+def ai_extract_actions(req: ExtractRequest, user: dict = Depends(auth.require_user)) -> list[str]:
     """텍스트 붙여넣기 → 액션아이템 string[](프론트 계약: Promise<string[]>).
 
     입력이 raw text 한 덩어리라 segment/timestamp 가 없다 → anchor/evidence/owner 는 만들 수 없고
@@ -153,42 +177,46 @@ def ai_extract_actions(req: ExtractRequest) -> list[str]:
 
 
 # ---------- 영속 엔드포인트 (meetingService 대체) ----------
-@app.get("/api/meetings")
-def list_meetings() -> list[dict]:
-    return store.list()
-
-
-@app.get("/api/meetings/{meeting_id}")
-def get_meeting(meeting_id: str) -> dict:
+def _owned_or_404(meeting_id: str, user: dict) -> dict:
+    """meeting 조회 + 소유자 확인. 없거나 남의 것이면 404(존재 자체를 숨김)."""
     m = store.get(meeting_id)
-    if m is None:
+    if m is None or m.get("ownerId") != user["id"]:
         raise HTTPException(status_code=404, detail="meeting 없음")
     return m
 
 
+@app.get("/api/meetings")
+def list_meetings(user: dict = Depends(auth.require_user)) -> list[dict]:
+    return store.list(owner_id=user["id"])
+
+
+@app.get("/api/meetings/{meeting_id}")
+def get_meeting(meeting_id: str, user: dict = Depends(auth.require_user)) -> dict:
+    return _owned_or_404(meeting_id, user)
+
+
 @app.post("/api/meetings")
-def create_meeting(meeting: dict) -> dict:
+def create_meeting(meeting: dict, user: dict = Depends(auth.require_user)) -> dict:
     if not meeting.get("id"):
         meeting["id"] = uuid.uuid4().hex
-    meeting.setdefault("ownerId", "local")
+    meeting["ownerId"] = user["id"]  # 소유자는 토큰에서 강제(클라이언트 위조 방지)
     meeting.setdefault("createdAt", _now_iso())
     meeting["updatedAt"] = _now_iso()
     return store.create(meeting)
 
 
 @app.patch("/api/meetings/{meeting_id}")
-def patch_meeting(meeting_id: str, patch: dict) -> dict:
+def patch_meeting(meeting_id: str, patch: dict, user: dict = Depends(auth.require_user)) -> dict:
+    _owned_or_404(meeting_id, user)  # 소유 확인 후에만 수정
+    patch.pop("ownerId", None)  # 소유자 변경 불가
     patch["updatedAt"] = _now_iso()
-    m = store.update(meeting_id, patch)
-    if m is None:
-        raise HTTPException(status_code=404, detail="meeting 없음")
-    return m
+    return store.update(meeting_id, patch)
 
 
 @app.delete("/api/meetings/{meeting_id}")
-def delete_meeting(meeting_id: str) -> dict:
-    if not store.delete(meeting_id):
-        raise HTTPException(status_code=404, detail="meeting 없음")
+def delete_meeting(meeting_id: str, user: dict = Depends(auth.require_user)) -> dict:
+    _owned_or_404(meeting_id, user)  # 소유 확인 후에만 삭제
+    store.delete(meeting_id)
     return {"ok": True}
 
 
@@ -200,6 +228,7 @@ def health() -> dict:
         "extract_backend": EXTRACT_BACKEND,
         "summarize_backend": SUMMARIZE_BACKEND or "off",
         "stt_model": "Cohere transcribe-03-2026",
+        "auth_users": users.count(),
     }
 
 

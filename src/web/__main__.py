@@ -10,9 +10,13 @@ dev: 프론트는 Vite(:3000)가 /api 를 이 서버(:8000)로 프록시. 컨테
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import uvicorn
+from dotenv import load_dotenv
 
 if __name__ == "__main__":
+    # WEB_PORT 등 .env 값을 포트 읽기 전에 로드(미적용 버그 수정). app import 전이라 직접 로드.
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     port = int(os.environ.get("WEB_PORT", "8000"))
     uvicorn.run("src.web.app:app", host="0.0.0.0", port=port, log_level="info")
