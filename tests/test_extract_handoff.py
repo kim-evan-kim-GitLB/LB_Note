@@ -47,7 +47,10 @@ def test_emit_structure() -> None:
         res = emit_extract_workorder(cleaned, d)
         wo = json.loads(Path(res["workorder_json"]).read_text(encoding="utf-8"))
         assert wo["workorder_schema_version"] == "extract-workorder-1.0", wo
-        assert wo["prompt_version"] == "extract-ko-1.0", wo
+        # 프롬프트 버전은 extract.ko.md 헤더에서 동적으로 읽어 비교(버전업마다 테스트 안 깨지게).
+        from src.postprocess.stages.extract import load_extract_prompt_version
+        assert wo["prompt_version"] == load_extract_prompt_version(), wo
+        assert wo["prompt_version"].startswith("extract-ko-"), wo
         assert wo["source_stem"] == "smoke", wo
         assert len(wo["segments"]) == 3, wo
         assert wo["action_items"] == [], wo  # 빈 슬롯

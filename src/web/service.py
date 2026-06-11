@@ -93,13 +93,18 @@ def clean_segments(raw_segments: list[dict], backend_name: str = "passthrough") 
 
 
 def extract_action_items(
-    cleaned_segments: list[dict], backend_name: str = "passthrough"
+    cleaned_segments: list[dict],
+    backend_name: str = "passthrough",
+    summary_hints: list[str] | None = None,
 ) -> list[dict]:
     """정제 segment → 웹 actionItems 목록. ExtractStage(회의 단위) 를 backend 로 직접 호출.
 
     추출은 segment 1:1 이 아니라 회의 전체 transcript 단위다(한 과제가 여러 segment에 걸침).
     ExtractStage 입력은 [{id, text}] — load_cleaned_segments 와 동일하게 정제 본문(cleaned)을
     text 로 노출한다. ExtractResult → 웹 계약 필드(text/owner/due/anchor/...)로 정규화.
+
+    summary_hints(방법2): 요약의 결정/이슈 텍스트를 추출 LLM 에 "참고 단서"로 격리 주입한다.
+    누락 보강용일 뿐 — 프롬프트가 "transcript 에 근거 없는 힌트는 버려라"를 강제하므로 환각은 차단.
 
     passthrough 등 JSON 출력이 안 되는 백엔드는 빈 결과가 나오므로 호출부에서 건너뛴다.
     """
@@ -113,7 +118,7 @@ def extract_action_items(
         for s in cleaned_segments
     ]
     backend = get_llm_backend(backend_name)
-    result = ExtractStage().run(ex_input, backend)
+    result = ExtractStage().run(ex_input, backend, ctx={"summary_hints": summary_hints})
     # anchor 결정적 산출: LLM 출력 anchor 는 신뢰하지 않는다(보통 null/추측). 계약대로
     # evidence_seg_ids 의 최소 start 에서 호출부가 직접 MM:SS 로 채운다(설계 §5, ActionItem.anchor).
     start_by_id = {s["id"]: s["start"] for s in ex_input}
@@ -148,6 +153,25 @@ def summarize_meeting(
     return summary.to_dict()
 
 
+def _summary_action_hints(summary: dict | None) -> list[str]:
+    """요약 dict → 추출 힌트 문자열 목록(각 안건의 결정·이슈 text). 방법2.
+
+    요약이 없거나 빈 구조체면 빈 목록(추출은 평소대로 transcript만으로 동작). 중복 text 는 제거.
+    """
+    if not summary:
+        return []
+    hints: list[str] = []
+    seen: set[str] = set()
+    for block in summary.get("agenda") or []:
+        for key in ("decisions", "issues"):
+            for it in block.get(key) or []:
+                text = str(it.get("text", "")).strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    hints.append(text)
+    return hints
+
+
 def process_audio_to_contract(
     audio_bytes: bytes,
     *,
@@ -172,12 +196,8 @@ def process_audio_to_contract(
         {"id": s.id, "start": s.start, "end": s.end, "cleaned": s.cleaned, "text": s.original}
         for s in final.segments
     ]
-    # 액션아이템 추출: passthrough 는 추출 불가(빈 값) 이므로 건너뛰고, 실 백엔드면 ExtractStage 가동.
-    ex_backend = extract_backend_name or backend_name
-    action_items: list[dict] = []
-    if ex_backend != "passthrough":
-        action_items = extract_action_items(seg_dicts, backend_name=ex_backend)
-    # 요약: 미지정 시 off(passthrough). 명시 백엔드일 때만 SummarizeStage 가동(설계 §6 폴백 정책).
+    # 요약 먼저(방법2): 요약의 결정/이슈를 추출 힌트로 쓰기 위해 추출보다 앞에 둔다.
+    # 미지정 시 off(passthrough). 명시 백엔드일 때만 SummarizeStage 가동(설계 §6 폴백 정책).
     sum_backend = summarize_backend_name
     summary: dict | None = None
     if sum_backend and sum_backend != "passthrough":
@@ -188,6 +208,14 @@ def process_audio_to_contract(
             # graceful degrade(설계 §6 "멈춤 없음"). 추출도 동일 정책 검토 대상.
             traceback.print_exc()
             summary = None
+    # 액션아이템 추출: passthrough 는 추출 불가(빈 값) 이므로 건너뛰고, 실 백엔드면 ExtractStage 가동.
+    # 요약이 있으면 그 결정/이슈를 힌트로 넘겨 누락을 보강(transcript 근거 없는 힌트는 프롬프트가 버림).
+    ex_backend = extract_backend_name or backend_name
+    action_items: list[dict] = []
+    if ex_backend != "passthrough":
+        action_items = extract_action_items(
+            seg_dicts, backend_name=ex_backend, summary_hints=_summary_action_hints(summary)
+        )
     contract = build_meeting_contract_from_segments(
         seg_dicts, action_items=action_items, summary=summary
     )
