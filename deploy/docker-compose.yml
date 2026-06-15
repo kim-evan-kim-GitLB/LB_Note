@@ -8,7 +8,7 @@
 #
 # 빌드+기동:  cd deploy && docker compose --env-file .env.deploy up -d --build
 # 로그:       docker compose --env-file .env.deploy logs -f
-# 접속:       http://<171-호스트-IP>:8088
+# 접속:       http://<171-LAN-IP>:49152   (HTTP, 인증서 없음)
 # 주의: BACKEND_DIR/FRONTEND_DIR/MODELS_DIR 는 빌드·볼륨 경로 치환에 쓰이므로
 #       반드시 --env-file .env.deploy 로 넘겨야 합니다(env_file: 만으로는 치환 안 됨).
 
@@ -25,7 +25,9 @@ services:
     container_name: meetscript-171
     restart: unless-stopped
     ports:
-      - "${HOST_PORT:-8088}:8088"        # 내부망 사용자 접속 포트
+      # 호스트 49152(HTTP) -> 컨테이너 8088. 내부망 사용자는 http://<LAN-IP>:49152 로 접속.
+      # 0.0.0.0 바인딩이라 호스트의 모든 인터페이스(LAN IP 포함)에서 열린다.
+      - "${HOST_PORT:-49152}:8088"
     env_file:
       - ./.env.deploy
     environment:

@@ -71,8 +71,11 @@ docker compose --env-file .env.deploy up -d --build
 docker compose --env-file .env.deploy logs -f        # 기동 로그
 ```
 
-- 접속: `http://<171-호스트-IP>:8088`
-- 헬스: `http://<171-호스트-IP>:8088/api/health` (claude_auth, cohere_model_exists 등 표시)
+- 접속: `http://<171-LAN-IP>:49152` (HTTP, 인증서 없음)
+- 헬스: `http://<171-LAN-IP>:49152/api/health` (claude_auth, cohere_model_exists 등 표시)
+- 호스트 49152 -> 컨테이너 8088 매핑. 0.0.0.0 바인딩이라 LAN 어디서든 접속(포트 49152 방화벽 오픈 필요).
+- 마이크 녹음: 접속 IP가 127.0.0.0/8 대역이면 HTTP 로도 마이크 동작(브라우저 보안 컨텍스트 예외).
+  일반 사설망(192.168/10.x)으로 접속하면 마이크가 차단되니 그때는 HTTPS 가 필요하다.
 - 첫 회의 처리 시 Cohere 모델(3.9G)을 로드하므로 수십 초 지연이 정상입니다.
 
 ## claude 요약/추출 인증 (사용자별)
@@ -114,8 +117,9 @@ vi prompts/extract.ko.md        # 또는 git pull 로 변경분 받기
 - 비밀번호: 사용자가 바꾼 비밀번호는 재기동해도 보존됩니다(seed 정책). 관리자가 강제
   초기화하려면 `WEB_AUTH_USERS` 에서 해당 id 를 빼고 재기동 후 다시 추가하세요.
 - 타임존: tzdata 미설치 환경 대비 `TZ=KST-9`(POSIX) 사용. 한국은 DST 가 없어 정확합니다.
-- 포트 변경: `HOST_PORT` 로 호스트 노출 포트만 바꿉니다(컨테이너 내부는 8088 고정).
-- TLS/도메인이 필요하면 이 컨테이너 앞에 nginx/Caddy 리버스 프록시를 두고 8088 로 프록시하세요.
+- 포트 변경: `HOST_PORT`(기본 49152) 로 호스트 노출 포트만 바꿉니다(컨테이너 내부는 8088 고정).
+- HTTP 운영: 로그인 비번/토큰이 평문 전송됩니다(신뢰된 사내 LAN 전제). 암호화/외부망 공개가
+  필요하면 이 컨테이너 앞에 nginx/Caddy 리버스 프록시로 TLS 종단 후 8088 로 프록시하세요.
 
 ## 트러블슈팅
 
