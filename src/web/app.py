@@ -201,6 +201,11 @@ def delete_claude_credential(user: dict = Depends(auth.require_user)) -> dict:
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 
+# 동시 STT 추론 제한(백프레셔). GPU 1장에 요청마다 모델을 load 하므로, 동시에 N개만 돌리고
+# 나머지는 대기시킨다 → OOM/연산 경합 방지. 대기 중 잡 status='queued'(프론트가 "처리 대기 중…" 표시).
+# 기본 1(직렬). WEB_STT_CONCURRENCY 로 조정(예: VRAM 여유 시 2). (모델 상주/유휴 언로드는 v2.)
+_stt_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_STT_CONCURRENCY", "1"))))
+
 
 def _run_ai_job(
     job_id: str, audio_bytes: bytes, mime_type: str | None, credential: dict | None
@@ -211,37 +216,42 @@ def _run_ai_job(
     심어 agent_cli 백엔드가 사용자별 인증으로 호출하게 한다(스레드별 ContextVar 격리). None 이면
     전역 폴백. 새 Thread 는 부모 ContextVar 를 자동 상속하지 않으므로 여기서 명시 설정한다.
     """
-    try:
-        with use_credential(credential):
-            contract = process_audio_to_contract(
-                audio_bytes,
-                mime_type=mime_type,
-                backend_name=CLEAN_BACKEND,
-                extract_backend_name=EXTRACT_BACKEND,
-                summarize_backend_name=SUMMARIZE_BACKEND or None,
-            )
-        result = {
-            "summary": contract.get("summary", {}),  # 구조체(dict) 계약 — 빈 기본값도 객체
-            "actionItems": contract.get("actionItems", []),
-            "transcript": contract.get("transcript", []),
-            "duration": _fmt_duration(contract.get("_duration_seconds")),
-        }
+    # 동시성 슬롯 확보까지 대기(잡 status 는 'queued' 유지). 확보하면 'processing' 으로 전환.
+    # 한 번에 _stt_semaphore 한도(기본 1)만 실제 추론, 나머지는 여기서 블록되어 큐처럼 동작한다.
+    with _stt_semaphore:
         with _jobs_lock:
-            _jobs[job_id] = {"status": "done", "result": result}
-    except AgentCLIAuthError as e:
-        # 인증 만료/미로그인: 일반 실패와 구분해 error_code 를 실어 프론트가 "재인증" 흐름을
-        # 안내하게 한다(STT 는 됐어도 요약/추출 백엔드 claude 인증이 끊긴 상태).
-        traceback.print_exc()
-        with _jobs_lock:
-            _jobs[job_id] = {
-                "status": "error",
-                "error": str(e),
-                "error_code": "claude_auth_expired",
+            _jobs[job_id] = {"status": "processing"}
+        try:
+            with use_credential(credential):
+                contract = process_audio_to_contract(
+                    audio_bytes,
+                    mime_type=mime_type,
+                    backend_name=CLEAN_BACKEND,
+                    extract_backend_name=EXTRACT_BACKEND,
+                    summarize_backend_name=SUMMARIZE_BACKEND or None,
+                )
+            result = {
+                "summary": contract.get("summary", {}),  # 구조체(dict) 계약 — 빈 기본값도 객체
+                "actionItems": contract.get("actionItems", []),
+                "transcript": contract.get("transcript", []),
+                "duration": _fmt_duration(contract.get("_duration_seconds")),
             }
-    except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
-        with _jobs_lock:
-            _jobs[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "done", "result": result}
+        except AgentCLIAuthError as e:
+            # 인증 만료/미로그인: 일반 실패와 구분해 error_code 를 실어 프론트가 "재인증" 흐름을
+            # 안내하게 한다(STT 는 됐어도 요약/추출 백엔드 claude 인증이 끊긴 상태).
+            traceback.print_exc()
+            with _jobs_lock:
+                _jobs[job_id] = {
+                    "status": "error",
+                    "error": str(e),
+                    "error_code": "claude_auth_expired",
+                }
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/api/ai/process")
@@ -258,14 +268,16 @@ def ai_process(req: ProcessRequest, user: dict = Depends(auth.require_user)) -> 
     # 현재 사용자 자격증명(secret 포함, 내부 주입용) 조회 → 잡 스레드로 전달.
     credential = auth.get_credential(user["username"])
     job_id = uuid.uuid4().hex
+    # 'queued' 로 시작: 스레드가 동시성 슬롯을 확보하면 _run_ai_job 이 'processing' 으로 전환한다.
+    # (슬롯이 비어 있으면 거의 즉시 processing, 혼잡하면 대기 → 프론트가 "처리 대기 중…" 표시.)
     with _jobs_lock:
-        _jobs[job_id] = {"status": "processing"}
+        _jobs[job_id] = {"status": "queued"}
     threading.Thread(
         target=_run_ai_job,
         args=(job_id, audio_bytes, req.mimeType, credential),
         daemon=True,
     ).start()
-    return {"jobId": job_id, "status": "processing"}
+    return {"jobId": job_id, "status": "queued"}
 
 
 @app.get("/api/ai/jobs/{job_id}")
