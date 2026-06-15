@@ -42,8 +42,10 @@ services:
       # 호스트에서 git pull(또는 직접 편집)만 하면 재빌드/재시작 없이 다음 회의부터 즉시 반영.
       # 추출 고도화의 주 대상: prompts/extract.ko.md (수정 시 prompt_version 올릴 것)
       - "${BACKEND_DIR:-..}/prompts:/app/prompts:ro"
-      # SQLite(계정/비번/사용자별 자격증명) + 산출물 영속. output/web/meetings.db 포함.
-      - meetscript-data:/app/output
+      # SQLite(계정/비번/사용자별 자격증명) + 산출물 영속. host-dir bind 라 호스트에서
+      # DB 파일(/opt/meetscript/data/web/meetings.db)을 직접 보고 cp 로 백업/이관 가능.
+      # 기존 DB 를 미리 DATA_DIR/web/ 에 놓으면 그대로 승계됨.
+      - "${DATA_DIR:?DATA_DIR(DB·산출물 호스트 경로)를 .env.deploy 에 지정하세요}:/app/output"
     # GPU 패스스루(nvidia-container-toolkit 필요).
     deploy:
       resources:
@@ -60,6 +62,4 @@ services:
       timeout: 5s
       retries: 5
       start_period: 120s                 # 첫 요청 시 모델 로드 시간 고려
-
-volumes:
-  meetscript-data:
+# named volume 미사용: 데이터는 host-dir bind(DATA_DIR)로 영속한다.

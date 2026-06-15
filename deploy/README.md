@@ -111,9 +111,12 @@ vi prompts/extract.ko.md        # 또는 git pull 로 변경분 받기
 
 ## 운영 메모
 
-- 데이터 영속: named volume `meetscript-data` -> `/app/output`
-  (SQLite `output/web/meetings.db` = 계정/비번/사용자별 자격증명 + 산출물).
-  - 백업: `docker run --rm -v meetscript-data:/data -v "$PWD":/b alpine tar czf /b/meetscript-data.tgz -C /data .`
+- 데이터 영속: host-dir bind `DATA_DIR`(예: `/opt/meetscript/data`) -> `/app/output`
+  (SQLite `web/meetings.db` = 계정/비번/사용자별 자격증명 + 산출물). 호스트에 평범한 파일로 떨어짐.
+  - 이관: 기존 `meetings.db` 를 `DATA_DIR/web/` 에 복사해두면 그대로 승계(컨테이너 root 가 쓰므로
+    파일/디렉토리 소유·권한만 맞춰둘 것).
+  - 백업(핫백업 권장): `sqlite3 /opt/meetscript/data/web/meetings.db ".backup /opt/meetscript/backup/meetings-$(date +%F).db"`
+    (또는 단순 `cp`). 매일 1회 크론이면 충분.
 - 비밀번호: 사용자가 바꾼 비밀번호는 재기동해도 보존됩니다(seed 정책). 관리자가 강제
   초기화하려면 `WEB_AUTH_USERS` 에서 해당 id 를 빼고 재기동 후 다시 추가하세요.
 - 타임존: tzdata 미설치 환경 대비 `TZ=KST-9`(POSIX) 사용. 한국은 DST 가 없어 정확합니다.
