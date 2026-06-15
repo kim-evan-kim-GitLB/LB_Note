@@ -18,6 +18,11 @@ dependencies = [
     "matplotlib>=3.10.9",
     "silero-vad>=5.1",
     "einops>=0.7",
+    "fastapi>=0.136",
+    "uvicorn>=0.49",
+    "pyjwt>=2.13",
+    "passlib>=1.7",
+    "python-multipart>=0.0.32",
 ]
 
 # torch/torchaudio 는 GPU 아키텍처별 휠이 달라 상호 배타 extra 로 분리.
