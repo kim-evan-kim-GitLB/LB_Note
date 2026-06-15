@@ -44,7 +44,9 @@ CREATE TABLE IF NOT EXISTS users (
     username      TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
     display_name  TEXT,
-    role          TEXT DEFAULT 'user',
+    role          TEXT DEFAULT 'user',   -- 권한(user/developer/admin). 직함과 무관.
+    english_name  TEXT,                  -- 영어 이름(이메일 @앞). 아바타 이니셜·보조 표기용.
+    job_title     TEXT,                  -- 직함(대표이사/팀장/프로 등). 권한 role 과 별개.
     created_at    TEXT
 );
 CREATE TABLE IF NOT EXISTS claude_credentials (
@@ -71,22 +73,41 @@ class UserStore:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(_USERS_SCHEMA)
+            # 기존 DB 마이그레이션: 신규 컬럼이 없으면 추가(이미 있으면 OperationalError 무시).
+            for col in ("english_name", "job_title"):
+                try:
+                    self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass  # 이미 존재
             self._conn.commit()
 
-    def upsert(self, username: str, password: str, *, display_name=None, role="user") -> None:
-        """사용자 생성/비번 갱신(전체 덮어쓰기). 기존이면 비번·표시명·역할 갱신."""
+    def upsert(
+        self,
+        username: str,
+        password: str,
+        *,
+        display_name=None,
+        role="user",
+        english_name=None,
+        job_title=None,
+    ) -> None:
+        """사용자 생성/비번 갱신(전체 덮어쓰기). 기존이면 비번·표시명·역할·영어이름·직함 갱신."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO users (username, password_hash, display_name, role, created_at) "
-                "VALUES (?,?,?,?,?) "
+                "INSERT INTO users "
+                "(username, password_hash, display_name, role, english_name, job_title, created_at) "
+                "VALUES (?,?,?,?,?,?,?) "
                 "ON CONFLICT(username) DO UPDATE SET "
                 "password_hash=excluded.password_hash, display_name=excluded.display_name, "
-                "role=excluded.role",
+                "role=excluded.role, english_name=excluded.english_name, "
+                "job_title=excluded.job_title",
                 (
                     username,
                     pbkdf2_sha256.hash(password),
                     display_name or username,
                     role,
+                    english_name,
+                    job_title,
                     dt.datetime.now().isoformat(timespec="seconds"),
                 ),
             )
@@ -129,7 +150,8 @@ class UserStore:
     def get(self, username: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT username, password_hash, display_name, role FROM users WHERE username=?",
+                "SELECT username, password_hash, display_name, role, english_name, job_title "
+                "FROM users WHERE username=?",
                 (username,),
             ).fetchone()
         return dict(row) if row else None
@@ -218,6 +240,8 @@ def public_user(u: dict) -> dict:
         "username": u["username"],
         "displayName": u.get("display_name") or u["username"],
         "role": u.get("role") or "user",
+        "englishName": u.get("english_name"),
+        "jobTitle": u.get("job_title"),
     }
 
 

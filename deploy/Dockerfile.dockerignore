@@ -1,0 +1,30 @@
+# 백엔드 빌드 컨텍스트(/app) 슬림화. BuildKit 은 deploy/Dockerfile 사용 시 이 파일을
+# 컨텍스트 무시 규칙으로 적용한다. Dockerfile 은 pyproject/uv.lock/src/prompts/config/deploy 를 COPY.
+.git
+.gitignore
+.venv
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# 대용량/런타임 산출물(이미지에 안 굽고 볼륨 마운트)
+models/
+output/
+samples/
+answer/
+*.wav
+*.mp3
+*.m4a
+*.webm
+
+# 비밀/로컬
+.env
+deploy/.env.deploy
+
+# 개발용(런타임 불필요)
+tests/
+tools/
+docs/
+.ruff_cache/
+.pytest_cache/
