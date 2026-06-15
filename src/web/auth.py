@@ -45,7 +45,17 @@ CREATE TABLE IF NOT EXISTS users (
     role          TEXT DEFAULT 'user',
     created_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS claude_credentials (
+    username   TEXT PRIMARY KEY,
+    cred_type  TEXT NOT NULL,   -- 'api_key' | 'oauth_token'
+    secret     TEXT NOT NULL,   -- 평문 보관(현 .env/~/.claude 수준). API 응답엔 절대 미노출.
+    updated_at TEXT
+);
 """
+
+# 사용자별 claude 자격증명 종류. api_key=ANTHROPIC_API_KEY(만료 없음, --bare 격리),
+# oauth_token=CLAUDE_CODE_OAUTH_TOKEN(구독 토큰, HOME 교정 불필요).
+_CRED_TYPES = ("api_key", "oauth_token")
 
 
 class UserStore:
@@ -108,6 +118,61 @@ class UserStore:
         if not u or not pbkdf2_sha256.verify(password, u["password_hash"]):
             return None
         return public_user(u)
+
+    # ---- 사용자별 claude 자격증명(claude_credentials 테이블) ----
+    def set_credential(self, username: str, cred_type: str, secret: str) -> None:
+        """사용자 claude 자격증명 저장/갱신. cred_type 검증, secret 평문 보관(로그 금지)."""
+        if cred_type not in _CRED_TYPES:
+            raise ValueError(
+                f"알 수 없는 cred_type: {cred_type!r} (지원: {', '.join(_CRED_TYPES)})"
+            )
+        secret = (secret or "").strip()
+        if not secret:
+            raise ValueError("secret 이 비어 있습니다.")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO claude_credentials (username, cred_type, secret, updated_at) "
+                "VALUES (?,?,?,?) "
+                "ON CONFLICT(username) DO UPDATE SET "
+                "cred_type=excluded.cred_type, secret=excluded.secret, "
+                "updated_at=excluded.updated_at",
+                (username, cred_type, secret, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            self._conn.commit()
+
+    def get_credential(self, username: str) -> dict | None:
+        """사용자 자격증명(secret 포함, **내부 주입 전용**). 없으면 None.
+
+        반환: {"type": cred_type, "secret": ..., "updated_at": ...}. 이 dict 는 절대 API 응답에
+        그대로 실으면 안 된다(secret 노출). 공개 상태는 credential_status() 사용.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cred_type, secret, updated_at FROM claude_credentials WHERE username=?",
+                (username,),
+            ).fetchone()
+        if not row:
+            return None
+        return {"type": row["cred_type"], "secret": row["secret"], "updated_at": row["updated_at"]}
+
+    def clear_credential(self, username: str) -> bool:
+        """사용자 자격증명 삭제. 삭제된 행이 있으면 True."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM claude_credentials WHERE username=?", (username,)
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def credential_status(self, username: str) -> dict:
+        """자격증명 공개 상태(secret **비노출**). 설정 UI/상태 표시용.
+
+        반환: {"configured": bool, "type": str|None, "updated_at": str|None}.
+        """
+        cred = self.get_credential(username)
+        if not cred:
+            return {"configured": False, "type": None, "updated_at": None}
+        return {"configured": True, "type": cred["type"], "updated_at": cred["updated_at"]}
 
 
 def public_user(u: dict) -> dict:
@@ -184,6 +249,25 @@ def store() -> UserStore:
     if _store is None:
         raise RuntimeError("auth.init() 가 호출되지 않았습니다.")
     return _store
+
+
+# ---- 모듈 레벨 자격증명 헬퍼(싱글턴 store 위임) ----
+def set_credential(username: str, cred_type: str, secret: str) -> None:
+    store().set_credential(username, cred_type, secret)
+
+
+def get_credential(username: str) -> dict | None:
+    """secret 포함 — 내부 주입 전용. API 응답에 그대로 싣지 말 것."""
+    return store().get_credential(username)
+
+
+def clear_credential(username: str) -> bool:
+    return store().clear_credential(username)
+
+
+def credential_status(username: str) -> dict:
+    """secret 비노출 공개 상태."""
+    return store().credential_status(username)
 
 
 # ---- FastAPI 의존성: Bearer 토큰 검증 → 현재 사용자 ----

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from src.pipeline import run_pipeline
 from src.postprocess.backends import get_llm_backend
+from src.postprocess.backends.agent_cli import AgentCLIAuthError
 from src.postprocess.extract_schema import seconds_to_timestamp
 from src.postprocess.glossary import load_glossary
 from src.postprocess.pipeline import _apply_glossary, _glossary_block, gate_segments
@@ -203,9 +204,13 @@ def process_audio_to_contract(
     if sum_backend and sum_backend != "passthrough":
         try:
             summary = summarize_meeting(seg_dicts, backend_name=sum_backend)
+        except AgentCLIAuthError:
+            # 인증 만료/미로그인은 graceful degrade 대상이 아니다 → 빈 요약으로 묻으면
+            # "재인증 필요"를 알 길이 없다. 그대로 전파해 호출부가 인증 흐름으로 분기하게 한다.
+            raise
         except Exception:  # noqa: BLE001
-            # 요약 실패는 회의 전체(정제·추출·transcript)를 죽이지 않는다 → 빈 요약으로
-            # graceful degrade(설계 §6 "멈춤 없음"). 추출도 동일 정책 검토 대상.
+            # (인증 외) 요약 실패는 회의 전체(정제·추출·transcript)를 죽이지 않는다 → 빈
+            # 요약으로 graceful degrade(설계 §6 "멈춤 없음"). 추출도 동일 정책 검토 대상.
             traceback.print_exc()
             summary = None
     # 액션아이템 추출: passthrough 는 추출 불가(빈 값) 이므로 건너뛰고, 실 백엔드면 ExtractStage 가동.

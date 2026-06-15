@@ -17,7 +17,10 @@ from src.web import app as webapp  # noqa: E402
 
 
 def _call(text: str) -> list[str]:
-    return webapp.ai_extract_actions(webapp.ExtractRequest(text=text))
+    # 엔드포인트를 DI 없이 직접 호출 → require_user 가 주입할 user 를 수동 전달.
+    # (사용자별 자격증명 주입 추가로 user["username"] 를 읽으므로 가짜 user 필요.)
+    fake_user = {"id": "tester", "username": "tester", "role": "developer"}
+    return webapp.ai_extract_actions(webapp.ExtractRequest(text=text), user=fake_user)
 
 
 def test_passthrough_returns_empty() -> None:
