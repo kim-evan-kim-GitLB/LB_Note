@@ -88,6 +88,15 @@ class CredentialRequest(BaseModel):
     secret: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+# 셀프 비번 변경 시 새 비밀번호 최소 길이.
+MIN_PASSWORD_LEN = 8
+
+
 # ---------- 인증 (프론트 src/lib/firebase.ts 계약) ----------
 @app.post("/api/auth/login")
 def auth_login(req: LoginRequest) -> dict:
@@ -102,6 +111,30 @@ def auth_login(req: LoginRequest) -> dict:
 def auth_me(user: dict = Depends(auth.require_user)) -> dict:
     """Bearer 토큰으로 세션 복원. 무효/만료 토큰은 require_user 가 401."""
     return user
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    req: ChangePasswordRequest, user: dict = Depends(auth.require_user)
+) -> dict:
+    """관리자에게 부여받은 비밀번호를 본인이 변경. 현재 비번 검증 후 새 비번으로 교체.
+
+    기존 토큰은 username 기반이라 변경 후에도 유효(재로그인 불필요). 부팅 시드는 seed_user 라
+    변경된 비번이 재기동에 보존된다(auth.py 참조).
+    """
+    username = user["username"]
+    if users.verify(username, req.current_password) is None:
+        raise HTTPException(status_code=400, detail="현재 비밀번호가 올바르지 않습니다.")
+    new_pw = req.new_password or ""
+    if len(new_pw) < MIN_PASSWORD_LEN:
+        raise HTTPException(
+            status_code=400, detail=f"새 비밀번호는 {MIN_PASSWORD_LEN}자 이상이어야 합니다."
+        )
+    if new_pw == req.current_password:
+        raise HTTPException(status_code=400, detail="새 비밀번호가 현재 비밀번호와 같습니다.")
+    if not users.set_password(username, new_pw):
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+    return {"ok": True, "detail": "비밀번호가 변경되었습니다."}
 
 
 # ---------- 사용자별 claude 자격증명 설정 ----------

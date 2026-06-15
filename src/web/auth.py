@@ -9,8 +9,10 @@
   - 비밀번호: passlib pbkdf2_sha256(순수 파이썬, bcrypt 백엔드 불필요).
   - 토큰: PyJWT HS256, 서명키=env JWT_SECRET. 만료=WEB_AUTH_TOKEN_TTL 초(기본 7일).
   - 사용자: SQLite users 테이블(저장소와 같은 DB 파일). env WEB_AUTH_USERS 가 사용자 목록의
-    단일 진실원천 — "user:pass,user2:pass2" 형식, 부팅 시 upsert(목록에 있으면 비번을 env 값으로
-    동기화). 비어있고 사용자도 없으면 기본 admin/admin 시드(경고 로그) → 운영 전 교체 권장.
+    단일 진실원천 — "user:pass,user2:pass2" 형식, 부팅 시 seed_user(없으면 env 비번으로 생성,
+    있으면 **비번 보존**+역할만 동기화 → 셀프 비번 변경이 재기동에 안 되돌아감). 비어있고 사용자도
+    없으면 기본 admin/admin 시드(경고 로그) → 운영 전 교체 권장.
+  - 셀프 비번 변경: POST /api/auth/change-password (현재 비번 검증 후 set_password).
 
 무거운 의존성 없이 stdlib + 이미 설치된 PyJWT/passlib 만 사용.
 """
@@ -72,7 +74,7 @@ class UserStore:
             self._conn.commit()
 
     def upsert(self, username: str, password: str, *, display_name=None, role="user") -> None:
-        """사용자 생성/비번 갱신(env 동기화용). 기존이면 비번·표시명·역할 갱신."""
+        """사용자 생성/비번 갱신(전체 덮어쓰기). 기존이면 비번·표시명·역할 갱신."""
         with self._lock:
             self._conn.execute(
                 "INSERT INTO users (username, password_hash, display_name, role, created_at) "
@@ -89,6 +91,40 @@ class UserStore:
                 ),
             )
             self._conn.commit()
+
+    def seed_user(self, username: str, password: str, *, display_name=None, role="user") -> None:
+        """부팅 시드용 — 없으면 env 비번으로 생성, 있으면 **비번은 보존**하고 역할·표시명만 동기화.
+
+        upsert 와 달리 기존 사용자의 password_hash 를 덮어쓰지 않는다 → 사용자가 셀프로 바꾼
+        비밀번호가 재기동 시 env 값으로 되돌아가지 않는다. (env WEB_AUTH_USERS 는 '누가 존재하나'
+        와 '초기 비번·역할'의 원천이지, 변경된 비번까지 강제 동기화하지는 않는다. 관리자가 비번을
+        강제 초기화하려면 WEB_AUTH_USERS 에서 해당 계정을 제거(prune 삭제) 후 다시 추가하면 된다.)
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO users (username, password_hash, display_name, role, created_at) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(username) DO UPDATE SET "
+                "display_name=excluded.display_name, role=excluded.role",  # 비번(password_hash) 미갱신
+                (
+                    username,
+                    pbkdf2_sha256.hash(password),
+                    display_name or username,
+                    role,
+                    dt.datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            self._conn.commit()
+
+    def set_password(self, username: str, new_password: str) -> bool:
+        """사용자 비밀번호만 갱신(셀프 변경용). 존재하면 True. 역할·표시명은 건드리지 않음."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET password_hash=? WHERE username=?",
+                (pbkdf2_sha256.hash(new_password), username),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
 
     def get(self, username: str) -> dict | None:
         with self._lock:
@@ -223,7 +259,8 @@ def init(db_path=None) -> UserStore:
             if not username or not password:
                 continue
             role = "admin" if username in admins else "developer"
-            _store.upsert(username, password, role=role)
+            # seed_user: 신규면 env 비번으로 생성, 기존이면 비번 보존(셀프 변경 유지)+역할 동기화.
+            _store.seed_user(username, password, role=role)
             listed.append(username)
 
     # prune: env(WEB_AUTH_USERS)를 계정의 단일 진실원천으로 — 목록에 없는 계정 제거.
