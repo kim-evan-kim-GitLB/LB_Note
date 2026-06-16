@@ -74,6 +74,11 @@ services:
     restart: unless-stopped
     depends_on:
       - meetscript
+    environment:
+      # Caddyfile 의 {$SITE_HOST} 치환값 = 사용자가 접속하는 171 LAN IP(또는 호스트명).
+      # tls internal 이 이 이름으로 인증서를 발급해야 IP 접속이 동작한다. 미설정 시 배포 실패
+      # (:? )로 막아, 인증서 이름 누락으로 HTTPS 가 조용히 깨지는 사고를 방지.
+      SITE_HOST: "${SITE_HOST:?SITE_HOST(접속 IP/호스트명)를 .env.deploy 에 지정하세요}"
     ports:
       # 호스트 HOST_PORT(기본 49152) -> caddy :443(HTTPS). 0.0.0.0 바인딩.
       - "${HOST_PORT:-49152}:443"

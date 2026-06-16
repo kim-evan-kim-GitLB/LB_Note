@@ -15,9 +15,16 @@
 	auto_https disable_redirects
 }
 
-# 컨테이너 내부 :443 수신. 호스트 노출 포트(HOST_PORT)는 compose 가 :443 으로 매핑한다.
-# 사이트 주소를 비워(:443) IP 직접 접속(https://<LAN-IP>:HOST_PORT)을 받는다.
-:443 {
+# [중요] 사이트 주소에 접속 호스트/IP 를 명시해야 tls internal 이 그 이름으로 유효한 인증서를
+# 발급한다. 포트만 쓴 ':443' 은 SNI 에 맞는 cert 가 없어 IP 접속 시 TLS internal error 로
+# 접속 자체가 실패한다(개발 컨테이너 검증으로 확인). 포트는 적지 않는다 → 호스트 포트매핑
+# (HOST_PORT→443)으로 브라우저 Host 포트(예 49152)와 리스너 포트(443)가 달라도 호스트명으로
+# 매칭된다(포트매핑 시뮬레이션 검증 완료).
+#   - SITE_HOST : 사용자가 접속하는 171 서버 LAN IP(또는 호스트명). .env.deploy 에서 주입(필수).
+#   - localhost : 컨테이너 내부/헬스체크의 로컬 접근도 유효 인증서로 동작하도록 함께 둔다.
+#   - bind 0.0.0.0 : 컨테이너는 SITE_HOST IP 를 직접 갖지 않으므로 전 인터페이스에서 수신.
+https://{$SITE_HOST}, https://localhost {
+	bind 0.0.0.0
 	tls internal
 	# 업로드(회의 오디오 base64)가 크므로 본문 상한을 넉넉히(기본 제한 회피). 과대 페이로드 차단.
 	request_body {
