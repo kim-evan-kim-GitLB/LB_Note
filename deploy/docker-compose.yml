@@ -1,0 +1,65 @@
+# meetscript-ai 온프레미스 배포 (171 서버, 별도 컨테이너)
+#
+# 사전 준비
+#   1) 호스트에 nvidia-container-toolkit 설치(컨테이너 GPU 패스스루).
+#   2) STT 모델 가중치(3.9G)를 호스트 경로에 두고 MODELS_DIR 로 지정.
+#   3) deploy/.env.deploy 작성(.env.deploy.example 복사 후 비밀값 채우기).
+#   4) 프론트 repo 경로 확인: build.additional_contexts.frontendsrc.
+#
+# 빌드+기동:  cd deploy && docker compose --env-file .env.deploy up -d --build
+# 로그:       docker compose --env-file .env.deploy logs -f
+# 접속:       http://<171-LAN-IP>:49152   (HTTP, 인증서 없음)
+# 주의: BACKEND_DIR/FRONTEND_DIR/MODELS_DIR 는 빌드·볼륨 경로 치환에 쓰이므로
+#       반드시 --env-file .env.deploy 로 넘겨야 합니다(env_file: 만으로는 치환 안 됨).
+
+services:
+  meetscript:
+    build:
+      # 호스트에서 git clone 한 백엔드 repo 루트. (기본값은 개발 컨테이너 기준)
+      context: ${BACKEND_DIR:-..}
+      dockerfile: deploy/Dockerfile
+      additional_contexts:
+        # 호스트에서 git clone 한 프론트엔드 repo 경로(별도 repo).
+        frontendsrc: ${FRONTEND_DIR:-/home/evan/meetscript-ai}
+    image: meetscript-ai:171
+    container_name: meetscript-171
+    restart: unless-stopped
+    ports:
+      # 호스트 49152(HTTP) -> 컨테이너 8088. 내부망 사용자는 http://<LAN-IP>:49152 로 접속.
+      # 0.0.0.0 바인딩이라 호스트의 모든 인터페이스(LAN IP 포함)에서 열린다.
+      - "${HOST_PORT:-49152}:8088"
+    env_file:
+      - ./.env.deploy
+    environment:
+      WEB_PORT: "8088"
+      TZ: "KST-9"                        # tzdata 미설치 환경용 POSIX 표기(한국, DST 없음)
+    volumes:
+      # 모델 가중치(읽기전용). 호스트에 미리 1회 배치한 경로를 MODELS_DIR 로 지정.
+      # (이 컨테이너에서 꺼내려면: docker cp <컨테이너>:/app/models <호스트경로>)
+      - "${MODELS_DIR:?MODELS_DIR(모델 디렉토리 호스트 경로)를 .env.deploy 에 지정하세요}:/app/models:ro"
+      # 프롬프트 라이브 마운트(읽기전용). 이미지에도 구워두지만(자체완결), 호스트 git repo 의
+      # prompts/ 를 덮어쓴다 → 프롬프트는 요청마다 새로 읽히므로(_load_prompt 캐시 없음)
+      # 호스트에서 git pull(또는 직접 편집)만 하면 재빌드/재시작 없이 다음 회의부터 즉시 반영.
+      # 추출 고도화의 주 대상: prompts/extract.ko.md (수정 시 prompt_version 올릴 것)
+      - "${BACKEND_DIR:-..}/prompts:/app/prompts:ro"
+      # SQLite(계정/비번/사용자별 자격증명) + 산출물 영속. host-dir bind 라 호스트에서
+      # DB 파일(/opt/meetscript/data/web/meetings.db)을 직접 보고 cp 로 백업/이관 가능.
+      # 기존 DB 를 미리 DATA_DIR/web/ 에 놓으면 그대로 승계됨.
+      - "${DATA_DIR:?DATA_DIR(DB·산출물 호스트 경로)를 .env.deploy 에 지정하세요}:/app/output"
+    # GPU 패스스루(nvidia-container-toolkit 필요).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Compose v2.30+ 에서는 아래 한 줄로도 GPU 할당 가능(위 deploy 블록과 택1).
+    # gpus: all
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8088/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s                 # 첫 요청 시 모델 로드 시간 고려
+# named volume 미사용: 데이터는 host-dir bind(DATA_DIR)로 영속한다.

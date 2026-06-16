@@ -1,0 +1,18 @@
+{
+  "file": "text-axenh.cleaned.json",
+  "extractor": "fixed-prompt v1 (general-purpose agent, blind)",
+  "run": 1,
+  "n_items": 10,
+  "action_items": [
+    {"text": "오픈소스 STT 모델 2개(Qwen3-ASR, Cohere) 비교 테스트로 더 적합한 모델 선정", "evidence_seg_ids": [15,16,67,164]},
+    {"text": "선정 모델을 본인 로컬 노트북 환경에서 직접 돌려 동작·속도·정확도 확인", "evidence_seg_ids": [88,164,180]},
+    {"text": "페이즈1(모델 확정+텍스트 추출)을 다음 주 수요일(6/2)까지 완료", "due": "2026-06-02", "evidence_seg_ids": [105,108,117]},
+    {"text": "모델 선정 근거·결과를 2장 내외 문서로 작성해 대표 보고", "due": "내일", "evidence_seg_ids": [69,91]},
+    {"text": "페이즈2: 추출 텍스트에서 액션아이템 도출(리스트/문서화)", "evidence_seg_ids": [109,114,203]},
+    {"text": "대표 보유 회의 녹음 파일을 프로에게 전달해 그 파일로 테스트", "evidence_seg_ids": [79,164,169]},
+    {"text": "대표(진영)가 다음 주 중 마일스톤 초안 작성해 공유·합작", "due": "다음 주 중", "evidence_seg_ids": [123,194]},
+    {"text": "진행상황(마일스톤) 보고를 슬랙 채널에 텍스트로 공유", "evidence_seg_ids": [122,193]},
+    {"text": "회의록 양식 정의 + 해당 양식 채우는 AI 스킬 제작", "evidence_seg_ids": [95,119]},
+    {"text": "클로바노트 등 기존 툴 결과 품질에 대한 의견을 대표에 제공", "evidence_seg_ids": [180]}
+  ]
+}

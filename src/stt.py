@@ -42,4 +42,11 @@ def get_vad(name: str | None = None) -> VADBackend | None:
             min_speech_sec=config.VAD_MIN_SPEECH_SEC,
             min_silence_sec=config.VAD_MIN_SILENCE_SEC,
         )
-    raise ValueError(f"알 수 없는 VAD: {name!r} (지원: silero)")
+    if name == "energy":
+        # 벡터화 에너지 VAD (~15x 빠름, 모델 없음). 청킹 경계 검출용.
+        from src.backends.energy_vad import EnergyVAD
+        return EnergyVAD(
+            min_speech_sec=config.VAD_MIN_SPEECH_SEC,
+            min_silence_sec=config.VAD_MIN_SILENCE_SEC,
+        )
+    raise ValueError(f"알 수 없는 VAD: {name!r} (지원: silero, energy)")

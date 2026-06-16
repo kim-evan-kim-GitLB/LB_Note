@@ -20,6 +20,12 @@ def _norm_token(t: str) -> str:
 DEFAULT_CHUNK_SEC = 60.0
 DEFAULT_OVERLAP_SEC = 10.0
 
+# --- VAD 분할 청킹 기본값 (tools/vad_chunk_ax_clova.py 의 '되는 버전' 상수) ---
+DEFAULT_TARGET_SEC = 30.0        # < max_audio_clip_s(35) → 모델 내부 청커 재분할 없음
+DEFAULT_PAD_SEC = 0.2            # 발화 구간 앞뒤 여유
+DEFAULT_SEG_OVERLAP_SEC = 2.0    # 초장발화 hard-split 시에만 사용(겹침+dedup)
+SEAM_DEDUP_MAX_WORDS = 12        # overlap seam 단어 중복제거 탐색 한도
+
 
 @dataclass
 class AudioChunk:
@@ -27,6 +33,8 @@ class AudioChunk:
     start_sec: float
     end_sec: float
     samples: np.ndarray
+    # overlap seam(초장발화 hard-split 경계) 여부 — VAD 분할에서만 사용, 병합 시 dedup 대상.
+    is_overlap_seam: bool = False
 
 
 def chunk_audio(
@@ -61,6 +69,108 @@ def chunk_audio(
         start += step_n
         idx += 1
     return chunks
+
+
+def vad_segment_chunks(
+    audio: np.ndarray,
+    sr: int = 16000,
+    regions: list[tuple[float, float]] | None = None,
+    target_sec: float = DEFAULT_TARGET_SEC,
+    pad_sec: float = DEFAULT_PAD_SEC,
+    overlap_sec: float = DEFAULT_SEG_OVERLAP_SEC,
+) -> list[AudioChunk]:
+    """VAD 발화 구간(regions) → ≤target_sec AudioChunk 리스트.
+
+    tools/vad_chunk_ax_clova.py 의 build_chunks 로직 포팅:
+    - 인접 발화를 ≤target 으로 greedy 묶고, 컷은 발화 사이 무음 gap 에 떨어진다.
+    - 단일 발화가 target 초과면 overlap 을 주고 hard-split(이 경계만 is_overlap_seam=True).
+    각 청크 ≤target<max_audio_clip_s 라 모델 내부 에너지 청커가 재분할하지 않음.
+    """
+    assert audio.ndim == 1, f"1D 배열만 지원. shape={audio.shape}"
+    dur = len(audio) / float(sr)
+    regions = regions or []
+    # pad 적용 후 경계 클램프
+    padded = [(max(0.0, s - pad_sec), min(dur, e + pad_sec)) for s, e in regions]
+
+    spans: list[tuple[float, float, bool]] = []  # (start, end, is_overlap_seam)
+    cur_s: float | None = None
+    cur_e: float | None = None
+
+    def flush() -> None:
+        nonlocal cur_s, cur_e
+        if cur_s is not None:
+            spans.append((cur_s, cur_e, False))
+            cur_s, cur_e = None, None
+
+    for s, e in padded:
+        if e - s > target_sec:                       # 초장발화 → hard-split (겹침)
+            flush()
+            t = s
+            first = True
+            while t < e:
+                seg_end = min(t + target_sec, e)
+                spans.append((t, seg_end, not first))
+                first = False
+                if seg_end >= e:
+                    break
+                t = seg_end - overlap_sec
+            continue
+        if cur_s is None:
+            cur_s, cur_e = s, e
+        elif e - cur_s <= target_sec:                # 같은 청크로 확장(내부 짧은 pause 포함)
+            cur_e = e
+        else:                                        # 무음 gap 에서 컷
+            flush()
+            cur_s, cur_e = s, e
+    flush()
+
+    chunks: list[AudioChunk] = []
+    for idx, (s, e, seam) in enumerate(spans):
+        a = int(round(s * sr))
+        b = int(round(e * sr))
+        chunks.append(AudioChunk(
+            index=idx,
+            start_sec=s,
+            end_sec=e,
+            samples=audio[a:b],
+            is_overlap_seam=seam,
+        ))
+    return chunks
+
+
+def merge_vad_segments(segments: list[Segment]) -> list[Segment]:
+    """VAD 분할 청크 Segment 병합. overlap seam 청크만 앞 청크 꼬리와 단어 중복제거.
+
+    tools/vad_chunk_ax_clova.py 의 merge_texts 로직 포팅(SEAM_DEDUP_MAX_WORDS).
+    seam 이 아닌 청크는 dedup 없이 그대로 이어붙임(컷이 항상 무음 경계라 중복 없음).
+    is_overlap_seam 은 Segment.meta["is_overlap_seam"] 로 전달받는다.
+    """
+    if not segments:
+        return []
+    merged: list[Segment] = [segments[0]]
+    for nxt in segments[1:]:
+        prev = merged[-1]
+        text = nxt.text
+        if nxt.meta.get("is_overlap_seam"):
+            prev_w = prev.text.split()
+            w = text.split()
+            if prev_w and w:
+                maxk = min(SEAM_DEDUP_MAX_WORDS, len(prev_w), len(w))
+                best = 0
+                for k in range(maxk, 0, -1):
+                    if prev_w[-k:] == w[:k]:
+                        best = k
+                        break
+                text = " ".join(w[best:])
+        merged.append(Segment(
+            start=nxt.start,
+            end=nxt.end,
+            text=text,
+            confidence=nxt.confidence,
+            speaker=nxt.speaker,
+            meta=nxt.meta,
+        ))
+    return merged
 
 
 def _strip_overlap(prev_text: str, next_text: str, max_tokens: int = 50) -> str:

@@ -12,6 +12,8 @@ from pathlib import Path
 PUNCT_RE = re.compile(r"[\.\,\!\?\…\"‘’“”]+")
 SLASH_VARIANT_RE = re.compile(r"\(([^()/]+)\)/\(([^()/]+)\)")
 WS_RE = re.compile(r"\s+")
+# 클로바 노트 화자 헤더 행 (예: "참석자 1 00:11" / "참석자 12 1:02:33") — 평가 시 제거
+CLOVA_SPEAKER_HEADER_RE = re.compile(r"^참석자\s+\d+\s+\d{1,2}:\d{2}(?::\d{2})?\s*$")
 
 
 def normalize(text: str) -> str:
@@ -89,7 +91,16 @@ def load_reference_text(reference_path: Path) -> tuple[str, str]:
     지원: AI Hub answer.json (Dialogs[*].Speakertext) / 클로바 노트 JSON / plain .txt
     """
     if reference_path.suffix.lower() == ".txt":
-        return normalize(reference_path.read_text(encoding="utf-8")), "plain_txt"
+        lines = [
+            ln.strip()
+            for ln in reference_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        body = [ln for ln in lines if not CLOVA_SPEAKER_HEADER_RE.match(ln)]
+        # 화자 헤더가 하나라도 제거됐으면 클로바 노트 txt 로 본다(CLAUDE.md: 헤더 제거 규칙).
+        if len(body) < len(lines):
+            return normalize(" ".join(body)), "clova_note_txt"
+        return normalize(" ".join(body)), "plain_txt"
 
     data = json.loads(reference_path.read_text(encoding="utf-8"))
 
