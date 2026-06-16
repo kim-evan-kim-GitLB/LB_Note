@@ -137,6 +137,24 @@ def change_password(
     return {"ok": True, "detail": "비밀번호가 변경되었습니다."}
 
 
+def require_user_active(user: dict = Depends(auth.require_user)) -> dict:
+    """비번 강제변경 대상(mustChangePassword)이면 403 — 데이터/AI/설정 엔드포인트 차단.
+
+    로그인·/me·비번변경·health 는 열어둬 '잠김'을 막는다: 토큰은 유효하므로 로그인 상태를
+    유지한 채 비번만 한 번 바꾸면(set_password→플래그 해제) 즉시 모든 기능이 풀린다. 프론트는
+    응답의 error_code='must_change_password' 를 보고 강제 변경 화면으로 보낸다.
+    """
+    if user.get("mustChangePassword"):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error_code": "must_change_password",
+                "message": "초기 비밀번호를 먼저 변경해야 합니다.",
+            },
+        )
+    return user
+
+
 # ---------- 사용자별 claude 자격증명 설정 ----------
 def _verify_credential(credential: dict) -> dict:
     """저장한 자격증명으로 claude 가벼운 "ping" 1콜 → {"ok": bool, "detail": str}.
@@ -165,14 +183,14 @@ def _verify_credential(credential: dict) -> dict:
 
 
 @app.get("/api/settings/claude-credential")
-def get_claude_credential(user: dict = Depends(auth.require_user)) -> dict:
+def get_claude_credential(user: dict = Depends(require_user_active)) -> dict:
     """현재 사용자 자격증명 상태(secret 비노출): {configured, type, updated_at}."""
     return auth.credential_status(user["username"])
 
 
 @app.put("/api/settings/claude-credential")
 def put_claude_credential(
-    req: CredentialRequest, user: dict = Depends(auth.require_user)
+    req: CredentialRequest, user: dict = Depends(require_user_active)
 ) -> dict:
     """자격증명 저장 + 가벼운 검증 호출. 검증 실패해도 저장은 유지(ok=false).
 
@@ -189,7 +207,7 @@ def put_claude_credential(
 
 
 @app.delete("/api/settings/claude-credential")
-def delete_claude_credential(user: dict = Depends(auth.require_user)) -> dict:
+def delete_claude_credential(user: dict = Depends(require_user_active)) -> dict:
     """현재 사용자 자격증명 삭제 → 전역 폴백으로 복귀."""
     cleared = auth.clear_credential(user["username"])
     return {"ok": True, "cleared": cleared, "status": auth.credential_status(user["username"])}
@@ -255,7 +273,7 @@ def _run_ai_job(
 
 
 @app.post("/api/ai/process")
-def ai_process(req: ProcessRequest, user: dict = Depends(auth.require_user)) -> dict:
+def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -> dict:
     """오디오 제출 → 백그라운드 STT 잡 등록 → {jobId} 즉시 반환. 프론트는 GET 잡 폴링."""
     import base64
     try:
@@ -281,7 +299,7 @@ def ai_process(req: ProcessRequest, user: dict = Depends(auth.require_user)) -> 
 
 
 @app.get("/api/ai/jobs/{job_id}")
-def ai_job(job_id: str, user: dict = Depends(auth.require_user)) -> dict:
+def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
     """잡 상태/결과 폴링. status: processing | done(result) | error(error)."""
     with _jobs_lock:
         j = _jobs.get(job_id)
@@ -291,7 +309,7 @@ def ai_job(job_id: str, user: dict = Depends(auth.require_user)) -> dict:
 
 
 @app.post("/api/ai/extract-actions")
-def ai_extract_actions(req: ExtractRequest, user: dict = Depends(auth.require_user)) -> list[str]:
+def ai_extract_actions(req: ExtractRequest, user: dict = Depends(require_user_active)) -> list[str]:
     """텍스트 붙여넣기 → 액션아이템 string[](프론트 계약: Promise<string[]>).
 
     입력이 raw text 한 덩어리라 segment/timestamp 가 없다 → anchor/evidence/owner 는 만들 수 없고
@@ -324,17 +342,17 @@ def _owned_or_404(meeting_id: str, user: dict) -> dict:
 
 
 @app.get("/api/meetings")
-def list_meetings(user: dict = Depends(auth.require_user)) -> list[dict]:
+def list_meetings(user: dict = Depends(require_user_active)) -> list[dict]:
     return store.list(owner_id=user["id"])
 
 
 @app.get("/api/meetings/{meeting_id}")
-def get_meeting(meeting_id: str, user: dict = Depends(auth.require_user)) -> dict:
+def get_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
     return _owned_or_404(meeting_id, user)
 
 
 @app.post("/api/meetings")
-def create_meeting(meeting: dict, user: dict = Depends(auth.require_user)) -> dict:
+def create_meeting(meeting: dict, user: dict = Depends(require_user_active)) -> dict:
     if not meeting.get("id"):
         meeting["id"] = uuid.uuid4().hex
     meeting["ownerId"] = user["id"]  # 소유자는 토큰에서 강제(클라이언트 위조 방지)
@@ -344,7 +362,7 @@ def create_meeting(meeting: dict, user: dict = Depends(auth.require_user)) -> di
 
 
 @app.patch("/api/meetings/{meeting_id}")
-def patch_meeting(meeting_id: str, patch: dict, user: dict = Depends(auth.require_user)) -> dict:
+def patch_meeting(meeting_id: str, patch: dict, user: dict = Depends(require_user_active)) -> dict:
     _owned_or_404(meeting_id, user)  # 소유 확인 후에만 수정
     patch.pop("ownerId", None)  # 소유자 변경 불가
     patch["updatedAt"] = _now_iso()
@@ -352,7 +370,7 @@ def patch_meeting(meeting_id: str, patch: dict, user: dict = Depends(auth.requir
 
 
 @app.delete("/api/meetings/{meeting_id}")
-def delete_meeting(meeting_id: str, user: dict = Depends(auth.require_user)) -> dict:
+def delete_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
     _owned_or_404(meeting_id, user)  # 소유 확인 후에만 삭제
     store.delete(meeting_id)
     return {"ok": True}

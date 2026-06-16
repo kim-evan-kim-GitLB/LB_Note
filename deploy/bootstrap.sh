@@ -54,13 +54,13 @@ mkdir -p "$DATA_DIR/web" "$MODELS_DIR"
 echo "[bootstrap] docker compose up -d --build"
 docker compose --env-file "$ENV_FILE" up -d --build
 
-# 4) 헬스체크
+# 4) 헬스체크 (caddy TLS 종단 → HTTPS, 자체서명이라 -k)
 PORT="${HOST_PORT:-49152}"
 echo "[bootstrap] 기동 대기..."
 for i in $(seq 1 30); do
-  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:$PORT/api/health" || true)
-  [ "$code" = "200" ] && { echo "[bootstrap] OK"; curl -s "http://localhost:$PORT/api/health"; echo; break; }
+  code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 "https://localhost:$PORT/api/health" || true)
+  [ "$code" = "200" ] && { echo "[bootstrap] OK"; curl -sk "https://localhost:$PORT/api/health"; echo; break; }
   sleep 2
 done
 echo
-echo "[bootstrap] 완료. 접속: http://<171-LAN-IP>:$PORT"
+echo "[bootstrap] 완료. 접속: https://<171-LAN-IP>:$PORT  (자체서명 인증서 — 첫 접속 시 브라우저 경고 수용)"

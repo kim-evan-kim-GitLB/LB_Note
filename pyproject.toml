@@ -23,6 +23,7 @@ dependencies = [
     "pyjwt>=2.13",
     "passlib>=1.7",
     "python-multipart>=0.0.32",
+    "cryptography>=43",
 ]
 
 # torch/torchaudio 는 GPU 아키텍처별 휠이 달라 상호 배타 extra 로 분리.
