@@ -1,0 +1,27 @@
+# Caddy 리버스 프록시 — TLS 종단(사내 폐쇄망, 자체 CA).
+#
+# 목적: meetscript(FastAPI :8088)를 HTTPS 로 감싸 ① 로그인 비번/JWT/Anthropic 키 평문
+#       전송을 막고 ② 브라우저 보안 컨텍스트를 만족시켜 마이크 녹음(getUserMedia)이 LAN
+#       IP 접속에서도 동작하게 한다.
+#
+# 인증서: 외부 ACME(Let's Encrypt) 미사용 — 폐쇄망이라 도달 불가. Caddy 내부 CA(local_certs)
+#         로 자체 서명한다. 브라우저는 처음 한 번 '신뢰할 수 없음' 경고를 띄운다(사내 50명 전제
+#         로 수용하거나, Caddy 루트 CA 인증서를 각 PC 에 1회 신뢰 등록하면 경고가 사라진다 —
+#         README '루트 CA 신뢰 등록' 참고).
+{
+	# 모든 사이트 인증서를 내부 CA 로 발급(공인 ACME 비활성).
+	local_certs
+	# HTTP→HTTPS 자동 리다이렉트는 켜두되(기본), 별도 80 공개는 compose 에서 매핑 안 함.
+	auto_https disable_redirects
+}
+
+# 컨테이너 내부 :443 수신. 호스트 노출 포트(HOST_PORT)는 compose 가 :443 으로 매핑한다.
+# 사이트 주소를 비워(:443) IP 직접 접속(https://<LAN-IP>:HOST_PORT)을 받는다.
+:443 {
+	tls internal
+	# 업로드(회의 오디오 base64)가 크므로 본문 상한을 넉넉히(기본 제한 회피). 과대 페이로드 차단.
+	request_body {
+		max_size 200MB
+	}
+	reverse_proxy meetscript:8088
+}

@@ -71,12 +71,27 @@ docker compose --env-file .env.deploy up -d --build
 docker compose --env-file .env.deploy logs -f        # 기동 로그
 ```
 
-- 접속: `http://<171-LAN-IP>:49152` (HTTP, 인증서 없음)
-- 헬스: `http://<171-LAN-IP>:49152/api/health` (claude_auth, cohere_model_exists 등 표시)
-- 호스트 49152 -> 컨테이너 8088 매핑. 0.0.0.0 바인딩이라 LAN 어디서든 접속(포트 49152 방화벽 오픈 필요).
-- 마이크 녹음: 접속 IP가 127.0.0.0/8 대역이면 HTTP 로도 마이크 동작(브라우저 보안 컨텍스트 예외).
-  일반 사설망(192.168/10.x)으로 접속하면 마이크가 차단되니 그때는 HTTPS 가 필요하다.
+- 접속: `https://<171-LAN-IP>:49152` (HTTPS, caddy 자체서명 인증서)
+- 헬스: `https://<171-LAN-IP>:49152/api/health` (claude_auth, cohere_model_exists 등 표시)
+- 호스트 49152 -> caddy :443 -> 내부 meetscript:8088. 평문 8088 은 호스트에 노출되지 않는다.
+  0.0.0.0 바인딩이라 LAN 어디서든 접속(포트 49152 방화벽 오픈 필요).
+- 마이크 녹음: HTTPS 라 LAN IP(192.168/10.x) 접속에서도 보안 컨텍스트가 충족돼 동작한다.
+  (자체서명 인증서를 브라우저가 한 번 신뢰하면 됨 — 아래 'TLS' 절 참고)
 - 첫 회의 처리 시 Cohere 모델(3.9G)을 로드하므로 수십 초 지연이 정상입니다.
+
+## TLS (caddy 자체 CA)
+
+폐쇄망이라 공인 인증서(Let's Encrypt) 발급이 불가하므로 caddy 내부 CA 로 자체 서명한다
+(`deploy/Caddyfile`, `local_certs`). 두 가지 운용 방식:
+
+- (간단) 첫 접속 시 브라우저 '신뢰할 수 없음' 경고를 그냥 수용 — 50명 사내망이면 충분.
+- (권장) caddy 루트 CA 인증서를 각 PC 에 1회 신뢰 등록하면 경고가 사라진다:
+  ```
+  # 루트 CA 추출(호스트)
+  docker cp meetscript-caddy-171:/data/caddy/pki/authorities/local/root.crt ./meetscript-root.crt
+  #   배포: Windows=certmgr(신뢰된 루트), macOS=키체인, 리눅스=/usr/local/share/ca-certificates
+  ```
+- 내부 CA 키/인증서는 named volume(`caddy_data`)에 영속 → 재기동해도 동일 CA 유지.
 
 ## claude 요약/추출 인증 (사용자별)
 
@@ -120,9 +135,22 @@ vi prompts/extract.ko.md        # 또는 git pull 로 변경분 받기
 - 비밀번호: 사용자가 바꾼 비밀번호는 재기동해도 보존됩니다(seed 정책). 관리자가 강제
   초기화하려면 `WEB_AUTH_USERS` 에서 해당 id 를 빼고 재기동 후 다시 추가하세요.
 - 타임존: tzdata 미설치 환경 대비 `TZ=KST-9`(POSIX) 사용. 한국은 DST 가 없어 정확합니다.
-- 포트 변경: `HOST_PORT`(기본 49152) 로 호스트 노출 포트만 바꿉니다(컨테이너 내부는 8088 고정).
-- HTTP 운영: 로그인 비번/토큰이 평문 전송됩니다(신뢰된 사내 LAN 전제). 암호화/외부망 공개가
-  필요하면 이 컨테이너 앞에 nginx/Caddy 리버스 프록시로 TLS 종단 후 8088 로 프록시하세요.
+- 포트 변경: `HOST_PORT`(기본 49152) 로 호스트 노출 포트만 바꿉니다(caddy :443 으로 매핑,
+  내부 meetscript 는 8088 고정).
+- TLS: caddy 가 HTTPS 종단(위 'TLS' 절). 로그인 비번/JWT/Anthropic 키가 더 이상 평문으로
+  LAN 을 지나지 않습니다.
+
+## 보안 하드닝 (2026-06-16)
+
+- **자격증명 at-rest 암호화**: `.env.deploy` 에 `CRED_ENC_KEY`(Fernet) 설정 시 DB 의 Claude
+  자격증명이 암호화 저장되고, 부팅 시 기존 평문이 자동 재암호화됩니다(멱등·무중단). 미설정이면
+  평문 저장(기존 동작). **키 분실 시 자격증명 복호 불가 → JWT_SECRET 과 함께 안전 보관.**
+- **초기 비밀번호 강제 변경**: 관리자/스크립트가 부여한 초기 비번(예: 공용 `axlead1234`)은
+  본인이 한 번 바꿔야 데이터/AI 기능이 열립니다. 미변경 사용자는 데이터/AI/설정 엔드포인트가
+  403(`error_code=must_change_password`)으로 차단되고, 프론트가 강제 변경 화면을 띄웁니다.
+  로그인·비번변경·`/api/auth/me`·`/api/health` 는 항상 열려 있어 '잠김'이 없습니다.
+  - 관리자가 특정 사용자의 비번을 강제 초기화(다시 강제변경 상태로)하려면 `bulk_create_users.py`
+    또는 `WEB_AUTH_USERS` 재시드로 해당 계정을 upsert 하면 `must_change_password=1` 로 돌아갑니다.
 
 ## 트러블슈팅
 

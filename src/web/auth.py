@@ -24,6 +24,7 @@ import sqlite3
 import threading
 
 import jwt
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.hash import pbkdf2_sha256
@@ -34,6 +35,55 @@ from src.web.store import DEFAULT_DB_PATH
 def _secret() -> str:
     # import 순서와 무관하게 호출 시점에 읽는다(.env 로드 타이밍 방어).
     return os.environ.get("JWT_SECRET", "")
+
+
+# ---- 자격증명 at-rest 암호화(Fernet) ----
+# CRED_ENC_KEY(Fernet 키, base64 32B)가 설정돼 있으면 claude_credentials.secret 를
+# 암호화해 저장한다. 미설정이면 **기존과 동일하게 평문 저장**(하위호환 — 무중단). 읽기는
+# 복호 실패 시 평문으로 폴백하므로, 기존 평문 자격증명도 그대로 동작한다(점진 마이그레이션).
+def _cred_cipher() -> Fernet | None:
+    key = os.environ.get("CRED_ENC_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        return Fernet(key.encode())
+    except Exception as e:  # noqa: BLE001
+        # 잘못된 키로 조용히 평문 저장하면 보안 의도가 무너지므로 즉시 드러낸다.
+        raise RuntimeError(
+            "CRED_ENC_KEY 형식 오류 — Fernet 키여야 합니다"
+            "(생성: python -c \"from cryptography.fernet import Fernet; "
+            f"print(Fernet.generate_key().decode())\"). 원인: {e}"
+        ) from e
+
+
+# 암호문 식별 접두사. 저장값이 이걸로 시작하면 "암호문", 아니면 "레거시 평문"으로 결정적으로
+# 구분한다(InvalidToken 추측 금지 → 키 교체/불일치 시 암호문을 평문으로 오판해 이중 암호화하는
+# 비가역 손상을 방지). 실제 시크릿(sk-ant-.../oauth)은 이 접두사로 시작하지 않는다.
+_ENC_PREFIX = "enc:fernet:"
+
+
+def _enc_secret(secret: str) -> str:
+    """저장용 변환. 키 있으면 '접두사+암호문', 없으면 평문 그대로(하위호환)."""
+    cipher = _cred_cipher()
+    if cipher is None:
+        return secret
+    return _ENC_PREFIX + cipher.encrypt(secret.encode()).decode()
+
+
+def _dec_secret(stored: str) -> str:
+    """저장값 → 평문. 접두사 없으면 레거시 평문(그대로). 접두사 있는데 키 없음/불일치로 복호
+    불가면 빈 문자열(미설정 취급) — 디스크의 암호문은 손상 없이 보존되어, 올바른 키 복원 시
+    그대로 복호된다(데이터 유실 없음)."""
+    if not stored.startswith(_ENC_PREFIX):
+        return stored  # 레거시 평문
+    token = stored[len(_ENC_PREFIX):]
+    cipher = _cred_cipher()
+    if cipher is None:
+        return ""  # 암호문인데 키 미설정 → 못 읽음(데이터는 보존)
+    try:
+        return cipher.decrypt(token.encode()).decode()
+    except InvalidToken:
+        return ""  # 키 불일치 → 못 읽음(데이터는 보존, 키 복원/재설정 필요)
 
 
 def _ttl() -> int:
@@ -47,6 +97,9 @@ CREATE TABLE IF NOT EXISTS users (
     role          TEXT DEFAULT 'user',   -- 권한(user/developer/admin). 직함과 무관.
     english_name  TEXT,                  -- 영어 이름(이메일 @앞). 아바타 이니셜·보조 표기용.
     job_title     TEXT,                  -- 직함(대표이사/팀장/프로 등). 권한 role 과 별개.
+    -- 관리자 부여/시드 비번을 본인이 아직 안 바꿈 → 1. 셀프 변경 시 0. 신규 행 기본 1
+    -- (관리자가 준 초기 비번은 반드시 한 번 교체하도록 강제). 데이터 엔드포인트는 1이면 403.
+    must_change_password INTEGER NOT NULL DEFAULT 1,
     created_at    TEXT
 );
 CREATE TABLE IF NOT EXISTS claude_credentials (
@@ -79,6 +132,14 @@ class UserStore:
                     self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
                 except sqlite3.OperationalError:
                     pass  # 이미 존재
+            # must_change_password: 기존 DB(공용 시드 비번 사용 중)에 컬럼을 추가하면 DEFAULT 1
+            # 이 적용돼 기존 사용자 전원이 '비번 변경 필요' 상태가 된다(의도 — 최초 1회 교체 강제).
+            try:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 1"
+                )
+            except sqlite3.OperationalError:
+                pass  # 이미 존재(신규 DB 는 CREATE TABLE 에 포함)
             self._conn.commit()
 
     def upsert(
@@ -93,14 +154,17 @@ class UserStore:
     ) -> None:
         """사용자 생성/비번 갱신(전체 덮어쓰기). 기존이면 비번·표시명·역할·영어이름·직함 갱신."""
         with self._lock:
+            # 관리자/스크립트가 비번을 (재)설정하는 경로 → must_change_password=1 강제
+            # (부여받은 초기 비번은 본인이 한 번 바꿔야 데이터 기능 사용 가능).
             self._conn.execute(
                 "INSERT INTO users "
-                "(username, password_hash, display_name, role, english_name, job_title, created_at) "
-                "VALUES (?,?,?,?,?,?,?) "
+                "(username, password_hash, display_name, role, english_name, job_title, "
+                "must_change_password, created_at) "
+                "VALUES (?,?,?,?,?,?,1,?) "
                 "ON CONFLICT(username) DO UPDATE SET "
                 "password_hash=excluded.password_hash, display_name=excluded.display_name, "
                 "role=excluded.role, english_name=excluded.english_name, "
-                "job_title=excluded.job_title",
+                "job_title=excluded.job_title, must_change_password=1",
                 (
                     username,
                     pbkdf2_sha256.hash(password),
@@ -138,10 +202,13 @@ class UserStore:
             self._conn.commit()
 
     def set_password(self, username: str, new_password: str) -> bool:
-        """사용자 비밀번호만 갱신(셀프 변경용). 존재하면 True. 역할·표시명은 건드리지 않음."""
+        """사용자 비밀번호 갱신(셀프 변경용). 존재하면 True. 역할·표시명은 건드리지 않음.
+
+        본인이 직접 바꾼 비번이므로 must_change_password=0 으로 해제 → 강제변경 게이트 통과.
+        """
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE users SET password_hash=? WHERE username=?",
+                "UPDATE users SET password_hash=?, must_change_password=0 WHERE username=?",
                 (pbkdf2_sha256.hash(new_password), username),
             )
             self._conn.commit()
@@ -150,8 +217,8 @@ class UserStore:
     def get(self, username: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT username, password_hash, display_name, role, english_name, job_title "
-                "FROM users WHERE username=?",
+                "SELECT username, password_hash, display_name, role, english_name, job_title, "
+                "must_change_password FROM users WHERE username=?",
                 (username,),
             ).fetchone()
         return dict(row) if row else None
@@ -187,6 +254,7 @@ class UserStore:
         secret = (secret or "").strip()
         if not secret:
             raise ValueError("secret 이 비어 있습니다.")
+        stored = _enc_secret(secret)  # CRED_ENC_KEY 있으면 암호화, 없으면 평문(하위호환)
         with self._lock:
             self._conn.execute(
                 "INSERT INTO claude_credentials (username, cred_type, secret, updated_at) "
@@ -194,7 +262,7 @@ class UserStore:
                 "ON CONFLICT(username) DO UPDATE SET "
                 "cred_type=excluded.cred_type, secret=excluded.secret, "
                 "updated_at=excluded.updated_at",
-                (username, cred_type, secret, dt.datetime.now().isoformat(timespec="seconds")),
+                (username, cred_type, stored, dt.datetime.now().isoformat(timespec="seconds")),
             )
             self._conn.commit()
 
@@ -211,7 +279,45 @@ class UserStore:
             ).fetchone()
         if not row:
             return None
-        return {"type": row["cred_type"], "secret": row["secret"], "updated_at": row["updated_at"]}
+        # 저장값 복호(레거시 평문은 그대로). secret 은 내부 주입 전용 — API/로그 미노출.
+        secret = _dec_secret(row["secret"])
+        if not secret:
+            # 암호문인데 키 없음/불일치로 복호 불가 → 미설정으로 취급(전역 폴백). 디스크 데이터는
+            # 보존되어 있으므로 올바른 키 복원 시 자동 복구된다(손상 아님).
+            return None
+        return {
+            "type": row["cred_type"],
+            "secret": secret,
+            "updated_at": row["updated_at"],
+        }
+
+    def migrate_encrypt_credentials(self) -> int:
+        """CRED_ENC_KEY 설정 시, 평문으로 남은 자격증명을 재암호화. 재암호화한 행 수 반환.
+
+        부팅 시 1회 호출(init). 키 미설정이면 0(아무것도 안 함). 이미 암호문인 행은 건너뛴다 →
+        멱등. 기존 평문 자격증명(57명 환경)을 무중단으로 점차 암호화로 올린다.
+        """
+        cipher = _cred_cipher()
+        if cipher is None:
+            return 0
+        migrated = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT username, secret FROM claude_credentials"
+            ).fetchall()
+            for r in rows:
+                # 접두사가 있으면 이미 암호문 → 절대 재암호화하지 않는다(키 불일치 암호문을
+                # 이중 래핑해 비가역 손상시키는 사고 방지). 접두사 없는 것만 = 레거시 평문 → 암호화.
+                if r["secret"].startswith(_ENC_PREFIX):
+                    continue
+                self._conn.execute(
+                    "UPDATE claude_credentials SET secret=? WHERE username=?",
+                    (_ENC_PREFIX + cipher.encrypt(r["secret"].encode()).decode(), r["username"]),
+                )
+                migrated += 1
+            if migrated:
+                self._conn.commit()
+        return migrated
 
     def clear_credential(self, username: str) -> bool:
         """사용자 자격증명 삭제. 삭제된 행이 있으면 True."""
@@ -242,6 +348,8 @@ def public_user(u: dict) -> dict:
         "role": u.get("role") or "user",
         "englishName": u.get("english_name"),
         "jobTitle": u.get("job_title"),
+        # True 면 프론트가 강제 비번변경 화면을 띄우고, 백엔드는 데이터/AI 엔드포인트를 403 차단.
+        "mustChangePassword": bool(u.get("must_change_password", 0)),
     }
 
 
@@ -265,6 +373,12 @@ def init(db_path=None) -> UserStore:
     if not _secret():
         raise RuntimeError("JWT_SECRET 미설정 — 인증 토큰 서명 불가. .env 에 설정하세요.")
     _store = UserStore(db_path)
+
+    # 자격증명 at-rest 암호화: CRED_ENC_KEY 가 설정돼 있으면 평문으로 남은 자격증명을 재암호화
+    # (멱등·무중단). 미설정이면 0(평문 유지 — 하위호환). 키 형식 오류면 _cred_cipher 가 즉시 예외.
+    migrated = _store.migrate_encrypt_credentials()
+    if migrated:
+        print(f"[auth] 자격증명 {migrated}건을 at-rest 암호화로 마이그레이션했습니다.", flush=True)
 
     # 정책: 계정은 개발자·어드민만. 자가가입 없음(가입 엔드포인트 미존재) → 발급은 .env 로만.
     # WEB_AUTH_ADMINS 에 적힌 사용자는 role=admin, 그 외 WEB_AUTH_USERS 사용자는 role=developer.

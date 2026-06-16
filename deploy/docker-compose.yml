@@ -24,10 +24,10 @@ services:
     image: meetscript-ai:171
     container_name: meetscript-171
     restart: unless-stopped
-    ports:
-      # 호스트 49152(HTTP) -> 컨테이너 8088. 내부망 사용자는 http://<LAN-IP>:49152 로 접속.
-      # 0.0.0.0 바인딩이라 호스트의 모든 인터페이스(LAN IP 포함)에서 열린다.
-      - "${HOST_PORT:-49152}:8088"
+    # 호스트 포트 직접 노출 안 함 — 앞단 caddy(TLS 종단)만 호스트에 열린다. 평문 8088 이
+    # LAN 에 직접 뜨지 않게 한다. caddy 는 compose 내부 네트워크에서 'meetscript:8088' 로 접근.
+    expose:
+      - "8088"
     env_file:
       - ./.env.deploy
     environment:
@@ -62,4 +62,29 @@ services:
       timeout: 5s
       retries: 5
       start_period: 120s                 # 첫 요청 시 모델 로드 시간 고려
-# named volume 미사용: 데이터는 host-dir bind(DATA_DIR)로 영속한다.
+
+  # ----- TLS 리버스 프록시 -----
+  # meetscript 앞단에서 HTTPS 를 종단한다(자체 CA). 사용자는 https://<LAN-IP>:HOST_PORT 로
+  # 접속. 부수효과로 브라우저 보안 컨텍스트가 충족돼 마이크 녹음이 LAN 에서도 동작한다.
+  caddy:
+    # 버전 핀(부동 태그 금지) — 무인 이미지 갱신으로 Caddyfile 문법 호환이 깨져 caddy 가
+    # 기동 실패하면 전체 외부 접속이 끊기므로(meetscript 는 expose 만). 갱신 시 caddy validate.
+    image: caddy:2.8-alpine
+    container_name: meetscript-caddy-171
+    restart: unless-stopped
+    depends_on:
+      - meetscript
+    ports:
+      # 호스트 HOST_PORT(기본 49152) -> caddy :443(HTTPS). 0.0.0.0 바인딩.
+      - "${HOST_PORT:-49152}:443"
+    volumes:
+      - "${BACKEND_DIR:-..}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro"
+      # 내부 CA 키/인증서 영속(재기동마다 CA 가 바뀌어 클라 신뢰가 깨지지 않게).
+      - caddy_data:/data
+      - caddy_config:/config
+
+# meetscript 데이터는 host-dir bind(DATA_DIR)로 영속. 아래 named volume 은 caddy 의 내부 CA
+# 인증서/설정 캐시 전용(사용자 데이터 아님 → named volume 으로 충분).
+volumes:
+  caddy_data:
+  caddy_config:
