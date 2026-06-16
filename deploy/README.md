@@ -57,6 +57,8 @@ cp .env.deploy.example .env.deploy
 #   FRONTEND_DIR=/opt/meetscript/frontend
 #   MODELS_DIR=/opt/meetscript/models
 #   JWT_SECRET=$(openssl rand -hex 32)
+#   CRED_ENC_KEY=<Fernet 키>   # python3 -c "import os,base64;print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+#   SITE_HOST=<171 LAN IP>     # 필수! https 인증서 이름. 틀리면 접속이 TLS 에러로 실패
 #   WEB_AUTH_USERS=admin:강한비번,...
 ```
 
@@ -82,7 +84,17 @@ docker compose --env-file .env.deploy logs -f        # 기동 로그
 ## TLS (caddy 자체 CA)
 
 폐쇄망이라 공인 인증서(Let's Encrypt) 발급이 불가하므로 caddy 내부 CA 로 자체 서명한다
-(`deploy/Caddyfile`, `local_certs`). 두 가지 운용 방식:
+(`deploy/Caddyfile`, `local_certs`).
+
+> **[중요] `SITE_HOST` 를 반드시 지정하세요.** caddy 의 `tls internal` 은 **사이트 주소에 적힌
+> 호스트명/IP 로만** 인증서를 발급합니다. 포트만 쓴 `:443` 형태는 접속 IP 에 맞는 인증서가 없어
+> **`https://<IP>:포트` 접속이 TLS 오류로 실패**합니다(개발 컨테이너 검증으로 확인됨). 그래서
+> Caddyfile 은 `https://{$SITE_HOST}, https://localhost` 형태이고, `.env.deploy` 의 `SITE_HOST`
+> 에 **사용자가 접속하는 171 LAN IP(또는 호스트명)** 를 넣어야 합니다. 미설정이면 compose 가
+> 기동을 거부합니다(조용한 실패 방지). 호스트 포트매핑(HOST_PORT→443)으로 브라우저 포트와
+> 리스너 포트가 달라도 호스트명으로 매칭되는 것까지 검증했습니다.
+
+두 가지 운용 방식:
 
 - (간단) 첫 접속 시 브라우저 '신뢰할 수 없음' 경고를 그냥 수용 — 50명 사내망이면 충분.
 - (권장) caddy 루트 CA 인증서를 각 PC 에 1회 신뢰 등록하면 경고가 사라진다:
