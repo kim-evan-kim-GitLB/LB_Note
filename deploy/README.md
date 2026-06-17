@@ -81,29 +81,30 @@ docker compose --env-file .env.deploy logs -f        # 기동 로그
   (자체서명 인증서를 브라우저가 한 번 신뢰하면 됨 — 아래 'TLS' 절 참고)
 - 첫 회의 처리 시 Cohere 모델(3.9G)을 로드하므로 수십 초 지연이 정상입니다.
 
-## TLS (caddy 자체 CA)
+## TLS (명시적 self-signed 인증서)
 
-폐쇄망이라 공인 인증서(Let's Encrypt) 발급이 불가하므로 caddy 내부 CA 로 자체 서명한다
-(`deploy/Caddyfile`, `local_certs`).
+폐쇄망이라 공인 인증서(Let's Encrypt)는 불가하므로 self-signed 인증서를 직접 만들어 caddy 에 물린다.
 
-> **[중요] `SITE_HOST` 를 반드시 지정하세요.** caddy 의 `tls internal` 은 **사이트 주소에 적힌
-> 호스트명/IP 로만** 인증서를 발급합니다. 포트만 쓴 `:443` 형태는 접속 IP 에 맞는 인증서가 없어
-> **`https://<IP>:포트` 접속이 TLS 오류로 실패**합니다(개발 컨테이너 검증으로 확인됨). 그래서
-> Caddyfile 은 `https://{$SITE_HOST}, https://localhost` 형태이고, `.env.deploy` 의 `SITE_HOST`
-> 에 **사용자가 접속하는 171 LAN IP(또는 호스트명)** 를 넣어야 합니다. 미설정이면 compose 가
-> 기동을 거부합니다(조용한 실패 방지). 호스트 포트매핑(HOST_PORT→443)으로 브라우저 포트와
-> 리스너 포트가 달라도 호스트명으로 매칭되는 것까지 검증했습니다.
+> **[중요/필수] 배포 전 `bash gen-cert.sh` 로 인증서를 생성하세요.**
+> 사용자가 raw IP(`https://<IP>:포트`)로 접속하면 TLS 에 **SNI 가 없어**(SNI 는 호스트명 전용),
+> caddy 의 `tls internal` 은 인증서를 고르지 못해 **`tlsv1 alert internal error` 로 접속이 실패**
+> 합니다(개발 컨테이너에서 재현·확인). 그래서 `SITE_HOST`(접속 IP/호스트명)를 **SAN 에 박은**
+> 인증서를 만들어 caddy 가 직접 물도록 합니다. 흐름:
+> ```
+> cd ~/LB_Note-deploy/deploy
+> # .env.deploy 의 SITE_HOST 가 실제 접속 IP 인지 확인 후:
+> bash gen-cert.sh                     # → deploy/certs/{cert,key}.pem 생성(SAN=SITE_HOST,localhost,127.0.0.1)
+> docker compose --env-file .env.deploy up -d   # caddy 가 certs/ 를 /etc/caddy/certs 로 ro 마운트
+> ```
+> - `SITE_HOST` 를 바꾸면 `gen-cert.sh` 를 다시 실행하고 caddy 를 재기동하세요.
+> - 인증서가 없으면 caddy 가 기동 실패하므로(파일 부재) gen-cert 선실행이 사실상 강제됩니다.
+> - `deploy/certs/` 는 개인키 포함이라 `.gitignore` 처리됨(커밋 금지).
 
-두 가지 운용 방식:
+브라우저 경고 처리(자체서명):
 
-- (간단) 첫 접속 시 브라우저 '신뢰할 수 없음' 경고를 그냥 수용 — 50명 사내망이면 충분.
-- (권장) caddy 루트 CA 인증서를 각 PC 에 1회 신뢰 등록하면 경고가 사라진다:
-  ```
-  # 루트 CA 추출(호스트)
-  docker cp meetscript-caddy-171:/data/caddy/pki/authorities/local/root.crt ./meetscript-root.crt
-  #   배포: Windows=certmgr(신뢰된 루트), macOS=키체인, 리눅스=/usr/local/share/ca-certificates
-  ```
-- 내부 CA 키/인증서는 named volume(`caddy_data`)에 영속 → 재기동해도 동일 CA 유지.
+- (간단) 첫 접속 시 '신뢰할 수 없음' 경고를 그냥 수용 — 50명 사내망이면 충분.
+- (권장) 만든 `certs/cert.pem` 을 각 PC 에 신뢰 인증서로 1회 등록하면 경고가 사라진다.
+  - Windows=certmgr(신뢰된 루트), macOS=키체인, 리눅스=/usr/local/share/ca-certificates 후 update-ca-certificates.
 
 ## claude 요약/추출 인증 (사용자별)
 
