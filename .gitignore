@@ -26,3 +26,6 @@ answer/*
 # OMC 상태 / 시크릿 (커밋 금지)
 .omc/
 secrets.env
+
+# 배포 TLS 인증서/키 (gen-cert.sh 가 호스트에서 생성 — 개인키 커밋 금지)
+deploy/certs/

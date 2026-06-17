@@ -50,11 +50,19 @@ if [ "${SKIP_COPY:-0}" != "1" ]; then
 fi
 mkdir -p "$DATA_DIR/web" "$MODELS_DIR"
 
-# 3) 빌드 + 기동
+# 3) TLS 인증서 생성(SITE_HOST 를 SAN 에 포함). 이미 있으면 건너뛴다(SITE_HOST 바뀌면 직접 재실행).
+if [ ! -f certs/cert.pem ]; then
+  echo "[bootstrap] TLS 인증서 생성(gen-cert.sh)"
+  bash gen-cert.sh "$ENV_FILE"
+else
+  echo "[bootstrap] certs/cert.pem 이미 존재 → 스킵(SITE_HOST 변경 시 gen-cert.sh 재실행)"
+fi
+
+# 4) 빌드 + 기동
 echo "[bootstrap] docker compose up -d --build"
 docker compose --env-file "$ENV_FILE" up -d --build
 
-# 4) 헬스체크 (caddy TLS 종단 → HTTPS, 자체서명이라 -k)
+# 5) 헬스체크 (caddy TLS 종단 → HTTPS, 자체서명이라 -k)
 PORT="${HOST_PORT:-49152}"
 echo "[bootstrap] 기동 대기..."
 for i in $(seq 1 30); do
