@@ -98,6 +98,9 @@ def save_staging(data: bytes, *, mime_type: str | None, filename: str | None) ->
     """staging 디렉토리에 1회 업로드 저장 → (stagingToken, ext). 실패 시 부분파일 정리(rollback).
 
     token 은 uuid4.hex(32 hex) — bind 시 호출부가 형식 검증한다. 파일은 {token}.{ext}.
+
+    NOTE: 운영 업로드 경로는 save_staging_stream(청크 스트리밍) 을 쓴다. 이 in-memory 변형은
+    현재 테스트 전용 헬퍼다(작은 고정 바이트로 staging 파일을 만들 때 편의).
     """
     token = uuid.uuid4().hex
     ext = safe_ext(mime_type, filename)
@@ -183,6 +186,7 @@ def bind_staging(token: str, meeting_id: str) -> dict | None:
     audioRef: {format, sizeBytes, createdAt}. (durationSec 은 디코딩 비용상 v2 — 키 미포함.)
     """
     _assert_hex32(meeting_id)  # 경로조립 직전 최후 방어선(호출부 검증에만 의존하지 않음)
+    _assert_hex32(token, what="token")  # token 도 동일 방어(glob 패턴 조립 직전 traversal 차단)
     src = _staging_path(token)
     if src is None:
         return None

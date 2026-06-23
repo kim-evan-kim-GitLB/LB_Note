@@ -572,7 +572,7 @@ def delete_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -
 
 # ---------- 원본 오디오 영속(플랜 v4 트랙 C·Phase 4, D7-id 옵션B) ----------
 @app.post("/api/meetings/audio/staging")
-async def upload_audio_staging(
+def upload_audio_staging(
     file: UploadFile = File(...),
     content_length: int | None = Header(default=None, alias="Content-Length"),
     user: dict = Depends(require_user_active),
@@ -585,6 +585,10 @@ async def upload_audio_staging(
     메모리/조기 413: 전체를 메모리에 적재하지 않고 1MB 청크로 스트리밍하며 디스크에 누적 write 한다.
     누적 크기가 상한을 넘으면 즉시 중단·부분파일 정리·413. Content-Length 헤더로 명백한 초과는
     바디를 읽기 전에 조기 거부한다(멀티파트 오버헤드만큼 헐겁지만 명백한 초과는 빠르게 걸러짐).
+
+    이벤트 루프 블로킹 해소: save_staging_stream 은 동기 디스크 누적 write(대용량 ≤500MB)이므로
+    이 엔드포인트를 동기 def 로 둔다 → Starlette 가 자동으로 threadpool 에 위임해 이벤트 루프를
+    막지 않는다(인증 Depends·예외 매핑·Content-Length 선검사 동작은 sync 에서도 동일).
     """
     # Content-Length 선검사: 명백한 초과는 바디를 받기 전에 조기 거부(DoS 완화).
     if content_length is not None and content_length > audio_store.MAX_AUDIO_BYTES:
@@ -594,7 +598,10 @@ async def upload_audio_staging(
         )
     try:
         token, ext, size = audio_store.save_staging_stream(
-            file.file.read, mime_type=file.content_type, filename=file.filename
+            file.file.read,
+            mime_type=file.content_type,
+            filename=file.filename,
+            max_bytes=audio_store.MAX_AUDIO_BYTES,  # 런타임 시점 상한(테스트 monkeypatch·재설정 반영)
         )
     except audio_store.AudioTooLarge:
         raise HTTPException(

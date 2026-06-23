@@ -115,6 +115,56 @@ def test_save_staging_rollback_no_partial_file():
         assert set(sdir.iterdir()) == before
 
 
+def test_stream_too_large_raises_and_no_partial_file():
+    """save_staging_stream 이 작은 max_bytes 초과 시 AudioTooLarge raise + staging 잔존 0개."""
+    from src.web import audio_store
+
+    with tempfile.TemporaryDirectory() as td, _patched_base(Path(td)):
+        sdir = audio_store._staging_dir()
+        sdir.mkdir(parents=True, exist_ok=True)
+        before = set(sdir.iterdir())
+        data = b"0123456789ABCDEF"  # 16 bytes > max 10
+        chunks = iter([data, b""])
+
+        def _reader(_size):  # noqa: ANN001
+            return next(chunks, b"")
+
+        raised = False
+        try:
+            audio_store.save_staging_stream(
+                _reader, mime_type="audio/webm", filename=None, max_bytes=10, chunk_size=16
+            )
+        except audio_store.AudioTooLarge:
+            raised = True
+        assert raised, "초과 시 AudioTooLarge 가 전파되어야 함"
+        # 부분파일 미잔존(rollback)
+        assert set(sdir.iterdir()) == before
+
+
+def test_stream_zero_byte_raises_valueerror_and_no_partial_file():
+    """0바이트 reader → ValueError + staging 잔존 0개."""
+    from src.web import audio_store
+
+    with tempfile.TemporaryDirectory() as td, _patched_base(Path(td)):
+        sdir = audio_store._staging_dir()
+        sdir.mkdir(parents=True, exist_ok=True)
+        before = set(sdir.iterdir())
+
+        def _empty_reader(_size):  # noqa: ANN001
+            return b""
+
+        raised = False
+        try:
+            audio_store.save_staging_stream(
+                _empty_reader, mime_type="audio/webm", filename=None
+            )
+        except ValueError:
+            raised = True
+        assert raised, "빈 reader 는 ValueError 가 전파되어야 함"
+        # 부분파일 미잔존(rollback)
+        assert set(sdir.iterdir()) == before
+
+
 def test_cleanup_staging_removes_aged():
     from src.web import audio_store
 
@@ -212,6 +262,48 @@ def test_staging_empty_rejected():
             "/api/meetings/audio/staging", files={"file": ("e.webm", b"", "audio/webm")}, headers=h
         )
         assert r.status_code == 400, r.text
+
+
+def test_staging_too_large_413():
+    """MAX_AUDIO_BYTES 를 작게 monkeypatch → 초과 업로드는 바디 스트리밍 중 413."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        from src.web import audio_store
+
+        orig = audio_store.MAX_AUDIO_BYTES
+        try:
+            audio_store.MAX_AUDIO_BYTES = 4  # 매우 작게
+            r = client.post(
+                "/api/meetings/audio/staging",
+                files={"file": ("big.webm", b"0123456789", "audio/webm")},  # 10 > 4
+                headers=h,
+            )
+            assert r.status_code == 413, r.text
+            # 부분파일 미잔존(rollback)
+            sdir = audio_store.audio_base() / "_staging"
+            assert not (sdir.is_dir() and list(sdir.glob("*")))
+        finally:
+            audio_store.MAX_AUDIO_BYTES = orig
+
+
+def test_staging_content_length_oversize_413_before_body():
+    """Content-Length 헤더가 상한 초과로 명시되면 바디를 읽기 전 413."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        from src.web import audio_store
+
+        orig = audio_store.MAX_AUDIO_BYTES
+        try:
+            audio_store.MAX_AUDIO_BYTES = 4
+            # 작은 바디라도 Content-Length 헤더가 상한 초과면 선검사에서 413
+            r = client.post(
+                "/api/meetings/audio/staging",
+                files={"file": ("x.webm", b"ab", "audio/webm")},
+                headers={**h, "Content-Length": "999"},
+            )
+            assert r.status_code == 413, r.text
+        finally:
+            audio_store.MAX_AUDIO_BYTES = orig
 
 
 def test_bind_on_create_records_audioref_and_moves():
