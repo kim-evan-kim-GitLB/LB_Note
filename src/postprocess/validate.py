@@ -21,7 +21,12 @@ from src.postprocess.homophone import excused_digits
 from src.postprocess.schema import CleanedSegment
 from src.scoring import levenshtein
 
-FLAG_REVIEW = "확인필요"
+FLAG_REVIEW = "확인필요"      # 그라운딩 실패(근거 0 = 환각 의심) — 게이트가 채움
+AMBIGUOUS_FLAG = "약함확인"   # 모호 발화 회색지대 캡처(확정·합의 강도 약함) — LLM이 채움
+INFERRED_FLAG = "추정"        # owner 를 본문 앵커로 추론(명시 아님) — LLM이 채움
+
+# flag 3종: 사유 코드가 다르며 모두 사람 검토 큐로 보낸다. n_flagged 는 사유별 분리 집계.
+KNOWN_FLAGS = frozenset({FLAG_REVIEW, AMBIGUOUS_FLAG, INFERRED_FLAG})
 
 # 내용보존 검사용 토큰 추출: 한글/영문/숫자 덩어리(구두점·간투사 영향 최소화)
 _TOKEN_RE = re.compile(r"[0-9]+|[A-Za-z]+|[가-힣]+")

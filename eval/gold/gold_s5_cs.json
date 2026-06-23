@@ -1,0 +1,19 @@
+{
+  "meeting": "SEED — 고객 대면/CS 이슈 미팅(S5)",
+  "status": "seed",
+  "scoring_note": "실제 transcript 확보 전 골격. 고객 약속(follow-up·회신)은 산출물 없어도 액션이며 확정 약하면 flag='약함확인'. 다짐·사과는 제외. 1차 측정 후 확정.",
+  "items": [
+    {"gid": 1, "text": "고객 환불 요청 원인을 파악해 회신", "due": null,
+     "keywords": [["환불", "요청", "이슈"], ["파악", "확인", "회신"]], "required": [0], "min_match": 2},
+    {"gid": 2, "text": "재현된 결함을 수정해 패치 일정 안내", "due": null,
+     "keywords": [["결함", "버그", "오류"], ["수정", "패치", "안내"]], "required": [0], "min_match": 2},
+    {"gid": 3, "text": "문의 처리 결과를 고객에 follow-up 회신", "due": null,
+     "keywords": [["문의", "처리"], ["회신", "follow", "연락", "안내"]], "required": [0], "min_match": 2}
+  ],
+  "negatives": [
+    {"nid": 1, "text": "불편을 드려 죄송합니다 잘 챙기겠습니다(사과·다짐)",
+     "keywords": [["죄송"]], "required": [0], "min_match": 1, "kind": "declaration"},
+    {"nid": 2, "text": "그건 한번 알아보겠습니다(대상 불명 약동사)",
+     "keywords": [["알아보겠"]], "required": [0], "min_match": 1, "kind": "borderline"}
+  ]
+}

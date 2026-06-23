@@ -1,0 +1,19 @@
+{
+  "meeting": "SEED — 경영/임원 보고·의사결정 회의(S4)",
+  "status": "seed",
+  "scoring_note": "실제 transcript 확보 전 골격. 결정 자체는 제외, 결정에 따른 후속 행동(추가 검토·자료 보완·보고)만 액션. 1차 측정 후 확정.",
+  "items": [
+    {"gid": 1, "text": "비용 영향을 추가 검토해 보고", "due": null,
+     "keywords": [["비용", "영향"], ["검토", "분석", "보고"]], "required": [0], "min_match": 2},
+    {"gid": 2, "text": "대안별 장단점을 정리해 자료 보완", "due": null,
+     "keywords": [["대안", "장단점", "옵션"], ["정리", "보완", "작성"]], "required": [0], "min_match": 2},
+    {"gid": 3, "text": "결정사항을 관련 부서에 공유/전파", "due": null,
+     "keywords": [["결정", "방침"], ["공유", "전파", "전달"]], "required": [0], "min_match": 2}
+  ],
+  "negatives": [
+    {"nid": 1, "text": "A 대신 B로 가기로 결정(방침 자체, 실행 없음)",
+     "keywords": [["가기로"]], "required": [0], "min_match": 1, "kind": "decision"},
+    {"nid": 2, "text": "그건 좀 더 봐야겠네요(대상 불명 약동사)",
+     "keywords": [["봐야겠"]], "required": [0], "min_match": 1, "kind": "borderline"}
+  ]
+}

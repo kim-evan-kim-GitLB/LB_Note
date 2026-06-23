@@ -24,5 +24,18 @@
      "keywords": [["케이스", "유형", "2인", "4~5", "4-5", "인원", "확장"], ["테스트", "진행", "돌려"]], "required": [0], "min_match": 2},
     {"gid": 10, "text": "AI 스킬/회의록 양식 포맷을 정의해 시스템에 적용하고 프롬프트 작성지침 정립",
      "keywords": [["양식", "포맷", "회의록"], ["정의", "작성", "제작", "스킬", "문서", "적용"]], "required": [0], "min_match": 2}
+  ],
+  "negatives_note": "[D] 오탐(과추출) 라벨. positives 와 동형 스키마(_covers 재사용, LLM-judge 불필요). required 토큰은 변별력 높게 좁게 잡아 정상 항목 오매칭을 막는다. confirmed_FP = positive 를 cover 하지 않으면서 negative 를 match 한 추출 수. nid5 는 현 axfull 골든 idx12(조건부 누수, extract-ko-1.3 시절) 박제 — v1.4 재추출 목표는 confirmed_FP=0.",
+  "negatives": [
+    {"nid": 1, "text": "B 방식으로 가기로 결정(방침 자체, 구체 실행 없음)",
+     "keywords": [["가기로"]], "required": [0], "min_match": 1, "kind": "decision"},
+    {"nid": 2, "text": "포기하지 않고 계속 가기로(선언·태도)",
+     "keywords": [["포기"]], "required": [0], "min_match": 1, "kind": "declaration"},
+    {"nid": 3, "text": "필요하면 추가로 고려(조건부 가정)",
+     "keywords": [["필요하면"]], "required": [0], "min_match": 1, "kind": "conditional"},
+    {"nid": 4, "text": "이미 처리/확인 완료(과거 완료, 미래 행동 아님)",
+     "keywords": [["이미 처리", "이미 확인", "이미 끝", "어제 처리"]], "required": [0], "min_match": 1, "kind": "completed"},
+    {"nid": 5, "text": "프로 환경 양호 시 한번 돌려보기(조건부, axfull 잉여 누수)",
+     "keywords": [["양호"], ["돌려"]], "required": [0, 1], "min_match": 2, "kind": "conditional"}
   ]
 }
