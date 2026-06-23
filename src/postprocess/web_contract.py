@@ -64,6 +64,46 @@ def _action_items_from_payload(ai: dict) -> list[dict]:
     return out
 
 
+class TranscriptStructureError(ValueError):
+    """transcript 구조보존 검증 위반. 호출부(app.py)가 422 로 변환한다."""
+
+
+def validate_transcript_edit(stored: list[dict], incoming: list[dict]) -> list[dict]:
+    """transcript 편집 구조보존 검증(편집 시에만, 후방호환).
+
+    저장본(stored)에 이미 비어있지 않은 transcript 가 있을 때만 적용한다:
+      - 엔트리 개수 불변
+      - 각 엔트리의 timestamp · speakerId 불변
+      - text 만 변경 허용
+    위반(개수/타임스탬프/speakerId 변경) 시 TranscriptStructureError.
+
+    text 가 실제로 바뀐 엔트리는 서버가 edited=True 를 set 한다(클라이언트 제공 edited 무시).
+    저장본이 비어있던(초기 상태) 경우엔 제약 미적용 → 호출부에서 그대로 통과시킨다.
+
+    반환: edited 플래그가 서버 기준으로 정규화된 새 transcript 리스트(원본 비파괴).
+    """
+    if len(incoming) != len(stored):
+        raise TranscriptStructureError(
+            f"transcript 엔트리 개수 불변 위반: 저장본 {len(stored)} != 요청 {len(incoming)}"
+        )
+    out: list[dict] = []
+    for idx, (old, new) in enumerate(zip(stored, incoming)):
+        if str(new.get("timestamp", "")) != str(old.get("timestamp", "")):
+            raise TranscriptStructureError(f"transcript[{idx}] timestamp 불변 위반")
+        if str(new.get("speakerId", "")) != str(old.get("speakerId", "")):
+            raise TranscriptStructureError(f"transcript[{idx}] speakerId 불변 위반")
+        entry = dict(new)  # 클라이언트 필드 보존하되 edited 는 서버가 결정
+        new_text = str(new.get("text", ""))
+        old_text = str(old.get("text", ""))
+        # edited 는 누적: 저장본이 이미 edited 면 유지, 이번에 바뀌었으면 set. 클라 값 무시.
+        if new_text != old_text or old.get("edited"):
+            entry["edited"] = True
+        else:
+            entry.pop("edited", None)
+        out.append(entry)
+    return out
+
+
 def build_meeting_contract_from_segments(
     segments: list[dict],
     action_items: list[dict] | None = None,

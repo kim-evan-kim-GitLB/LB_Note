@@ -17,7 +17,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -26,8 +26,12 @@ from src.postprocess.backends.agent_cli import (
     claude_auth_status,
     use_credential,
 )
+from src.postprocess.web_contract import (
+    TranscriptStructureError,
+    validate_transcript_edit,
+)
 from src.web.service import extract_action_items, process_audio_to_contract
-from src.web.store import MeetingStore
+from src.web.store import MeetingStore, PreconditionFailedError
 # service import 가 config(load_dotenv)를 끌어와 .env 가 로드된 뒤 auth 를 가져온다(순서 주의).
 from src.web import auth
 
@@ -287,6 +291,8 @@ def _run_ai_job(
     """
     # 동시성 슬롯 확보까지 대기(잡 status 는 'queued' 유지). 확보하면 'processing' 으로 전환.
     # 한 번에 _stt_semaphore 한도(기본 1)만 실제 추론, 나머지는 여기서 블록되어 큐처럼 동작한다.
+    # 락 순서 규약: 이 잡 스레드는 _stt_semaphore 보유 중 store._lock(update_if_match)을 잡지
+    # 않는다 — STT 추론은 store 비접촉이고 _jobs(인메모리)만 갱신한다(데드락/장시간 점유 방지).
     with _stt_semaphore:
         with _jobs_lock:
             _jobs[job_id] = {"status": "processing"}
@@ -413,11 +419,60 @@ def create_meeting(meeting: dict, user: dict = Depends(require_user_active)) -> 
 
 
 @app.patch("/api/meetings/{meeting_id}")
-def patch_meeting(meeting_id: str, patch: dict, user: dict = Depends(require_user_active)) -> dict:
-    _owned_or_404(meeting_id, user)  # 소유 확인 후에만 수정
-    patch.pop("ownerId", None)  # 소유자 변경 불가
-    patch["updatedAt"] = _now_iso()
-    return store.update(meeting_id, patch)
+def patch_meeting(
+    meeting_id: str,
+    patch: dict,
+    response: Response,
+    user: dict = Depends(require_user_active),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> dict:
+    """회의 부분 업데이트.
+
+    후방호환: **If-Match 헤더가 없으면 기존 동작(last-write-wins)** 그대로 — finalize·제목·
+    액션아이템 편집 등 기존 호출부를 깨지 않는다. If-Match 가 있으면 저장본 updatedAt 과
+    비교해 불일치 시 412(현재 updatedAt 을 ETag 헤더·본문 힌트로 재조회 유도).
+
+    transcript 구조보존(편집 시에만): 저장본에 비어있지 않은 transcript 가 있고 patch 에
+    transcript 가 포함되면 개수·timestamp·speakerId 불변을 검증(위반 시 422)하고 text 가
+    바뀐 엔트리에 edited=True 를 서버가 set 한다(클라 제공 edited 무시). summary/actionItems
+    구조검증은 이 Phase 비대상이며, transcript 검증이 다른 필드 동시 patch 를 막지 않는다.
+
+    비교+갱신은 store.update_if_match() 로 store 락 내 원자 수행(read+compare+write 단일 구간).
+    """
+    cur = _owned_or_404(meeting_id, user)  # 소유 확인 후에만 수정
+    patch.pop("ownerId", None)  # 소유자 변경 불가(store 도 한 번 더 강제)
+    patch.pop("updatedAt", None)  # updatedAt(ETag)은 서버가 부여 — 클라 값 무시
+
+    # transcript 구조보존: patch 에 transcript 가 있고 저장본 transcript 가 비어있지 않을 때만.
+    if "transcript" in patch:
+        stored_tr = cur.get("transcript") or []
+        incoming_tr = patch.get("transcript") or []
+        if stored_tr:
+            try:
+                patch["transcript"] = validate_transcript_edit(stored_tr, incoming_tr)
+            except TranscriptStructureError as e:
+                raise HTTPException(status_code=422, detail=str(e))
+
+    # If-Match 없으면 None → 비교 생략(last-write-wins). 있으면 따옴표 제거 후 비교.
+    expected = if_match.strip('"') if if_match else None
+    try:
+        updated = store.update_if_match(meeting_id, patch, expected)
+    except PreconditionFailedError as e:
+        # 412: 프론트가 현재 값 재조회·재적용하도록 현재 updatedAt(ETag)을 힌트로 제공.
+        if e.current_updated_at:
+            response.headers["ETag"] = f'"{e.current_updated_at}"'
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "error": "precondition_failed",
+                "message": "저장본이 변경되었습니다. 최신 회의를 재조회한 뒤 다시 시도하세요.",
+                "currentUpdatedAt": e.current_updated_at,
+            },
+        )
+    if updated is None:  # 비교 직전 삭제된 경합
+        raise HTTPException(status_code=404, detail="meeting 없음")
+    response.headers["ETag"] = f'"{updated["updatedAt"]}"'
+    return updated
 
 
 @app.delete("/api/meetings/{meeting_id}")
