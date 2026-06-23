@@ -1,0 +1,23 @@
+{
+  "meeting": "SEED — 외부 업체/협력사 미팅(S2)",
+  "status": "seed",
+  "scoring_note": "실제 벤더 transcript 확보 전 골격. 키워드는 행동·소관 토큰 위주(도메인 전문용어 회피). owner 는 팀/부서. 합격선·변별력은 1차 측정 후 확정.",
+  "items": [
+    {"gid": 1, "text": "거래처와 납기 일정을 협의해 확정", "due": null,
+     "keywords": [["납기", "일정"], ["협의", "확정", "조율"]], "required": [0], "min_match": 2},
+    {"gid": 2, "text": "견적서를 기한 내 회신/송부", "due": null,
+     "keywords": [["견적"], ["회신", "송부", "전달", "발송"]], "required": [0], "min_match": 2},
+    {"gid": 3, "text": "계약 조건을 법무팀과 검토 요청", "due": null,
+     "keywords": [["계약", "조건"], ["검토", "법무", "확인"]], "required": [0], "min_match": 2},
+    {"gid": 4, "text": "요구사항 변경분을 정리해 협력사에 공유", "due": null,
+     "keywords": [["요구사항", "스펙"], ["공유", "전달", "정리"]], "required": [0], "min_match": 2}
+  ],
+  "negatives": [
+    {"nid": 1, "text": "긍정적으로 검토해보겠습니다(외교적 수사)",
+     "keywords": [["긍정적"]], "required": [0], "min_match": 1, "kind": "borderline"},
+    {"nid": 2, "text": "양사 일정 한번 맞춰보죠(대상 불명 조율 의사)",
+     "keywords": [["맞춰보"]], "required": [0], "min_match": 1, "kind": "borderline"},
+    {"nid": 3, "text": "문제 생기면 그때 다시 논의(조건부 가정)",
+     "keywords": [["생기면"]], "required": [0], "min_match": 1, "kind": "conditional"}
+  ]
+}

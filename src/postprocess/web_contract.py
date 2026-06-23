@@ -54,6 +54,7 @@ def _action_items_from_payload(ai: dict) -> list[dict]:
             {
                 "text": it.get("text", ""),
                 "owner": it.get("owner"),
+                "owner_source": it.get("owner_source"),
                 "due": it.get("due"),
                 "anchor": it.get("anchor"),
                 "evidence_seg_ids": it.get("evidence_seg_ids", []),

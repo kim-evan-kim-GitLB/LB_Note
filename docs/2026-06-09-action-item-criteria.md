@@ -102,3 +102,28 @@
 - 정밀도(오탐) 정량 지표 도입 여부 — 현재는 회수율 중심, 과추출은 경계정책으로만 억제.
 - `owner` 채움: 화자분리 제외 확정이므로 **명시 역할만**. 향후 diarization 도입은 별 과제.
 - 프론트 `extract-actions` 계약(string[] vs 리치객체) — `meetscript-frontend-integration` 참조, 별 합의.
+
+## 9. v1.4 고도화 (2026-06-17, 회의 결정으로 갱신)
+
+> 상세 결정·근거·시나리오 진단: **`docs/2026-06-17-action-item-methodology-upgrade.md`**.
+> 본 절은 위 §1~§8 중 v1.4 에서 **바뀐 점만** 요약한다(상위 문서가 정본).
+
+- **정의 확장(A)**: §1 의 "산출물이 남는 행동" 한정을 폐기. **협의·검토·조율·재확인·승인요청·회신**처럼
+  산출물이 안 남는 행동도, **대상이 명시되고 완료판정이 한 문장으로 떨어지면** 액션. 약동사 단독은 제외.
+- **owner 3단계(B)**: §4 의 "명시만/추측 금지"를 **명시(explicit) / 본문 앵커 추론(inferred) / null**
+  3단계로 확장. 추론은 본문에 "주제↔팀 결속 발화"가 있을 때만, `owner_source="inferred"` +
+  `flag="추정"` 으로 **격리**(owner 본필드 추측 주입 금지). 정적 주제→팀 글로서리 자동매핑 금지.
+- **모호 발화(C)**: §2 "정밀도 우선 제외"를 부분 완화. 행동·대상은 분명하나 확정이 약한 회색지대
+  (특히 고객·벤더 약속)는 버리지 말고 **`flag="약함확인"`** 캡처. 순수 약동사·조건부·완료·선언은 계속 제외.
+- **flag 3종 분리**: `확인필요`(근거0 환각, 호출부가 채움) / `약함확인`(모호 캡처, LLM) / `추정`(추론 owner, LLM).
+  `n_flagged` 는 사유별 분리 집계(`extract_handoff.py`). (선결 버그: 구 `extract_handoff` 가 LLM flag 를
+  전량 폐기 → v1.4 에서 보존하도록 수정.)
+- **정밀도 정량화(D)**: §5 의 회수율 단독을 보완. `eval/gold_actionitems.json` 에 **`negatives[]`**(오탐 라벨,
+  positives 와 동형 스키마) 신설, `score_extraction.score_precision()` 가 결정적 산출. 게이트:
+  `axfull recall=1.0` 유지 + `confirmed_FP` 회귀 락 + `precision_strict` 락 + **방향 불변식 `axfull≥axenh`**(precision 도).
+  동결 골든 baseline: axfull precision_strict=0.8125·confirmed_FP=1(idx12 조건부 누수, v1.4 재추출 목표=0),
+  axenh precision_strict=0.8·confirmed_FP=0.
+- **코드 무변경 원칙 종료**: §6-4 의 "프롬프트만 수정"은 v1.4 에서 끝난다. B·C·D 는
+  `extract_schema.py`(owner_source)·`extract_handoff.py`(flag 보존)·`score_extraction.py`(precision) 동반 변경 필수.
+- **일반화(E)**: few-shot·정의를 **비개발·벤더·CS 도메인**까지 확장(개발 편향 해소). 멀티도메인 정답셋
+  (`eval/gold/*.json`)·도메인별 합격선은 실제 도메인 transcript 확보 후 확정(후속).

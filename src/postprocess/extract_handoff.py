@@ -30,7 +30,11 @@ from src.postprocess.stages.extract import (
     load_extract_prompt_version,
     load_extract_rules,
 )
-from src.postprocess.validate import FLAG_REVIEW
+from src.postprocess.validate import (
+    AMBIGUOUS_FLAG,
+    FLAG_REVIEW,
+    INFERRED_FLAG,
+)
 
 WORKORDER_SCHEMA_VERSION = "extract-workorder-1.0"
 EXTRACT_SCHEMA_VERSION = "extract-1.0"
@@ -161,15 +165,18 @@ def collect_extract_workorder(
 
     items: list[ActionItem] = []
     by_key: dict[str, int] = {}  # 정규화 텍스트 → items 인덱스(병합용)
-    n_flagged = 0
     for it in parsed.items:
         text = it.text.strip()
         if not text:
             continue
         valid_ev = sorted({e for e in it.evidence_seg_ids if e in seg_index})
-        flag = None
-        if not valid_ev:
-            flag = FLAG_REVIEW  # 근거 없음 → 환각 의심(차단하지 않되 표시)
+        # flag 결정: grounding(근거 0=환각)이 최우선, 그 외엔 LLM 이 보낸 의미 flag(약함확인/추정)를
+        # 보존한다. (구버그: flag 를 무조건 None 으로 초기화해 LLM flag 를 전량 폐기했음.)
+        semantic_flag = it.flag if it.flag in (AMBIGUOUS_FLAG, INFERRED_FLAG) else None
+        flag = FLAG_REVIEW if not valid_ev else semantic_flag
+        # 추론 owner(owner_source='inferred')는 '추정' flag 로 격리 보장(LLM 이 빠뜨려도).
+        if it.owner_source == "inferred" and valid_ev and flag is None:
+            flag = INFERRED_FLAG
         anchor = None
         if valid_ev:
             anchor = seconds_to_timestamp(
@@ -184,23 +191,33 @@ def collect_extract_workorder(
                 tgt.anchor = seconds_to_timestamp(
                     min(float(seg_index[e]["start"]) for e in merged)
                 )
+                # grounding flag(확인필요)만 근거 생기면 해제. 의미 flag(약함확인/추정)는 유지.
                 if tgt.flag == FLAG_REVIEW:
                     tgt.flag = None
-                    n_flagged -= 1
+            # 병합 대상이 의미 flag 를 들고 왔는데 tgt 가 비었으면 승계(flag 소실 방지).
+            if tgt.flag is None and semantic_flag is not None:
+                tgt.flag = semantic_flag
             continue
         item = ActionItem(
             id=len(items),
             text=text,
             owner=it.owner,
+            owner_source=it.owner_source,
             due=it.due,
             anchor=anchor,
             evidence_seg_ids=valid_ev,
             flag=flag,
         )
-        if flag == FLAG_REVIEW:
-            n_flagged += 1
         by_key[key] = len(items)
         items.append(item)
+
+    # n_flagged: 사유별 분리 집계(확인필요/약함확인/추정) — 병합 후 최종 상태 기준.
+    flag_breakdown = {
+        FLAG_REVIEW: sum(1 for it in items if it.flag == FLAG_REVIEW),
+        AMBIGUOUS_FLAG: sum(1 for it in items if it.flag == AMBIGUOUS_FLAG),
+        INFERRED_FLAG: sum(1 for it in items if it.flag == INFERRED_FLAG),
+    }
+    n_flagged = sum(flag_breakdown.values())
 
     result = ExtractResult(items=items)
     return write_extract_outputs(
@@ -211,6 +228,7 @@ def collect_extract_workorder(
         glossary_version=glossary_version,
         source=str(workorder_json),
         n_flagged=n_flagged,
+        flag_breakdown=flag_breakdown,
         overwrite=overwrite,
     )
 
@@ -224,6 +242,7 @@ def write_extract_outputs(
     glossary_version: str,
     source: str,
     n_flagged: int,
+    flag_breakdown: dict | None = None,
     overwrite: bool = True,
 ) -> dict:
     """표준 출력 2종: text-{stem}.actionitems.json (권위) + 액션아이템-{stem}.md (가독)."""
@@ -244,6 +263,7 @@ def write_extract_outputs(
         "source": source,
         "n_items": len(result.items),
         "n_flagged": n_flagged,
+        "flag_breakdown": flag_breakdown or {},
         **result.to_dict(),
     }
     json_out.write_text(
@@ -254,7 +274,11 @@ def write_extract_outputs(
     lines = [f"# 액션아이템 — {stem}", ""]
     lines.append(f"- 버전: schema={EXTRACT_SCHEMA_VERSION} glossary={glossary_version} "
                  f"prompt={prompt_version}")
-    lines.append(f"- 항목: {len(result.items)}개 (확인필요 {n_flagged}개)")
+    if flag_breakdown:
+        bd = " ".join(f"{k} {v}" for k, v in flag_breakdown.items() if v)
+        lines.append(f"- 항목: {len(result.items)}개 (검토 {n_flagged}개{': ' + bd if bd else ''})")
+    else:
+        lines.append(f"- 항목: {len(result.items)}개 (검토 {n_flagged}개)")
     lines.append("")
     for it in result.items:
         tag = f" `{it.flag}`" if it.flag else ""

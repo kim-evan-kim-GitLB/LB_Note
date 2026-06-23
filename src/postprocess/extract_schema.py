@@ -57,10 +57,11 @@ class ActionItem:
     id: int
     text: str
     owner: str | None = None
+    owner_source: str | None = None  # 'explicit'(본문 명시) | 'inferred'(본문 앵커 추론) | None
     due: str | None = None
     anchor: str | None = None  # evidence 의 최소 start 에서 결정적 산출(MM:SS)
     evidence_seg_ids: list[int] = field(default_factory=list)
-    flag: str | None = None
+    flag: str | None = None  # 확인필요(근거0) | 약함확인(모호) | 추정(추론owner) | None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -79,6 +80,7 @@ class ActionItem:
             id=int(data["id"]) if id is None else id,
             text=str(data.get("text", "")).strip(),
             owner=(data.get("owner") or None),
+            owner_source=(data.get("owner_source") or None),
             due=(data.get("due") or None),
             anchor=(data.get("anchor") or None),
             evidence_seg_ids=ev,

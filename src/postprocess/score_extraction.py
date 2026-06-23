@@ -20,6 +20,18 @@ def load_gold(gold_json: Path | str) -> dict:
     return json.loads(Path(gold_json).read_text(encoding="utf-8"))
 
 
+def load_gold_dir(gold_dir: Path | str, pattern: str = "*.json") -> dict[str, dict]:
+    """[E] 멀티도메인 정답셋 로드: eval/gold/*.json → {stem: gold}.
+
+    회의 유형(벤더·운영·경영·CS) 별 미니 골드를 한 번에 채점하기 위한 글롭 로더.
+    단일 GOLD_PATH 에 묶여 S2~S5 사각이 회귀에서 침묵하던 문제(결정문서 §E)를 푼다.
+    """
+    out: dict[str, dict] = {}
+    for p in sorted(Path(gold_dir).glob(pattern)):
+        out[p.stem] = load_gold(p)
+    return out
+
+
 def _group_satisfied(group: list[str], text: str) -> bool:
     return any(syn in text for syn in group)
 
@@ -78,6 +90,66 @@ def score(extracted: dict | list, gold: dict) -> dict:
     }
 
 
+def _ambiguous_flagged(extracted: dict | list) -> list[bool]:
+    """추출 항목별 '약함확인'(모호 캡처) 여부. 리스트/문자열 입력은 전부 False."""
+    if isinstance(extracted, list):
+        items = extracted
+    else:
+        items = extracted.get("action_items", extracted.get("actionItems", []))
+    out: list[bool] = []
+    for it in items:
+        out.append(isinstance(it, dict) and it.get("flag") == "약함확인")
+    return out
+
+
+def score_precision(extracted: dict | list, gold: dict) -> dict:
+    """결정적 **정밀도**. negatives[](오탐 라벨)로 과추출을 정량화한다(LLM-judge 불필요).
+
+    각 추출 텍스트를 3분류한다(positives 우선):
+      - 어떤 positive 를 cover  → TP 기여
+      - 아니면서 어떤 negative 를 match → confirmed_FP(라벨된 명백 비액션)
+      - 둘 다 아님 → unmatched(병합 변형/미라벨 회색)
+
+    flag='약함확인'(모호 캡처) 항목은 strict 분모에서 분리해, C 안건의 캡처가 precision 을
+    부당하게 깎지 않게 한다(lenient/strict 이원 집계).
+    반환: {precision_strict, confirmed_FP, fp_rate, unmatched_rate, n_extracted, n_ambiguous}.
+    """
+    texts = _item_texts(extracted)
+    amb = _ambiguous_flagged(extracted)
+    positives = gold.get("items", [])
+    negatives = gold.get("negatives", [])
+    n_ext = len(texts)
+
+    tp = fp = unmatched = 0
+    tp_strict = 0  # 약함확인 제외한 '확정' 추출 중 positive cover 수(분자도 분모와 동일 집합)
+    for t, a in zip(texts, amb):
+        if any(_covers(t, p) for p in positives):
+            tp += 1
+            if not a:
+                tp_strict += 1
+        elif any(_covers(t, neg) for neg in negatives):
+            fp += 1
+        else:
+            unmatched += 1
+    n_amb = sum(1 for a in amb if a)
+    # strict 분자·분모 모두 약함확인 제외(확정 캡처만). 분모 0 보호. → precision_strict ≤ 1.0.
+    strict_den = n_ext - n_amb
+    return {
+        "precision_strict": round(tp_strict / strict_den, 4) if strict_den else 0.0,
+        "confirmed_FP": fp,
+        "fp_rate": round(fp / n_ext, 4) if n_ext else 0.0,
+        "unmatched_rate": round(unmatched / n_ext, 4) if n_ext else 0.0,
+        "n_extracted": n_ext,
+        "n_ambiguous": n_amb,
+        # 약함확인 비율 — 예산(~0.25) 초과 시 남발 신호(비파괴적 관찰값).
+        "ambiguous_rate": round(n_amb / n_ext, 4) if n_ext else 0.0,
+        "over_flag_budget": bool(n_ext) and (n_amb / n_ext) > 0.25,
+    }
+
+
 def score_file(extracted_json: Path | str, gold_json: Path | str) -> dict:
     extracted = json.loads(Path(extracted_json).read_text(encoding="utf-8"))
-    return score(extracted, load_gold(gold_json))
+    gold = load_gold(gold_json)
+    out = score(extracted, gold)
+    out["precision"] = score_precision(extracted, gold)
+    return out

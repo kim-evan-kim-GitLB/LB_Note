@@ -1,0 +1,21 @@
+{
+  "meeting": "SEED — 비개발 실무팀 회의(S3: 영업·총무·구매·HR)",
+  "status": "seed",
+  "scoring_note": "실제 transcript 확보 전 골격. 승인·문서·구매/계약·일정 조율형 액션. owner 는 팀/부서. 1차 측정 후 확정.",
+  "items": [
+    {"gid": 1, "text": "구매 품의서를 작성해 팀장 승인 상신", "due": null,
+     "keywords": [["품의", "구매", "결재"], ["작성", "승인", "상신"]], "required": [0], "min_match": 2},
+    {"gid": 2, "text": "채용 일정을 인사팀과 조율해 확정", "due": null,
+     "keywords": [["채용", "일정"], ["조율", "확정", "협의"]], "required": [0], "min_match": 2},
+    {"gid": 3, "text": "행사 비용 견적을 정리해 보고", "due": null,
+     "keywords": [["견적", "비용"], ["정리", "보고", "작성"]], "required": [0], "min_match": 2},
+    {"gid": 4, "text": "계약서 갱신분을 검토해 회신", "due": null,
+     "keywords": [["계약"], ["검토", "갱신", "회신"]], "required": [0], "min_match": 2}
+  ],
+  "negatives": [
+    {"nid": 1, "text": "다들 좀 더 신경 써서 잘 챙겨봅시다(추상 다짐)",
+     "keywords": [["신경"]], "required": [0], "min_match": 1, "kind": "declaration"},
+    {"nid": 2, "text": "필요하면 인력 더 붙이는 것도 고려(조건부)",
+     "keywords": [["필요하면"]], "required": [0], "min_match": 1, "kind": "conditional"}
+  ]
+}
