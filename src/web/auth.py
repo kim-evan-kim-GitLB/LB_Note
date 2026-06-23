@@ -100,6 +100,9 @@ CREATE TABLE IF NOT EXISTS users (
     -- 관리자 부여/시드 비번을 본인이 아직 안 바꿈 → 1. 셀프 변경 시 0. 신규 행 기본 1
     -- (관리자가 준 초기 비번은 반드시 한 번 교체하도록 강제). 데이터 엔드포인트는 1이면 403.
     must_change_password INTEGER NOT NULL DEFAULT 1,
+    -- display_name 출처: 'seed'(env/시드) | 'user'(본인 self-edit). 'user' 면 seed 재실행이
+    -- display_name 을 덮어쓰지 않는다(role 동기화는 무관하게 유지). english/job 은 seed 미관여.
+    name_source   TEXT DEFAULT 'seed',
     created_at    TEXT
 );
 CREATE TABLE IF NOT EXISTS claude_credentials (
@@ -132,6 +135,14 @@ class UserStore:
                     self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
                 except sqlite3.OperationalError:
                     pass  # 이미 존재
+            # name_source: display_name 출처('seed'=env/시드, 'user'=본인 self-edit). 'user' 면
+            # seed 재실행 시 display_name 을 username 으로 리셋하지 않고 보존한다(role 동기화는 유지).
+            try:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN name_source TEXT DEFAULT 'seed'"
+                )
+            except sqlite3.OperationalError:
+                pass  # 이미 존재(신규 DB 는 CREATE TABLE 에 포함)
             # must_change_password: 기존 DB(공용 시드 비번 사용 중)에 컬럼을 추가하면 DEFAULT 1
             # 이 적용돼 기존 사용자 전원이 '비번 변경 필요' 상태가 된다(의도 — 최초 1회 교체 강제).
             try:
@@ -190,7 +201,12 @@ class UserStore:
                 "INSERT INTO users (username, password_hash, display_name, role, created_at) "
                 "VALUES (?,?,?,?,?) "
                 "ON CONFLICT(username) DO UPDATE SET "
-                "display_name=excluded.display_name, role=excluded.role",  # 비번(password_hash) 미갱신
+                # display_name 은 본인이 self-edit(name_source='user')한 경우 보존, 아니면 시드값
+                # 으로 갱신(신규 시 username 폴백). role 은 name_source 무관하게 항상 동기화.
+                # 비번(password_hash)·english_name·job_title 은 미갱신(기존 동작 유지).
+                "display_name=CASE WHEN users.name_source='user' THEN users.display_name "
+                "ELSE excluded.display_name END, "
+                "role=excluded.role",
                 (
                     username,
                     pbkdf2_sha256.hash(password),
@@ -200,6 +216,46 @@ class UserStore:
                 ),
             )
             self._conn.commit()
+
+    def update_profile(
+        self,
+        username: str,
+        *,
+        display_name=None,
+        english_name=None,
+        job_title=None,
+    ) -> dict | None:
+        """본인 표시명 self-edit. None 인 필드는 미변경(보낸 것만 갱신). 1개라도 갱신되면
+        name_source='user' 로 표시해 seed 재실행이 display_name 을 덮어쓰지 않게 한다.
+
+        username/role/password 는 이 경로로 변경 불가. 갱신 후 공개 user dict 반환(없으면 None).
+        실제 갱신 필드가 0개(전부 None)면 name_source 를 'user' 로 승격하지 않고 현재 값을
+        그대로 반환한다(빈 PATCH 가 seed 보호 플래그를 임의로 켜지 않게).
+        """
+        # 실제 갱신 필드가 없으면 no-op: name_source 승격 없이 현재 사용자 반환(행 없으면 None).
+        if display_name is None and english_name is None and job_title is None:
+            cur = self.get(username)
+            return public_user(cur) if cur else None
+        sets: list[str] = ["name_source='user'"]
+        params: list = []
+        if display_name is not None:
+            sets.append("display_name=?")
+            params.append(display_name)
+        if english_name is not None:
+            sets.append("english_name=?")
+            params.append(english_name)
+        if job_title is not None:
+            sets.append("job_title=?")
+            params.append(job_title)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE users SET {', '.join(sets)} WHERE username=?",
+                (*params, username),
+            )
+            self._conn.commit()
+        if cur.rowcount == 0:
+            return None
+        return public_user(self.get(username))
 
     def set_password(self, username: str, new_password: str) -> bool:
         """사용자 비밀번호 갱신(셀프 변경용). 존재하면 True. 역할·표시명은 건드리지 않음.
@@ -443,6 +499,11 @@ def clear_credential(username: str) -> bool:
 def credential_status(username: str) -> dict:
     """secret 비노출 공개 상태."""
     return store().credential_status(username)
+
+
+def update_profile(username: str, **fields) -> dict | None:
+    """본인 표시명 self-edit(싱글턴 store 위임). 공개 user dict 반환(없으면 None)."""
+    return store().update_profile(username, **fields)
 
 
 # ---- FastAPI 의존성: Bearer 토큰 검증 → 현재 사용자 ----

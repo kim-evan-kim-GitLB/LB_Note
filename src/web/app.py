@@ -93,8 +93,18 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class ProfileRequest(BaseModel):
+    """본인 표시명 self-edit. 셋 다 선택 — 보낸 필드만 갱신. username/role/password 불가."""
+    displayName: str | None = None
+    englishName: str | None = None
+    jobTitle: str | None = None
+
+
 # 셀프 비번 변경 시 새 비밀번호 최소 길이.
 MIN_PASSWORD_LEN = 8
+
+# 표시명 필드 최대 길이.
+MAX_NAME_LEN = 64
 
 
 # ---------- 인증 (프론트 src/lib/firebase.ts 계약) ----------
@@ -135,6 +145,47 @@ def change_password(
     if not users.set_password(username, new_pw):
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
     return {"ok": True, "detail": "비밀번호가 변경되었습니다."}
+
+
+def _clean_name(value: str, *, field: str, required: bool) -> str:
+    """표시명 검증·정규화. trim 후 제어문자/줄바꿈 금지, 길이 제한. 위반 시 422.
+
+    required=True(displayName): trim 후 1..MAX_NAME_LEN(빈값 거부).
+    required=False(englishName/jobTitle): 0..MAX_NAME_LEN(빈 허용).
+    """
+    v = value.strip()
+    # 길이 상한을 먼저 검사 — 긴 입력을 제어문자 전수 스캔하기 전에 빠르게 거부.
+    if len(v) > MAX_NAME_LEN:
+        raise HTTPException(status_code=422, detail=f"{field}: 최대 {MAX_NAME_LEN}자입니다.")
+    if required and not v:
+        raise HTTPException(status_code=422, detail=f"{field}: 빈 값은 저장할 수 없습니다.")
+    # 제어문자(줄바꿈/탭 포함) 금지 — 표시명에 부적합.
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+        raise HTTPException(status_code=422, detail=f"{field}: 제어문자/줄바꿈은 사용할 수 없습니다.")
+    return v
+
+
+@app.patch("/api/settings/profile")
+def patch_profile(req: ProfileRequest, user: dict = Depends(auth.require_user)) -> dict:
+    """본인 표시명(display/english/job) self-edit → 공개 user(갱신본). 보낸 필드만 갱신.
+
+    인증은 요구하되 must_change_password 게이트는 우회한다(change-password 와 동급) — 초기
+    비번 변경 전에도 이름 정정이 가능해야 한다(FR-A7). username/role/password 는 변경 불가.
+    갱신 시 name_source='user' 로 표시해 seed 재실행이 display_name 을 덮어쓰지 않게 한다.
+    """
+    if req.displayName is None and req.englishName is None and req.jobTitle is None:
+        raise HTTPException(status_code=422, detail="변경할 필드가 없습니다.")
+    fields: dict[str, str] = {}
+    if req.displayName is not None:
+        fields["display_name"] = _clean_name(req.displayName, field="displayName", required=True)
+    if req.englishName is not None:
+        fields["english_name"] = _clean_name(req.englishName, field="englishName", required=False)
+    if req.jobTitle is not None:
+        fields["job_title"] = _clean_name(req.jobTitle, field="jobTitle", required=False)
+    updated = auth.update_profile(user["username"], **fields)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+    return updated
 
 
 def require_user_active(user: dict = Depends(auth.require_user)) -> dict:
