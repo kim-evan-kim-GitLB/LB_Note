@@ -15,6 +15,7 @@ import datetime as _dt
 import json
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 # 기본 DB 경로: output/ 는 .gitignore 대상이라 커밋 안 됨(시크릿/대용량 정책과 동일 영역).
@@ -45,8 +46,27 @@ class PreconditionFailedError(Exception):
 
 
 def _now_iso_micro() -> str:
-    """ETag(updatedAt) 용 타임스탬프. 같은 초 내 연속 갱신도 구분되도록 마이크로초까지."""
-    return _dt.datetime.now().isoformat(timespec="microseconds")
+    """ETag(updatedAt) 용 타임스탬프. UTC·마이크로초 기준(M1: create/update 포맷 통일)."""
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def _next_etag(prev: str | None) -> str:
+    """단조 증가하는 새 ETag(updatedAt) 생성.
+
+    같은 마이크로초 안에서 연속 갱신되면 now() 가 직전 updatedAt 과 동일해 ETag 충돌(낙관적
+    락 우회) 위험이 있다 → 직전 값과 같거나 더 작으면 직전 +1µs 로 보정해 단조 증가를 보장한다.
+    prev 가 다른 포맷(예: 초 단위·naive)이라 파싱 불가하면 비교 없이 현재값을 그대로 쓴다.
+    """
+    now = _now_iso_micro()
+    if not prev or now > prev:
+        return now
+    try:
+        prev_dt = _dt.datetime.fromisoformat(prev)
+    except ValueError:
+        return now
+    if prev_dt.tzinfo is None:  # naive 저장본은 비교 불가 → 현재값 사용
+        return now
+    return (prev_dt + _dt.timedelta(microseconds=1)).isoformat(timespec="microseconds")
 
 
 class MeetingStore:
@@ -111,16 +131,26 @@ class MeetingStore:
         return self.create(cur)
 
     def update_if_match(
-        self, meeting_id: str, patch: dict, expected_updated_at: str | None
+        self,
+        meeting_id: str,
+        patch: dict,
+        expected_updated_at: str | None,
+        *,
+        validator: Callable[[dict, dict], dict] | None = None,
     ) -> dict | None:
-        """원자 compare-and-update. read+compare+write 를 단일 _lock 구간에서 수행.
+        """원자 compare-and-update. read+compare+(검증)+write 를 단일 _lock 구간에서 수행.
 
         - 없으면 None.
         - expected_updated_at 가 None 이면 비교 생략(무조건 적용, last-write-wins).
         - expected_updated_at 가 주어졌고 저장본 updatedAt 과 다르면 PreconditionFailedError.
         - ownerId 는 patch 로 바꿀 수 없다(불변). updatedAt 은 항상 서버가 새로 부여(ETag).
 
-        store._lock 한 구간 안에서 SELECT→비교→INSERT OR REPLACE 를 끝내므로
+        validator(M2, TOCTOU 차단): 주어지면 **락 안에서 재조회한 바로 그 저장본(cur)** 과
+        patch 를 받아 검증·정규화된 새 patch 를 반환한다(원본 patch 비파괴). 검증 실패는
+        validator 가 예외를 던지며, 그 예외는 락 밖으로 그대로 전파되어 호출부가 422 로 변환한다.
+        즉 "검증에 쓴 스냅샷 == write 대상 스냅샷" 이 보장된다(락 밖 읽기본 기준 검증 금지).
+
+        store._lock 한 구간 안에서 SELECT→비교→검증→INSERT OR REPLACE 를 끝내므로
         get→update→create(store.update) 의 비원자 race 가 없다.
 
         락 순서 규약: 잡 스레드는 _stt_semaphore 보유 중 이 락(_lock)을 잡지 않는다
@@ -135,10 +165,14 @@ class MeetingStore:
             cur = json.loads(row["data"])
             if expected_updated_at is not None and cur.get("updatedAt") != expected_updated_at:
                 raise PreconditionFailedError(cur.get("updatedAt"))
+            # M2: 락 안에서 재조회한 cur 기준으로 검증·정규화(write 대상과 동일 스냅샷).
+            if validator is not None:
+                patch = validator(cur, patch)
             owner = cur.get("ownerId", "local")  # ownerId 불변 보장
+            prev_updated = cur.get("updatedAt")
             cur.update(patch)
             cur["ownerId"] = owner
-            cur["updatedAt"] = _now_iso_micro()  # 갱신마다 새 ETag
+            cur["updatedAt"] = _next_etag(prev_updated)  # 갱신마다 새 ETag(단조 증가)
             self._conn.execute(
                 "INSERT OR REPLACE INTO meetings "
                 "(id, owner_id, status, title, created_at, updated_at, data) "

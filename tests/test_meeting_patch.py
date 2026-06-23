@@ -288,6 +288,107 @@ def test_patch_transcript_with_other_fields_simultaneously():
         assert body["actionItems"] == [{"text": "할일"}]
 
 
+def test_patch_transcript_speaker_change_422():
+    """speakerId 변경은 구조보존 위반 → 422(M2·L4)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        tr = [{"speakerId": "spk1", "text": "한 줄", "timestamp": "00:01"}]
+        m = _create_meeting(client, h, transcript=tr)
+        bad = [{"speakerId": "spk2", "text": "한 줄", "timestamp": "00:01"}]
+        r = client.patch(f"/api/meetings/{m['id']}", json={"transcript": bad}, headers=h)
+        assert r.status_code == 422, r.text
+
+
+def test_patch_transcript_preserves_unknown_stored_fields():
+    """M3: 저장본의 미지 필드(예: 미래 confidence)는 text 편집 후에도 보존되고, incoming 의
+    임의/위조 필드는 반영되지 않는다(text 만 교체)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        # 저장본을 직접 store 로 심어 미지 필드(confidence)를 포함시킨다(create 경로는 임의 dict 보존).
+        tr = [{"speakerId": "", "text": "원문", "timestamp": "00:01", "confidence": 0.91}]
+        m = _create_meeting(client, h, transcript=tr)
+        # 클라가 confidence 위조 + 미지 필드(injected) 추가 + text 교정 시도
+        edited = [{
+            "speakerId": "", "text": "교정문", "timestamp": "00:01",
+            "confidence": 0.0, "injected": "evil", "edited": False,
+        }]
+        r = client.patch(f"/api/meetings/{m['id']}", json={"transcript": edited}, headers=h)
+        assert r.status_code == 200, r.text
+        out = r.json()["transcript"][0]
+        assert out["text"] == "교정문"          # text 만 교체됨
+        assert out["confidence"] == 0.91         # 저장본 미지 필드 보존(위조 무시)
+        assert "injected" not in out             # incoming 임의 필드 미반영
+        assert out["edited"] is True             # 서버가 edited 결정
+
+
+def test_patch_if_match_star_matches_when_exists():
+    """If-Match `*` → 리소스 존재하면 값 비교 없이 갱신 성공(M4)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h)
+        r = client.patch(
+            f"/api/meetings/{m['id']}", json={"title": "별표"}, headers={**h, "If-Match": "*"}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["title"] == "별표"
+
+
+def test_patch_if_match_weak_etag_prefix_stripped():
+    """If-Match `W/"..."`(약 ETag) → 접두 제거 후 값 비교(M4). 일치하면 200, stale 이면 412."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h)
+        etag = m["updatedAt"]
+        r = client.patch(
+            f"/api/meetings/{m['id']}", json={"title": "약태그"},
+            headers={**h, "If-Match": f'W/"{etag}"'},
+        )
+        assert r.status_code == 200, r.text
+        # 같은(이제 stale) 약 ETag 재시도 → 412
+        r2 = client.patch(
+            f"/api/meetings/{m['id']}", json={"title": "다시"},
+            headers={**h, "If-Match": f'W/"{etag}"'},
+        )
+        assert r2.status_code == 412, r2.text
+
+
+def test_patch_if_match_multi_value_uses_first():
+    """If-Match 다중값(콤마) → 첫 토큰(현재 etag)으로 비교 → 200(M4)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h)
+        etag = m["updatedAt"]
+        r = client.patch(
+            f"/api/meetings/{m['id']}", json={"title": "다중"},
+            headers={**h, "If-Match": f'"{etag}", "deadbeef"'},
+        )
+        assert r.status_code == 200, r.text
+
+
+def test_patch_if_match_malformed_400():
+    """비표준/파싱불가 If-Match(빈 따옴표) → 400(M4)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h)
+        r = client.patch(
+            f"/api/meetings/{m['id']}", json={"title": "x"}, headers={**h, "If-Match": '""'}
+        )
+        assert r.status_code == 400, r.text
+
+
+def test_store_etag_monotonic_on_rapid_updates():
+    """M1: 같은 마이크로초 내 연속 갱신에도 updatedAt(ETag) 이 단조 증가(충돌 없음)."""
+    with tempfile.TemporaryDirectory() as td:
+        store = _fresh_store(Path(td))
+        _make_meeting(store)
+        etags = []
+        for i in range(50):
+            out = store.update_if_match("a" * 32, {"title": f"t{i}"}, None)
+            etags.append(out["updatedAt"])
+        assert len(set(etags)) == len(etags), "ETag 중복 발생(단조 증가 위반)"
+        assert etags == sorted(etags), "ETag 가 단조 증가하지 않음"
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

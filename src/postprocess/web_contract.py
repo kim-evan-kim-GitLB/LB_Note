@@ -80,6 +80,11 @@ def validate_transcript_edit(stored: list[dict], incoming: list[dict]) -> list[d
     text 가 실제로 바뀐 엔트리는 서버가 edited=True 를 set 한다(클라이언트 제공 edited 무시).
     저장본이 비어있던(초기 상태) 경우엔 제약 미적용 → 호출부에서 그대로 통과시킨다.
 
+    필드 보존(M3): 결과 엔트리는 **저장본(old) 베이스**로 만들고 검증된 새 text 만 교체한다.
+    timestamp·speakerId 및 저장본의 미지 필드(향후 confidence 등)는 old 에서 그대로 보존되며,
+    incoming 의 임의 필드(위조·미지 키)는 반영하지 않는다 → 클라이언트가 transcript 편집으로
+    변조할 수 있는 표면을 text 단 하나로 제한한다.
+
     반환: edited 플래그가 서버 기준으로 정규화된 새 transcript 리스트(원본 비파괴).
     """
     if len(incoming) != len(stored):
@@ -92,9 +97,11 @@ def validate_transcript_edit(stored: list[dict], incoming: list[dict]) -> list[d
             raise TranscriptStructureError(f"transcript[{idx}] timestamp 불변 위반")
         if str(new.get("speakerId", "")) != str(old.get("speakerId", "")):
             raise TranscriptStructureError(f"transcript[{idx}] speakerId 불변 위반")
-        entry = dict(new)  # 클라이언트 필드 보존하되 edited 는 서버가 결정
         new_text = str(new.get("text", ""))
         old_text = str(old.get("text", ""))
+        # M3: 저장본 베이스 + 검증된 새 text 만 교체. 미지 필드/타임스탬프/speakerId 는 old 보존.
+        entry = dict(old)
+        entry["text"] = new_text
         # edited 는 누적: 저장본이 이미 edited 면 유지, 이번에 바뀌었으면 set. 클라 값 무시.
         if new_text != old_text or old.get("edited"):
             entry["edited"] = True
