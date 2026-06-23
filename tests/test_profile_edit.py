@@ -11,13 +11,16 @@
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 from pathlib import Path
 
 
 def _fresh_auth(tmp: Path, users: str, admins: str = "admin", prune: str = "1"):
-    """env 세팅 후 임시 DB 로 auth.init() 재실행 → 독립된 UserStore."""
+    """env 세팅 후 임시 DB 로 auth.init() 재실행 → 독립된 UserStore.
+
+    임시 DB 를 명시 인자로 넘기므로 DEFAULT_DB_PATH 전역을 건드리지 않는다(오염 없음)."""
     os.environ["JWT_SECRET"] = "test-secret-profile"
     os.environ["WEB_AUTH_USERS"] = users
     os.environ["WEB_AUTH_ADMINS"] = admins
@@ -52,10 +55,15 @@ def test_update_profile_sets_fields_and_name_source():
         assert store.update_profile("ghost", display_name="x") is None
 
 
+@contextlib.contextmanager
 def _client_for(td: Path, users: str):
-    """임시 DB 로 격리된 app + TestClient. **실제 DB(output/web/meetings.db)는 절대 건드리지
-    않는다** — store/auth 의 DEFAULT_DB_PATH 를 임시경로로 패치한 뒤 auth·app 을 reload 해
-    모듈 레벨 init()/MeetingStore() 가 임시 DB 만 쓰게 한다. 반환: (auth, appmod, TestClient)."""
+    """임시 DB 로 격리된 app + TestClient(컨텍스트 매니저). **실제 DB(output/web/meetings.db)는
+    절대 건드리지 않는다** — store/auth 의 DEFAULT_DB_PATH 를 임시경로로 패치한 뒤 auth·app 을
+    reload 해 모듈 레벨 init()/MeetingStore() 가 임시 DB 만 쓰게 한다.
+
+    패치한 DEFAULT_DB_PATH 전역은 종료 시 try/finally 로 **원복**한다 — 같은 프로세스에서
+    다른 테스트가 뒤이어 실행돼도 전역(특히 실 DB 경로) 오염이 남지 않게.
+    yield: (auth, appmod, TestClient)."""
     from fastapi.testclient import TestClient
     import importlib
     tmp_db = td / "users.db"
@@ -65,18 +73,28 @@ def _client_for(td: Path, users: str):
     os.environ["WEB_AUTH_TOKEN_TTL"] = "3600"
     os.environ["WEB_AUTH_PRUNE"] = "1"
     import src.web.store as storemod
-    storemod.DEFAULT_DB_PATH = tmp_db  # MeetingStore() 임시 경로
-    import src.web.auth as auth
-    importlib.reload(auth)  # auth 가 패치된 DEFAULT_DB_PATH 를 다시 import
-    auth.DEFAULT_DB_PATH = tmp_db  # 폴백 인자(init() no-arg)도 임시 경로 보장
-    import src.web.app as appmod
-    importlib.reload(appmod)  # 모듈 레벨 store=MeetingStore()/users=auth.init() → 임시 DB
-    return auth, appmod, TestClient(appmod.app)
+    import src.web.auth as auth_pre
+    store_orig = storemod.DEFAULT_DB_PATH
+    auth_orig = getattr(auth_pre, "DEFAULT_DB_PATH", None)
+    try:
+        storemod.DEFAULT_DB_PATH = tmp_db  # MeetingStore() 임시 경로
+        import src.web.auth as auth
+        importlib.reload(auth)  # auth 가 패치된 DEFAULT_DB_PATH 를 다시 import
+        auth.DEFAULT_DB_PATH = tmp_db  # 폴백 인자(init() no-arg)도 임시 경로 보장
+        import src.web.app as appmod
+        importlib.reload(appmod)  # 모듈 레벨 store=MeetingStore()/users=auth.init() → 임시 DB
+        with TestClient(appmod.app) as client:
+            yield auth, appmod, client
+    finally:
+        # 전역 원복: 실 DB 경로(또는 원래 값)로 되돌려 후속 테스트 오염 방지.
+        storemod.DEFAULT_DB_PATH = store_orig
+        import src.web.auth as auth_post
+        if auth_orig is not None:
+            auth_post.DEFAULT_DB_PATH = auth_orig
 
 
 def test_profile_validation_422():
-    with tempfile.TemporaryDirectory() as td:
-        auth, appmod, client = _client_for(Path(td), "admin:pw1")
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
         tok = auth.make_token("admin")
         h = {"Authorization": f"Bearer {tok}"}
 
@@ -110,6 +128,28 @@ def test_profile_validation_422():
         assert "password_hash" not in body
 
 
+def test_profile_empty_patch_422():
+    """세 필드 모두 미제공인 빈 PATCH → 422("변경할 필드가 없습니다")."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        tok = auth.make_token("admin")
+        h = {"Authorization": f"Bearer {tok}"}
+        r = client.patch("/api/settings/profile", json={}, headers=h)
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"] == "변경할 필드가 없습니다."
+        # 빈 PATCH 가 name_source 를 'user' 로 승격하지 않았는지(seed 보호 플래그 유지) 확인.
+        ns = appmod.users._conn.execute(
+            "SELECT name_source FROM users WHERE username=?", ("admin",)
+        ).fetchone()["name_source"]
+        assert ns == "seed", ns
+        # update_profile 을 빈 인자로 직접 호출해도 no-op(현재 user 반환, name_source 미승격).
+        same = appmod.users.update_profile("admin")
+        assert same is not None and same["username"] == "admin"
+        ns2 = appmod.users._conn.execute(
+            "SELECT name_source FROM users WHERE username=?", ("admin",)
+        ).fetchone()["name_source"]
+        assert ns2 == "seed", ns2
+
+
 def test_seed_preserves_user_display_name_but_syncs_role():
     with tempfile.TemporaryDirectory() as td:
         # 1차: dev 가 표시명을 self-edit → name_source='user'
@@ -141,8 +181,7 @@ def test_prune_deletes_user_row_regardless_of_name_source():
 
 
 def test_must_change_password_user_can_patch_profile():
-    with tempfile.TemporaryDirectory() as td:
-        auth, appmod, client = _client_for(Path(td), "admin:pw1")
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
         # 신규 시드 사용자는 must_change_password=1
         assert appmod.users.get("admin")["must_change_password"] == 1
         tok = auth.make_token("admin")

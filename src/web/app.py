@@ -154,13 +154,14 @@ def _clean_name(value: str, *, field: str, required: bool) -> str:
     required=False(englishName/jobTitle): 0..MAX_NAME_LEN(빈 허용).
     """
     v = value.strip()
+    # 길이 상한을 먼저 검사 — 긴 입력을 제어문자 전수 스캔하기 전에 빠르게 거부.
+    if len(v) > MAX_NAME_LEN:
+        raise HTTPException(status_code=422, detail=f"{field}: 최대 {MAX_NAME_LEN}자입니다.")
+    if required and not v:
+        raise HTTPException(status_code=422, detail=f"{field}: 빈 값은 저장할 수 없습니다.")
     # 제어문자(줄바꿈/탭 포함) 금지 — 표시명에 부적합.
     if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
         raise HTTPException(status_code=422, detail=f"{field}: 제어문자/줄바꿈은 사용할 수 없습니다.")
-    if required and not v:
-        raise HTTPException(status_code=422, detail=f"{field}: 빈 값은 저장할 수 없습니다.")
-    if len(v) > MAX_NAME_LEN:
-        raise HTTPException(status_code=422, detail=f"{field}: 최대 {MAX_NAME_LEN}자입니다.")
     return v
 
 
@@ -172,6 +173,8 @@ def patch_profile(req: ProfileRequest, user: dict = Depends(auth.require_user)) 
     비번 변경 전에도 이름 정정이 가능해야 한다(FR-A7). username/role/password 는 변경 불가.
     갱신 시 name_source='user' 로 표시해 seed 재실행이 display_name 을 덮어쓰지 않게 한다.
     """
+    if req.displayName is None and req.englishName is None and req.jobTitle is None:
+        raise HTTPException(status_code=422, detail="변경할 필드가 없습니다.")
     fields: dict[str, str] = {}
     if req.displayName is not None:
         fields["display_name"] = _clean_name(req.displayName, field="displayName", required=True)

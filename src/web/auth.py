@@ -229,8 +229,13 @@ class UserStore:
         name_source='user' 로 표시해 seed 재실행이 display_name 을 덮어쓰지 않게 한다.
 
         username/role/password 는 이 경로로 변경 불가. 갱신 후 공개 user dict 반환(없으면 None).
-        username 만 들어온(전부 None) 경우에도 행이 있으면 현재 값을 반환한다.
+        실제 갱신 필드가 0개(전부 None)면 name_source 를 'user' 로 승격하지 않고 현재 값을
+        그대로 반환한다(빈 PATCH 가 seed 보호 플래그를 임의로 켜지 않게).
         """
+        # 실제 갱신 필드가 없으면 no-op: name_source 승격 없이 현재 사용자 반환(행 없으면 None).
+        if display_name is None and english_name is None and job_title is None:
+            cur = self.get(username)
+            return public_user(cur) if cur else None
         sets: list[str] = ["name_source='user'"]
         params: list = []
         if display_name is not None:
