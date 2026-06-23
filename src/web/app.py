@@ -574,29 +574,39 @@ def delete_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -
 @app.post("/api/meetings/audio/staging")
 async def upload_audio_staging(
     file: UploadFile = File(...),
+    content_length: int | None = Header(default=None, alias="Content-Length"),
     user: dict = Depends(require_user_active),
 ) -> dict:
     """멀티파트 오디오 업로드 → {stagingToken, format, sizeBytes}. 처리 시점 1회 업로드(옵션B).
 
     finalize(create_meeting)가 stagingToken 을 받으면 회의로 bind 한다. 인증 필요.
     크기 상한(MAX_AUDIO_BYTES) 초과는 413. 빈 파일은 400. 저장 실패 시 부분파일 정리(rollback).
+
+    메모리/조기 413: 전체를 메모리에 적재하지 않고 1MB 청크로 스트리밍하며 디스크에 누적 write 한다.
+    누적 크기가 상한을 넘으면 즉시 중단·부분파일 정리·413. Content-Length 헤더로 명백한 초과는
+    바디를 읽기 전에 조기 거부한다(멀티파트 오버헤드만큼 헐겁지만 명백한 초과는 빠르게 걸러짐).
     """
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="빈 오디오")
-    if len(data) > audio_store.MAX_AUDIO_BYTES:
+    # Content-Length 선검사: 명백한 초과는 바디를 받기 전에 조기 거부(DoS 완화).
+    if content_length is not None and content_length > audio_store.MAX_AUDIO_BYTES:
         raise HTTPException(
             status_code=413,
             detail=f"오디오가 너무 큽니다(최대 {audio_store.MAX_AUDIO_BYTES} bytes).",
         )
     try:
-        token, ext = audio_store.save_staging(
-            data, mime_type=file.content_type, filename=file.filename
+        token, ext, size = audio_store.save_staging_stream(
+            file.file.read, mime_type=file.content_type, filename=file.filename
         )
+    except audio_store.AudioTooLarge:
+        raise HTTPException(
+            status_code=413,
+            detail=f"오디오가 너무 큽니다(최대 {audio_store.MAX_AUDIO_BYTES} bytes).",
+        )
+    except ValueError:  # 빈 오디오(0바이트) — 부분파일 정리됨
+        raise HTTPException(status_code=400, detail="빈 오디오")
     except Exception as e:  # noqa: BLE001 — 저장 실패는 부분파일 정리 후 500(부분파일 미잔존)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"오디오 저장 실패: {type(e).__name__}")
-    return {"stagingToken": token, "format": ext, "sizeBytes": len(data)}
+    return {"stagingToken": token, "format": ext, "sizeBytes": size}
 
 
 # Range 응답 청크 크기(부분요청 스트리밍 단위).

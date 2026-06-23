@@ -329,6 +329,48 @@ def test_delete_meeting_removes_audio():
         assert client.get(f"/api/meetings/{m['id']}", headers=h).status_code == 404
 
 
+def test_get_audio_zero_byte_200_empty_and_416_on_range():
+    """0바이트 오디오: Range 없으면 200 빈본문, Range 오면 불만족 → 416."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        st = _upload_staging(client, h, b"NONZERO")
+        m = _create_with_token(client, h, st["stagingToken"])
+        from src.web import audio_store
+
+        # 소스 파일을 0바이트로 절단(엣지: 빈 파일이지만 파일은 존재)
+        src = audio_store.audio_base() / m["id"] / "source.webm"
+        src.write_bytes(b"")
+        assert src.stat().st_size == 0
+        # Range 없음 → 200 빈본문
+        r = client.get(f"/api/meetings/{m['id']}/audio", headers=h)
+        assert r.status_code == 200, r.text
+        assert r.content == b""
+        assert r.headers.get("Accept-Ranges") == "bytes"
+        # Range 오면 불만족 → 416
+        r2 = client.get(
+            f"/api/meetings/{m['id']}/audio", headers={**h, "Range": "bytes=0-0"}
+        )
+        assert r2.status_code == 416, r2.text
+        assert r2.headers.get("Content-Range") == "bytes */0"
+
+
+def test_duplicate_staging_token_bind_second_meeting_no_audioref():
+    """동일 stagingToken 으로 두 번 bind: 첫 회의만 audioRef, 두 번째는 staging 부재 → audioRef 없음."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        st = _upload_staging(client, h, b"DUPLICATE-BIND-DATA")
+        token = st["stagingToken"]
+        # 1차 bind: audioRef 기록됨
+        m1 = _create_with_token(client, h, token)
+        assert "audioRef" in m1
+        # 2차 bind(동일 토큰): staging 파일이 이미 이동되어 없음 → graceful, audioRef 미기록
+        m2 = _create_with_token(client, h, token)
+        assert "audioRef" not in m2
+        # 2번째 회의 오디오 GET 은 404
+        r = client.get(f"/api/meetings/{m2['id']}/audio", headers=h)
+        assert r.status_code == 404, r.text
+
+
 def test_create_with_bad_token_rejected_400():
     with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
         h = _auth_headers(auth, appmod, "admin")

@@ -22,14 +22,29 @@ DB 에는 audioRef(메타: format/sizeBytes/durationSec?/createdAt)만 싣는다
 from __future__ import annotations
 
 import datetime as _dt
+import re
 import shutil
 import uuid
 from pathlib import Path
+from typing import Protocol
 
 import src.web.store as _storemod
 
 # 업로드 크기 상한(과대 거부). 기본 500MB. 회의 원본 오디오 1건 기준 넉넉.
 MAX_AUDIO_BYTES = 500 * 1024 * 1024
+
+# 스트리밍 저장 청크(1MB). UploadFile 을 조각조각 읽어 누적 write — 전체 메모리 적재 회피.
+_STREAM_CHUNK = 1024 * 1024
+
+# meetingId/token 최후 방어선(경로조립 직전). uuid4.hex == 32 소문자 hex.
+# 호출부 검증에만 의존하지 않고 모듈 내부에서 한 번 더 검증(traversal 차단).
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _assert_hex32(meeting_id: str, *, what: str = "meeting_id") -> None:
+    """meeting_id 가 ^[0-9a-f]{32}$ 인지 검증(경로조립 직전 최후 방어선). 위반 시 ValueError."""
+    if not isinstance(meeting_id, str) or not _HEX32.match(meeting_id):
+        raise ValueError(f"{what} 형식이 올바르지 않습니다(^[0-9a-f]{{32}}$).")
 
 # 허용 확장자(mime/파일명에서 추출). 알 수 없으면 .bin 으로 저장(경로조립 안전·재생은 메타로).
 _ALLOWED_EXTS = {
@@ -98,6 +113,57 @@ def save_staging(data: bytes, *, mime_type: str | None, filename: str | None) ->
     return token, ext
 
 
+class _ChunkReader(Protocol):
+    """청크 단위로 bytes 를 돌려주는 동기 reader(예: file.file.read). EOF 시 b''."""
+
+    def __call__(self, size: int, /) -> bytes: ...
+
+
+class AudioTooLarge(Exception):
+    """업로드 누적 크기가 MAX_AUDIO_BYTES 를 초과(스트리밍 중 즉시 중단). 호출부에서 413 매핑."""
+
+
+def save_staging_stream(
+    read_chunk: _ChunkReader,
+    *,
+    mime_type: str | None,
+    filename: str | None,
+    max_bytes: int = MAX_AUDIO_BYTES,
+    chunk_size: int = _STREAM_CHUNK,
+) -> tuple[str, str, int]:
+    """청크 스트리밍으로 staging 저장 → (stagingToken, ext, sizeBytes).
+
+    read_chunk(size) 를 반복 호출해 디스크에 누적 write 한다(전체 메모리 적재 회피). 누적 크기가
+    max_bytes 를 초과하면 즉시 중단 → 부분파일 정리 → AudioTooLarge 전파(호출부 413).
+    빈 파일(0바이트)이면 부분파일 정리 후 ValueError 전파(호출부 400). write 실패도 rollback.
+    """
+    token = uuid.uuid4().hex
+    ext = safe_ext(mime_type, filename)
+    sdir = _staging_dir()
+    sdir.mkdir(parents=True, exist_ok=True)
+    path = sdir / f"{token}.{ext}"
+    total = 0
+    try:
+        with path.open("wb") as f:
+            while True:
+                chunk = read_chunk(chunk_size)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise AudioTooLarge(
+                        f"오디오가 너무 큽니다(최대 {max_bytes} bytes)."
+                    )
+                f.write(chunk)
+        if total == 0:
+            raise ValueError("빈 오디오")
+    except Exception:
+        # 부분파일이 남았으면 정리(rollback) 후 재전파.
+        path.unlink(missing_ok=True)
+        raise
+    return token, ext, total
+
+
 def _staging_path(token: str) -> Path | None:
     """token 에 해당하는 staging 파일 경로(확장자 무관 첫 매치). 없으면 None."""
     sdir = _staging_dir()
@@ -113,9 +179,10 @@ def bind_staging(token: str, meeting_id: str) -> dict | None:
     """staging 파일을 {meetingId}/source.<ext> 로 이동(rename) + audioRef 메타 반환. 없으면 None.
 
     호출부(create_meeting)는 token(^[0-9a-f]{32}$)·meeting_id(^[0-9a-f]{32}$) 형식을 검증한
-    값만 넘긴다(경로조립 traversal 차단). 동일 디렉토리 내 rename → 원자적 이동.
+    값만 넘긴다(경로조립 traversal 차단). _staging→{id} 디렉토리 간 이동(shutil.move).
     audioRef: {format, sizeBytes, createdAt}. (durationSec 은 디코딩 비용상 v2 — 키 미포함.)
     """
+    _assert_hex32(meeting_id)  # 경로조립 직전 최후 방어선(호출부 검증에만 의존하지 않음)
     src = _staging_path(token)
     if src is None:
         return None
@@ -136,6 +203,7 @@ def meeting_audio_path(meeting_id: str, audio_ref: dict | None) -> Path | None:
     """meeting 의 오디오 파일 경로. audioRef 없거나 파일 부재면 None.
 
     호출부가 meeting_id(^[0-9a-f]{32}$)를 검증한 뒤에만 호출한다(경로조립 안전)."""
+    _assert_hex32(meeting_id)  # 경로조립 직전 최후 방어선
     if not audio_ref:
         return None
     ext = (audio_ref.get("format") or "bin").strip().lower()
@@ -149,6 +217,7 @@ def delete_meeting_audio(meeting_id: str) -> bool:
     """{meetingId}/ 오디오 디렉토리 동반 삭제(회의 삭제 시). 있었으면 True.
 
     호출부가 meeting_id(^[0-9a-f]{32}$)를 검증한 뒤에만 호출한다."""
+    _assert_hex32(meeting_id)  # 경로조립 직전 최후 방어선
     mdir = audio_base() / meeting_id
     if mdir.is_dir():
         shutil.rmtree(mdir, ignore_errors=True)
