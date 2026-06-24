@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict, dataclass, field
 
 from src.postprocess.extract_schema import seconds_to_timestamp
@@ -41,21 +42,51 @@ def _coerce_no(raw: object, fallback: int) -> int:
 
 @dataclass
 class SummaryItem:
-    """요약 항목 1개(논의 불릿 / 결정 / 이슈). anchor 는 호출부가 결정적 산출."""
+    """요약 항목 1개(논의 불릿 / 결정 / 이슈). anchor 는 호출부가 결정적 산출.
+
+    item_id(선결 Phase I): 생성 시 부여하는 안정 식별자(uuid). edited·재요약 매칭의 유일한
+    안정 조인키다(agenda no/위치는 재요약 간 불안정 — 사용 금지). edited 메타(edited/edited_at/
+    original_text)는 사용자 교정 시 **서버가 set**하며(클라 위조 차단), 그때 evidence_seg_ids 를
+    스냅샷 동결한다(web_contract.validate_summary_edit).
+    """
 
     text: str
     anchor: str | None = None
     evidence_seg_ids: list[int] = field(default_factory=list)
+    item_id: str = ""
+    edited: bool = False
+    edited_at: str | None = None
+    original_text: str | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        # 항상 노출: text/anchor/evidence_seg_ids/item_id. edited 메타는 교정된 항목만(노이즈 최소).
+        d: dict = {
+            "text": self.text,
+            "anchor": self.anchor,
+            "evidence_seg_ids": self.evidence_seg_ids,
+            "item_id": self.item_id,
+        }
+        if self.edited:
+            d["edited"] = True
+            if self.edited_at:
+                d["edited_at"] = self.edited_at
+            if self.original_text is not None:
+                d["original_text"] = self.original_text
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "SummaryItem":
+        # item_id 부여 경로: ① 파이프라인 산출(이 from_dict 경유) → 생성 시 부여. ② 클라가 summary 를
+        # 직접 POST/레거시 회의(이 경로 미경유, 통짜 저장) → 첫 summary PATCH 시 lazy 부여
+        # (web_contract.validate_summary_edit). 기존 값은 항상 보존(라운드트립 멱등).
         return cls(
             text=str(data.get("text", "")).strip(),
             anchor=None,  # LLM anchor 무시 — ground_summary 가 채운다.
             evidence_seg_ids=_coerce_int_list(data.get("evidence_seg_ids")),
+            item_id=str(data.get("item_id") or uuid.uuid4().hex),
+            edited=bool(data.get("edited")),
+            edited_at=(data.get("edited_at") or None),
+            original_text=(data.get("original_text") if data.get("original_text") is not None else None),
         )
 
 

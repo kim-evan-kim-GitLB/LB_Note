@@ -31,7 +31,9 @@ from src.postprocess.backends.agent_cli import (
     use_credential,
 )
 from src.postprocess.web_contract import (
+    SummaryStructureError,
     TranscriptStructureError,
+    validate_summary_edit,
     validate_transcript_edit,
 )
 from src.web.service import extract_action_items, process_audio_to_contract
@@ -501,10 +503,15 @@ def patch_meeting(
     If-Match 파싱(M4): `*`=존재하면 일치(값 비교 생략·존재만 요구), 약 ETag `W/` 접두 제거,
     다중값(콤마)은 첫 토큰 사용, 비어있는 비표준 입력은 400.
 
-    transcript 구조보존(편집 시에만): 저장본에 비어있지 않은 transcript 가 있고 patch 에
-    transcript 가 포함되면 개수·timestamp·speakerId 불변을 검증(위반 시 422)하고 text 가
-    바뀐 엔트리에 edited=True 를 서버가 set 한다(클라 제공 edited 무시). summary/actionItems
-    구조검증은 이 Phase 비대상이며, transcript 검증이 다른 필드 동시 patch 를 막지 않는다.
+    구조보존 편집(편집 시에만, 독립 적용):
+      - transcript: 저장본에 비어있지 않은 transcript 가 있고 patch 에 transcript 가 포함되면
+        개수·timestamp·speakerId 불변을 검증(위반 422)하고 text 가 바뀐 엔트리에 edited=True 를
+        서버가 set 한다(위치 식별, 클라 edited 무시).
+      - summary(P6): 저장본 summary 에 agenda 가 있고 patch 에 summary 가 포함되면 블록/항목
+        개수·no·title·anchor·evidence·item_id 불변을 검증(위반 422)하고 SummaryItem.text 만
+        편집 허용, 바뀐 항목에 edited/edited_at/original_text 를 서버가 set·evidence 스냅샷
+        동결한다(item_id 식별, 레거시 회의는 lazy 부여, grounding 우회). actionItems 구조검증은
+        이 Phase 비대상이다. 두 검증은 독립이며 다른 필드 동시 patch 를 막지 않는다.
 
     비교+갱신+구조검증은 store.update_if_match() 로 store 락 내 원자 수행(M2: read+compare+
     validate+write 단일 구간). transcript 구조검증은 락 안에서 재조회한 저장본 기준으로
@@ -519,23 +526,26 @@ def patch_meeting(
     expected = None if parsed is _IF_MATCH_ANY else parsed
 
     def _validator(stored: dict, p: dict) -> dict:
-        """락 안에서 재조회한 저장본(stored) 기준 transcript 구조검증(M2).
+        """락 안에서 재조회한 저장본(stored) 기준 transcript·summary 구조검증(M2).
 
-        patch 에 transcript 가 있고 저장본 transcript 가 비어있지 않을 때만 적용한다(후방호환).
-        검증 실패(TranscriptStructureError)는 락 밖으로 전파되어 422 로 변환된다."""
-        if "transcript" not in p:
-            return p
-        stored_tr = stored.get("transcript") or []
-        if not stored_tr:  # 초기 빈 상태 → 구조검증 미적용(0→N 채우기 허용)
-            return p
-        normalized = validate_transcript_edit(stored_tr, p.get("transcript") or [])
+        patch 에 transcript/summary 가 있고 저장본의 해당 구조가 비어있지 않을 때만 적용한다
+        (후방호환: 초기 0→N 채우기·미포함 patch 는 통과). 두 검증은 독립이며 한쪽이 다른 필드
+        동시 patch 를 막지 않는다. 검증 실패(Transcript/SummaryStructureError)는 락 밖으로
+        전파되어 422 로 변환된다."""
         out = dict(p)
-        out["transcript"] = normalized
+        if "transcript" in p:
+            stored_tr = stored.get("transcript") or []
+            if stored_tr:  # 초기 빈 상태가 아니면 구조검증(0→N 채우기는 허용)
+                out["transcript"] = validate_transcript_edit(stored_tr, p.get("transcript") or [])
+        if "summary" in p:
+            stored_sum = stored.get("summary") or {}
+            if stored_sum.get("agenda"):  # agenda 가 있는(생성 완료) summary 만 편집 검증
+                out["summary"] = validate_summary_edit(stored_sum, p.get("summary") or {})
         return out
 
     try:
         updated = store.update_if_match(meeting_id, patch, expected, validator=_validator)
-    except TranscriptStructureError as e:
+    except (TranscriptStructureError, SummaryStructureError) as e:
         # M2: 락 안 검증 실패 — 검증에 쓴 스냅샷 == write 대상 스냅샷 보장하에 422.
         raise HTTPException(status_code=422, detail=str(e))
     except PreconditionFailedError as e:
