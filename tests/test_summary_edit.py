@@ -178,6 +178,26 @@ def test_evidence_change_rejected():
         validate_summary_edit(stored, incoming)
 
 
+def test_evidence_reorder_is_accepted():
+    """evidence 순서만 다른 정상 편집은 허용(집합 동일) — 출력은 저장본 스냅샷 동결."""
+    stored = _summary("원문", evidence=(0, 1))
+    incoming = copy.deepcopy(stored)
+    _first_point(incoming)["evidence_seg_ids"] = [1, 0]  # 순서만 뒤집힘
+    _first_point(incoming)["text"] = "교정"
+    out = validate_summary_edit(stored, incoming)
+    assert _first_point(out)["evidence_seg_ids"] == [0, 1], "출력은 저장본 순서 동결"
+    assert _first_point(out)["edited"] is True
+
+
+def test_whitespace_only_diff_not_marked_edited():
+    """저장본 text 의 선·후행 공백 차이만으로는 edited 가 찍히지 않는다."""
+    stored = _summary("  공백포함  ")
+    incoming = copy.deepcopy(stored)
+    _first_point(incoming)["text"] = "공백포함"  # strip 된 동일 내용
+    out = validate_summary_edit(stored, incoming)
+    assert "edited" not in _first_point(out)
+
+
 def test_item_id_forgery_rejected():
     stored = _summary(item_id="real")
     incoming = copy.deepcopy(stored)

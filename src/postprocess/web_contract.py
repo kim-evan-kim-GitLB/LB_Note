@@ -156,7 +156,9 @@ def _validate_summary_items(stored_items: list, incoming_items: list, *, path: s
             except (TypeError, ValueError):
                 raise SummaryStructureError(f"{path}[{idx}] evidence_seg_ids 형식 오류")
             old_ev = [int(x) for x in (old.get("evidence_seg_ids") or [])]
-            if new_ev != old_ev:
+            # 순서 무시 비교: 근거 집합(중복 포함)만 같으면 정상 — 출력은 어차피 저장본 스냅샷으로
+            # 동결되므로 클라 직렬화 순서 차이([0,1]↔[1,0])로 정상 편집을 422 로 막지 않는다.
+            if sorted(new_ev) != sorted(old_ev):
                 raise SummaryStructureError(f"{path}[{idx}] evidence_seg_ids 불변 위반(근거 게이트)")
         # item_id: 저장본 우선. 부재(레거시)면 lazy 부여. incoming 이 다른 값을 주면 위조로 거부.
         stored_id = old.get("item_id")
@@ -173,7 +175,8 @@ def _validate_summary_items(stored_items: list, incoming_items: list, *, path: s
         entry = dict(old)  # 저장본 베이스: evidence 스냅샷·anchor·미지 필드 동결(grounding 우회)
         entry["text"] = new_text
         entry["item_id"] = out_id
-        if new_text != old_text:
+        # 변경 판정은 양쪽 strip 기준(저장본의 선·후행 공백 차이만으로 edited 오설정 방지).
+        if new_text != old_text.strip():
             # 서버 set: 교정 표시 + 최초 original_text 동결 + edited_at 갱신. 클라 edited 무시.
             entry["edited"] = True
             entry["edited_at"] = _now_iso_micro()

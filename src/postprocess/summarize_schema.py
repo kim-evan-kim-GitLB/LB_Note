@@ -76,7 +76,9 @@ class SummaryItem:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SummaryItem":
-        # item_id: 기존 값 보존(라운드트립 멱등), 없으면 생성 시 uuid 부여(신규 회의는 여기서 획득).
+        # item_id 부여 경로: ① 파이프라인 산출(이 from_dict 경유) → 생성 시 부여. ② 클라가 summary 를
+        # 직접 POST/레거시 회의(이 경로 미경유, 통짜 저장) → 첫 summary PATCH 시 lazy 부여
+        # (web_contract.validate_summary_edit). 기존 값은 항상 보존(라운드트립 멱등).
         return cls(
             text=str(data.get("text", "")).strip(),
             anchor=None,  # LLM anchor 무시 — ground_summary 가 채운다.
