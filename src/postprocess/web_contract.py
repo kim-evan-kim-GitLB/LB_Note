@@ -32,28 +32,40 @@ def _summary_or_empty(summary: dict | None) -> dict:
 
 
 def _transcript_from_segments(segments: list[dict]) -> list[dict]:
-    """segment 목록 → 웹 TranscriptEntry 목록. cleaned 우선, 없으면 text. 빈 줄 제외."""
+    """segment 목록 → 웹 TranscriptEntry 목록. cleaned 우선, 없으면 text. 빈 줄 제외.
+
+    segmentId(원본 STT segment id)를 함께 노출한다 — summary/actionItem 의 evidence_seg_ids 가
+    이 id 를 참조하므로, transcript↔근거 매핑과 (향후) 재요약의 evidence 정합에 필요하다.
+    빈 줄 제외로 위치 인덱스는 시프트되지만 segmentId 는 원본 id 라 매핑이 보존된다.
+    """
     out = []
     for s in segments:
         text = str(s.get("cleaned", s.get("text", ""))).strip()
         if not text:
             continue
-        out.append(
-            {
-                "speakerId": "",  # 화자분리 미적용
-                "text": text,
-                "timestamp": seconds_to_timestamp(float(s["start"])),
-            }
-        )
+        entry = {
+            "speakerId": "",  # 화자분리 미적용
+            "text": text,
+            "timestamp": seconds_to_timestamp(float(s["start"])),
+        }
+        if s.get("id") is not None:
+            entry["segmentId"] = int(s["id"])
+        out.append(entry)
     return out
 
 
 def _action_items_from_payload(ai: dict) -> list[dict]:
-    """추출 산출 dict → 웹 actionItems(표준 필드 노출)."""
+    """추출 산출 dict → 웹 actionItems(표준 필드 노출).
+
+    item_id(uuid): 웹 계약 경계에서 부여하는 안정 식별자(summary item_id 와 대칭). 편집·(향후)
+    재요약 item_id 단위 대조의 조인키. 원본 추출 스키마(ExtractResult, golden 비교)는 건드리지
+    않고 여기서만 부여해 결정성을 유지한다. 기존 값이 있으면 보존(멱등).
+    """
     out = []
     for it in ai.get("action_items", ai.get("actionItems", [])):
         out.append(
             {
+                "item_id": str(it.get("item_id") or uuid.uuid4().hex),
                 "text": it.get("text", ""),
                 "owner": it.get("owner"),
                 "owner_source": it.get("owner_source"),
