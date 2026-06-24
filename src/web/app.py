@@ -12,14 +12,18 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import threading
 import traceback
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from src.web import audio_store
 
 from src.postprocess.backends.agent_cli import (
     AgentCLIAuthError,
@@ -96,6 +100,17 @@ def _parse_if_match(if_match: str | None) -> object | str | None:
     value = first.strip('"')
     if not value:
         raise HTTPException(status_code=400, detail="If-Match 헤더 형식이 올바르지 않습니다.")
+    return value
+
+
+# meetingId/stagingToken 화이트리스트(경로조립 traversal 차단). uuid4.hex == 32 소문자 hex.
+_HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _require_hex32(value: str, *, what: str) -> str:
+    """meetingId/token 이 ^[0-9a-f]{32}$ 인지 검증(경로조립 전 화이트리스트). 위반 시 400."""
+    if not isinstance(value, str) or not _HEX32_RE.match(value):
+        raise HTTPException(status_code=400, detail=f"{what} 형식이 올바르지 않습니다.")
     return value
 
 
@@ -447,11 +462,26 @@ def get_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -> d
 
 @app.post("/api/meetings")
 def create_meeting(meeting: dict, user: dict = Depends(require_user_active)) -> dict:
+    """회의 확정 저장. optional audioStagingToken 이 있으면 staging 오디오를 이 회의에 bind.
+
+    D7-id 옵션B: 처리 시점에 1회 업로드한 staging 을 finalize 시 meetingId 로 이동(이중 전송 없음).
+    토큰 없으면 무시(후방호환). 토큰이 있어도 staging 파일이 없으면(만료·정리됨) 회의는 정상
+    저장하되 audioRef 를 남기지 않는다(graceful — 오디오는 부가 정보).
+    """
     if not meeting.get("id"):
         meeting["id"] = uuid.uuid4().hex
+    _require_hex32(meeting["id"], what="meetingId")  # 경로조립(audio bind) 안전 보장
     meeting["ownerId"] = user["id"]  # 소유자는 토큰에서 강제(클라이언트 위조 방지)
     meeting.setdefault("createdAt", _now_iso())
     meeting["updatedAt"] = _now_iso()
+
+    # 오디오 bind(옵션B). audioStagingToken 은 meeting JSON 에 영속하지 않는다(메타는 audioRef).
+    token = meeting.pop("audioStagingToken", None)
+    if token:
+        _require_hex32(token, what="audioStagingToken")
+        audio_ref = audio_store.bind_staging(token, meeting["id"])
+        if audio_ref is not None:
+            meeting["audioRef"] = audio_ref
     return store.create(meeting)
 
 
@@ -528,9 +558,168 @@ def patch_meeting(
 
 @app.delete("/api/meetings/{meeting_id}")
 def delete_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
+    """회의 삭제 + 원본 오디오 동반 삭제(보존=회의 수명 동일).
+
+    meetingId 화이트리스트(^[0-9a-f]{32}$) 통과분만 오디오 디렉토리 경로를 조립한다(traversal 차단).
+    형식 위반 meetingId 는 오디오 삭제를 건너뛴다(DB 삭제만; 그런 id 는 오디오가 있을 수 없음).
+    """
     _owned_or_404(meeting_id, user)  # 소유 확인 후에만 삭제
     store.delete(meeting_id)
+    if _HEX32_RE.match(meeting_id):
+        audio_store.delete_meeting_audio(meeting_id)
     return {"ok": True}
+
+
+# ---------- 원본 오디오 영속(플랜 v4 트랙 C·Phase 4, D7-id 옵션B) ----------
+@app.post("/api/meetings/audio/staging")
+def upload_audio_staging(
+    file: UploadFile = File(...),
+    content_length: int | None = Header(default=None, alias="Content-Length"),
+    user: dict = Depends(require_user_active),
+) -> dict:
+    """멀티파트 오디오 업로드 → {stagingToken, format, sizeBytes}. 처리 시점 1회 업로드(옵션B).
+
+    finalize(create_meeting)가 stagingToken 을 받으면 회의로 bind 한다. 인증 필요.
+    크기 상한(MAX_AUDIO_BYTES) 초과는 413. 빈 파일은 400. 저장 실패 시 부분파일 정리(rollback).
+
+    메모리/조기 413: 전체를 메모리에 적재하지 않고 1MB 청크로 스트리밍하며 디스크에 누적 write 한다.
+    누적 크기가 상한을 넘으면 즉시 중단·부분파일 정리·413. Content-Length 헤더로 명백한 초과는
+    바디를 읽기 전에 조기 거부한다(멀티파트 오버헤드만큼 헐겁지만 명백한 초과는 빠르게 걸러짐).
+
+    이벤트 루프 블로킹 해소: save_staging_stream 은 동기 디스크 누적 write(대용량 ≤500MB)이므로
+    이 엔드포인트를 동기 def 로 둔다 → Starlette 가 자동으로 threadpool 에 위임해 이벤트 루프를
+    막지 않는다(인증 Depends·예외 매핑·Content-Length 선검사 동작은 sync 에서도 동일).
+    """
+    # Content-Length 선검사: 명백한 초과는 바디를 받기 전에 조기 거부(DoS 완화).
+    if content_length is not None and content_length > audio_store.MAX_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"오디오가 너무 큽니다(최대 {audio_store.MAX_AUDIO_BYTES} bytes).",
+        )
+    try:
+        token, ext, size = audio_store.save_staging_stream(
+            file.file.read,
+            mime_type=file.content_type,
+            filename=file.filename,
+            max_bytes=audio_store.MAX_AUDIO_BYTES,  # 런타임 시점 상한(테스트 monkeypatch·재설정 반영)
+        )
+    except audio_store.AudioTooLarge:
+        raise HTTPException(
+            status_code=413,
+            detail=f"오디오가 너무 큽니다(최대 {audio_store.MAX_AUDIO_BYTES} bytes).",
+        )
+    except ValueError:  # 빈 오디오(0바이트) — 부분파일 정리됨
+        raise HTTPException(status_code=400, detail="빈 오디오")
+    except Exception as e:  # noqa: BLE001 — 저장 실패는 부분파일 정리 후 500(부분파일 미잔존)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"오디오 저장 실패: {type(e).__name__}")
+    return {"stagingToken": token, "format": ext, "sizeBytes": size}
+
+
+# Range 응답 청크 크기(부분요청 스트리밍 단위).
+_RANGE_CHUNK = 1024 * 1024
+
+
+def _parse_range(range_header: str | None, size: int) -> tuple[int, int] | None:
+    """`Range: bytes=start-end` 단일 범위 파싱 → (start, end) inclusive. 없거나 불만족이면 None.
+
+    멀티 레인지(콤마)는 미지원 — 단일 범위만(오디오 시킹 용도). 잘못된 범위는 None(호출부 416/200).
+    """
+    if not range_header:
+        return None
+    unit, _, spec = range_header.partition("=")
+    if unit.strip().lower() != "bytes" or not spec:
+        return None
+    first = spec.split(",", 1)[0].strip()
+    start_s, _, end_s = first.partition("-")
+    try:
+        if start_s == "":  # suffix: bytes=-N (마지막 N 바이트)
+            n = int(end_s)
+            if n <= 0:
+                return None
+            start = max(0, size - n)
+            end = size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+    except ValueError:
+        return None
+    if start < 0 or start >= size or end < start:
+        return None
+    end = min(end, size - 1)
+    return start, end
+
+
+_AUDIO_MIME = {
+    "webm": "audio/webm", "wav": "audio/wav", "mp3": "audio/mpeg", "m4a": "audio/mp4",
+    "mp4": "audio/mp4", "ogg": "audio/ogg", "oga": "audio/ogg", "flac": "audio/flac",
+    "aac": "audio/aac", "opus": "audio/opus", "bin": "application/octet-stream",
+}
+
+
+@app.get("/api/meetings/{meeting_id}/audio")
+def get_meeting_audio(
+    meeting_id: str,
+    user: dict = Depends(require_user_active),
+    range_header: str | None = Header(default=None, alias="Range"),
+) -> Response:
+    """회의 원본 오디오 스트리밍. 인증 + 소유자 검증 + meetingId 화이트리스트 + HTTP Range(206).
+
+    audioRef 없거나 파일 부재면 404. 소유자 아니면 404(_owned_or_404, 존재 자체 숨김).
+    meetingId 가 ^[0-9a-f]{32}$ 아니면 400(경로조립 traversal 차단). Range 미지정 시 전체(200).
+    """
+    _require_hex32(meeting_id, what="meetingId")  # 경로조립 전 화이트리스트(traversal 차단)
+    m = _owned_or_404(meeting_id, user)  # 인증 + 소유자 격리
+    path = audio_store.meeting_audio_path(meeting_id, m.get("audioRef"))
+    if path is None:
+        raise HTTPException(status_code=404, detail="오디오 없음")
+    size = path.stat().st_size
+    ext = (m.get("audioRef") or {}).get("format", "bin")
+    media_type = _AUDIO_MIME.get(ext, "application/octet-stream")
+
+    rng = _parse_range(range_header, size)
+    if rng is None:
+        if range_header:  # 범위 헤더는 왔으나 불만족 → 416
+            return Response(
+                status_code=416,
+                headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"},
+            )
+
+        def _full():
+            with path.open("rb") as f:
+                while chunk := f.read(_RANGE_CHUNK):
+                    yield chunk
+
+        return StreamingResponse(
+            _full(),
+            media_type=media_type,
+            headers={"Accept-Ranges": "bytes", "Content-Length": str(size)},
+        )
+
+    start, end = rng
+    length = end - start + 1
+
+    def _partial():
+        remaining = length
+        with path.open("rb") as f:
+            f.seek(start)
+            while remaining > 0:
+                chunk = f.read(min(_RANGE_CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        _partial(),
+        status_code=206,
+        media_type=media_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Content-Length": str(length),
+        },
+    )
 
 
 @app.get("/api/health")
