@@ -78,6 +78,33 @@ def _action_items_from_payload(ai: dict) -> list[dict]:
     return out
 
 
+def ensure_action_item_ids(items: object) -> list[dict]:
+    """actionItems 의 item_id 무결성 보장(재요약 P8 조인키 선결).
+
+    actionItems 는 UI 에서 자유롭게 추가/삭제/편집/확정토글되므로 summary 처럼 구조(개수/순서)를
+    잠그지 않는다 — 구조 검증은 부적절(정상 추가·삭제를 막음). 대신 재요약 item_id 단위 대조의
+    안정 조인키만 보장한다: 각 항목에 **고유 item_id** 부여 — 기존 값은 보존(불변), 부재/중복
+    (UI 신규 추가·위조·복제)은 새 uuid 부여. 순서·개수·text·기타 필드는 그대로 둔다(비파괴, 멱등).
+
+    create_meeting(POST)·patch_meeting(PATCH) 양 저장 경로에서 호출돼, 어느 경로로 저장하든 저장본
+    actionItems 가 항상 유일 item_id 를 갖도록 한다. dict 가 아닌 항목은 무시(그대로 통과).
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for it in items or []:  # type: ignore[union-attr]
+        if not isinstance(it, dict):
+            out.append(it)
+            continue
+        entry = dict(it)
+        iid = entry.get("item_id")
+        if not iid or not isinstance(iid, str) or iid in seen:
+            iid = uuid.uuid4().hex
+        entry["item_id"] = iid
+        seen.add(iid)
+        out.append(entry)
+    return out
+
+
 class TranscriptStructureError(ValueError):
     """transcript 구조보존 검증 위반. 호출부(app.py)가 422 로 변환한다."""
 
