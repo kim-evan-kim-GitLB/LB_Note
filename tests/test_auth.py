@@ -42,7 +42,11 @@ def test_password_verify_and_roles():
         auth, store = _fresh_init(Path(td), "admin:pw1,dev:pw2")
         # 올바른 비번 → 공개 user, 역할 매핑
         admin = store.verify("admin", "pw1")
-        assert admin == {"id": "admin", "username": "admin", "displayName": "admin", "role": "admin"}
+        # public_user 는 englishName/jobTitle/mustChangePassword 등 부가 키도 포함하므로
+        # 전체 dict 동등 비교 대신 핵심 계약 키만 부분집합 검증한다.
+        assert {k: admin[k] for k in ("id", "username", "displayName", "role")} == {
+            "id": "admin", "username": "admin", "displayName": "admin", "role": "admin"
+        }
         dev = store.verify("dev", "pw2")
         assert dev["role"] == "developer"
         # 잘못된 비번 / 없는 사용자 → None

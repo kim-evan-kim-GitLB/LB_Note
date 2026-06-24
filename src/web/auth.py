@@ -29,7 +29,7 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.hash import pbkdf2_sha256
 
-from src.web.store import DEFAULT_DB_PATH
+from src.web.store import DEFAULT_DB_PATH, _guard_default_db
 
 
 def _secret() -> str:
@@ -123,6 +123,7 @@ class UserStore:
 
     def __init__(self, db_path=None) -> None:
         self.db_path = db_path or DEFAULT_DB_PATH
+        _guard_default_db(self.db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -428,6 +429,8 @@ def init(db_path=None) -> UserStore:
     global _store
     if not _secret():
         raise RuntimeError("JWT_SECRET 미설정 — 인증 토큰 서명 불가. .env 에 설정하세요.")
+    # 테스트 격리 가드레일: 패치 누락으로 실 DB 를 열려 하면 즉시 거부(아래 UserStore 도 재확인).
+    _guard_default_db(db_path or DEFAULT_DB_PATH)
     _store = UserStore(db_path)
 
     # 자격증명 at-rest 암호화: CRED_ENC_KEY 가 설정돼 있으면 평문으로 남은 자격증명을 재암호화

@@ -19,6 +19,29 @@ from pathlib import Path
 # 기본 DB 경로: output/ 는 .gitignore 대상이라 커밋 안 됨(시크릿/대용량 정책과 동일 영역).
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "output" / "web" / "meetings.db"
 
+# 가드레일 비교 기준 — **실 운영 DB 의 고정 절대경로**. DEFAULT_DB_PATH 는 테스트가 임시 경로로
+# 패치(rebind)하므로 비교 기준으로 쓰면 패치된 임시 경로끼리 같아져 정상 격리 테스트도 막힌다.
+# 따라서 모듈 로드 시 1회 계산한 불변 상수를 기준으로, 실 경로를 열 때만 차단한다.
+_REAL_DB_PATH = DEFAULT_DB_PATH.resolve()
+
+
+def _guard_default_db(resolved: Path) -> None:
+    """테스트 격리 가드레일 — MEETSCRIPT_BLOCK_DEFAULT_DB=1 일 때 **실 운영 DB 경로** 접촉 거부.
+
+    테스트가 DEFAULT_DB_PATH 패치를 빠뜨려 실 운영 DB(output/web/meetings.db)를 열려 하면
+    즉시 RuntimeError 로 막는다(과거 실 DB 2회 변조 사고 재발 방지). env 미설정인 정상 부팅은
+    영향 없다(가드 자체가 동작 안 함). 임시 경로로 올바르게 격리된 테스트는 통과한다."""
+    import os
+
+    if os.environ.get("MEETSCRIPT_BLOCK_DEFAULT_DB") != "1":
+        return
+    if Path(resolved).resolve() == _REAL_DB_PATH:
+        raise RuntimeError(
+            "MEETSCRIPT_BLOCK_DEFAULT_DB=1 인데 기본 실 DB 경로"
+            f"({_REAL_DB_PATH})를 열려고 했습니다 — 테스트 격리 누락. "
+            "테스트는 DEFAULT_DB_PATH 를 임시 경로로 패치해야 합니다."
+        )
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meetings (
     id         TEXT PRIMARY KEY,
@@ -38,6 +61,7 @@ class MeetingStore:
 
     def __init__(self, db_path: Path | str | None = None) -> None:
         self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+        _guard_default_db(self.db_path.resolve())
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False + Lock: BackgroundTask(별도 스레드)에서도 같은 연결 사용.
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
