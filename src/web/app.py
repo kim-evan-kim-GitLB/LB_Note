@@ -17,7 +17,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -26,8 +26,12 @@ from src.postprocess.backends.agent_cli import (
     claude_auth_status,
     use_credential,
 )
+from src.postprocess.web_contract import (
+    TranscriptStructureError,
+    validate_transcript_edit,
+)
 from src.web.service import extract_action_items, process_audio_to_contract
-from src.web.store import MeetingStore
+from src.web.store import MeetingStore, PreconditionFailedError
 # service import 가 config(load_dotenv)를 끌어와 .env 가 로드된 뒤 auth 를 가져온다(순서 주의).
 from src.web import auth
 
@@ -55,7 +59,44 @@ users = auth.init()  # users 테이블 준비 + WEB_AUTH_USERS 시드/동기화
 
 
 def _now_iso() -> str:
-    return dt.datetime.now().isoformat(timespec="seconds")
+    """create/update 타임스탬프. UTC·마이크로초로 store 의 ETag 포맷과 통일(M1).
+
+    create 직후 동일 마이크로초에 PATCH 가 와도 store._next_etag 가 단조 증가를 보장하므로,
+    여기서는 마이크로초 정밀도만 맞춰 두면 충분하다(초 단위 → 마이크로초 통일)."""
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+# If-Match `*`(존재하면 일치) 표식. 비교를 생략하되, 락 안에서 "존재" 자체는 보장된다.
+_IF_MATCH_ANY = object()
+
+
+def _parse_if_match(if_match: str | None) -> object | str | None:
+    """If-Match 헤더 파싱(M4, RFC 7232 견고화).
+
+    반환:
+      - None            : 헤더 없음 → 비교 생략(last-write-wins, 후방호환).
+      - _IF_MATCH_ANY   : `*` → "리소스가 존재하면 일치"(값 비교 생략). 호출부는 존재만 요구.
+      - str             : 비교할 강(strong) ETag 값(따옴표·W/ 접두 제거).
+
+    규칙:
+      - 약(weak) ETag 접두 `W/` 는 제거하고 값만 사용(편집 동시성엔 강·약 구분 불필요).
+      - 다중값(콤마 구분)은 첫 유효 토큰을 사용한다.
+      - 양끝 큰따옴표는 제거한다.
+      - 빈 문자열·따옴표만 등 파싱 불가 입력은 400(클라이언트 오류로 명시)으로 거부한다.
+    """
+    if if_match is None:
+        return None
+    raw = if_match.strip()
+    if raw == "*":
+        return _IF_MATCH_ANY
+    # 다중값 중 첫 토큰만 사용(편집은 단일 리소스 대상).
+    first = raw.split(",", 1)[0].strip()
+    if first.startswith("W/"):  # 약 ETag 접두 제거
+        first = first[2:].strip()
+    value = first.strip('"')
+    if not value:
+        raise HTTPException(status_code=400, detail="If-Match 헤더 형식이 올바르지 않습니다.")
+    return value
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -287,6 +328,8 @@ def _run_ai_job(
     """
     # 동시성 슬롯 확보까지 대기(잡 status 는 'queued' 유지). 확보하면 'processing' 으로 전환.
     # 한 번에 _stt_semaphore 한도(기본 1)만 실제 추론, 나머지는 여기서 블록되어 큐처럼 동작한다.
+    # 락 순서 규약: 이 잡 스레드는 _stt_semaphore 보유 중 store._lock(update_if_match)을 잡지
+    # 않는다 — STT 추론은 store 비접촉이고 _jobs(인메모리)만 갱신한다(데드락/장시간 점유 방지).
     with _stt_semaphore:
         with _jobs_lock:
             _jobs[job_id] = {"status": "processing"}
@@ -413,11 +456,74 @@ def create_meeting(meeting: dict, user: dict = Depends(require_user_active)) -> 
 
 
 @app.patch("/api/meetings/{meeting_id}")
-def patch_meeting(meeting_id: str, patch: dict, user: dict = Depends(require_user_active)) -> dict:
-    _owned_or_404(meeting_id, user)  # 소유 확인 후에만 수정
-    patch.pop("ownerId", None)  # 소유자 변경 불가
-    patch["updatedAt"] = _now_iso()
-    return store.update(meeting_id, patch)
+def patch_meeting(
+    meeting_id: str,
+    patch: dict,
+    response: Response,
+    user: dict = Depends(require_user_active),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> dict:
+    """회의 부분 업데이트.
+
+    후방호환: **If-Match 헤더가 없으면 기존 동작(last-write-wins)** 그대로 — finalize·제목·
+    액션아이템 편집 등 기존 호출부를 깨지 않는다. If-Match 가 있으면 저장본 updatedAt 과
+    비교해 불일치 시 412(현재 updatedAt 을 ETag 헤더·본문 힌트로 재조회 유도).
+    If-Match 파싱(M4): `*`=존재하면 일치(값 비교 생략·존재만 요구), 약 ETag `W/` 접두 제거,
+    다중값(콤마)은 첫 토큰 사용, 비어있는 비표준 입력은 400.
+
+    transcript 구조보존(편집 시에만): 저장본에 비어있지 않은 transcript 가 있고 patch 에
+    transcript 가 포함되면 개수·timestamp·speakerId 불변을 검증(위반 시 422)하고 text 가
+    바뀐 엔트리에 edited=True 를 서버가 set 한다(클라 제공 edited 무시). summary/actionItems
+    구조검증은 이 Phase 비대상이며, transcript 검증이 다른 필드 동시 patch 를 막지 않는다.
+
+    비교+갱신+구조검증은 store.update_if_match() 로 store 락 내 원자 수행(M2: read+compare+
+    validate+write 단일 구간). transcript 구조검증은 락 안에서 재조회한 저장본 기준으로
+    수행되므로(락 밖 읽기본 cur 기준이 아님) If-Match 없는 편집의 TOCTOU 가 차단된다.
+    """
+    _owned_or_404(meeting_id, user)  # 소유 확인 후에만 수정(소유권/존재 게이트)
+    patch.pop("ownerId", None)  # 소유자 변경 불가(store 도 한 번 더 강제)
+    patch.pop("updatedAt", None)  # updatedAt(ETag)은 서버가 부여 — 클라 값 무시
+
+    # M4: If-Match 견고 파싱. `*`=존재하면 일치(값 비교 생략), W/·다중값·따옴표 처리.
+    parsed = _parse_if_match(if_match)
+    expected = None if parsed is _IF_MATCH_ANY else parsed
+
+    def _validator(stored: dict, p: dict) -> dict:
+        """락 안에서 재조회한 저장본(stored) 기준 transcript 구조검증(M2).
+
+        patch 에 transcript 가 있고 저장본 transcript 가 비어있지 않을 때만 적용한다(후방호환).
+        검증 실패(TranscriptStructureError)는 락 밖으로 전파되어 422 로 변환된다."""
+        if "transcript" not in p:
+            return p
+        stored_tr = stored.get("transcript") or []
+        if not stored_tr:  # 초기 빈 상태 → 구조검증 미적용(0→N 채우기 허용)
+            return p
+        normalized = validate_transcript_edit(stored_tr, p.get("transcript") or [])
+        out = dict(p)
+        out["transcript"] = normalized
+        return out
+
+    try:
+        updated = store.update_if_match(meeting_id, patch, expected, validator=_validator)
+    except TranscriptStructureError as e:
+        # M2: 락 안 검증 실패 — 검증에 쓴 스냅샷 == write 대상 스냅샷 보장하에 422.
+        raise HTTPException(status_code=422, detail=str(e))
+    except PreconditionFailedError as e:
+        # 412: 프론트가 현재 값 재조회·재적용하도록 현재 updatedAt(ETag)을 힌트로 제공.
+        if e.current_updated_at:
+            response.headers["ETag"] = f'"{e.current_updated_at}"'
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "error": "precondition_failed",
+                "message": "저장본이 변경되었습니다. 최신 회의를 재조회한 뒤 다시 시도하세요.",
+                "currentUpdatedAt": e.current_updated_at,
+            },
+        )
+    if updated is None:  # 비교 직전 삭제된 경합
+        raise HTTPException(status_code=404, detail="meeting 없음")
+    response.headers["ETag"] = f'"{updated["updatedAt"]}"'
+    return updated
 
 
 @app.delete("/api/meetings/{meeting_id}")
