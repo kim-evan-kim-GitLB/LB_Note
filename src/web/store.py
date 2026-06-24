@@ -307,3 +307,33 @@ class MeetingStore:
             self._conn.execute("DELETE FROM meeting_backup WHERE meeting_id=?", (meeting_id,))
             self._conn.commit()
         return cur.rowcount > 0
+
+    def prune_expired_backups(self, max_age_seconds: float) -> int:
+        """created_at 이 max_age_seconds 초 이전인 재요약 백업 삭제 → 삭제 개수(정리배치 P10).
+
+        apply 후 undo 하지 않은 백업(meeting_backup)이 무한정 쌓여 data 누적·디스크 잠식되는 것을
+        막는다. created_at 은 _now_iso_micro(UTC ISO·마이크로초)라 ISO 문자열 비교로 cutoff 판단이
+        가능하다(동일 포맷·타임존 일관 → 사전식 비교 == 시간 비교). 회의 자체나 최신 상태는 건드리지
+        않는다(이미 apply 로 본문에 반영됨 — 백업은 undo 여력일 뿐, 만료 시 undo 불가만 됨).
+        """
+        cutoff = (
+            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=max_age_seconds)
+        ).isoformat(timespec="microseconds")
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM meeting_backup WHERE created_at < ?", (cutoff,)
+            )
+            self._conn.commit()
+        return cur.rowcount
+
+    def count_backups(self) -> int:
+        """현재 meeting_backup 행 수(메트릭/관측성용)."""
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM meeting_backup").fetchone()
+        return int(row["n"]) if row else 0
+
+    def count_meetings(self) -> int:
+        """현재 meetings 행 수(메트릭/관측성용)."""
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM meetings").fetchone()
+        return int(row["n"]) if row else 0
