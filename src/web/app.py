@@ -74,6 +74,13 @@ BACKUP_MAX_AGE_SEC = float(
     os.environ.get("WEB_BACKUP_MAX_AGE_SEC", str(maintenance.DEFAULT_BACKUP_MAX_AGE))
 )
 
+# DB 스냅샷 백업(무백업 prune 사고 재발 방지). 기본 ON·1일 주기·최근 7개 보존.
+DB_BACKUP_ENABLED = os.environ.get("WEB_DB_BACKUP_ENABLED", "1") != "0"
+DB_BACKUP_INTERVAL_SEC = float(
+    os.environ.get("WEB_DB_BACKUP_INTERVAL_SEC", str(maintenance.DEFAULT_DB_BACKUP_INTERVAL))
+)
+DB_BACKUP_KEEP = int(os.environ.get("WEB_DB_BACKUP_KEEP", str(maintenance.DEFAULT_DB_BACKUP_KEEP)))
+
 
 async def _cleanup_loop() -> None:
     """부팅 직후 1회 + 이후 CLEANUP_INTERVAL_SEC 주기로 정리 배치 실행.
@@ -95,24 +102,44 @@ async def _cleanup_loop() -> None:
         await asyncio.sleep(CLEANUP_INTERVAL_SEC)
 
 
+async def _db_backup_loop() -> None:
+    """부팅 직후 1회 + 이후 DB_BACKUP_INTERVAL_SEC 주기로 DB 스냅샷 백업(무백업 사고 재발 방지).
+
+    블로킹 sqlite backup API 는 asyncio.to_thread 로 워커스레드에 위임한다(store._lock 으로 백업 중
+    동시 쓰기 차단·일관 스냅샷 보장). 사이클 예외는 로깅 후 삼켜 루프가 죽지 않게 한다.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(maintenance.run_db_backup, store, keep=DB_BACKUP_KEEP)
+        except Exception:  # noqa: BLE001 — 한 사이클 실패가 스케줄러를 죽이지 않게 격리
+            traceback.print_exc()
+        await asyncio.sleep(DB_BACKUP_INTERVAL_SEC)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """앱 수명 — startup 시 정리 스케줄러 기동, shutdown 시 취소.
+    """앱 수명 — startup 시 정리·DB백업 스케줄러 기동, shutdown 시 취소.
 
-    테스트(MEETSCRIPT_BLOCK_DEFAULT_DB=1)·비활성(WEB_CLEANUP_ENABLED=0)에서는 스케줄러를 띄우지
-    않는다 → 테스트는 maintenance.run_cleanup_once 를 직접 호출해 정리 로직을 단언한다.
+    테스트(MEETSCRIPT_BLOCK_DEFAULT_DB=1)·비활성(WEB_CLEANUP_ENABLED/WEB_DB_BACKUP_ENABLED=0)에서는
+    해당 스케줄러를 띄우지 않는다 → 테스트는 maintenance.run_cleanup_once/run_db_backup 을 직접
+    호출해 로직을 단언한다(실 DB·스케줄러 미접촉).
     """
-    task = None
-    if CLEANUP_ENABLED and os.environ.get("MEETSCRIPT_BLOCK_DEFAULT_DB") != "1":
-        task = asyncio.create_task(_cleanup_loop())
-        observability.audit("scheduler.start", interval=CLEANUP_INTERVAL_SEC)
+    in_test = os.environ.get("MEETSCRIPT_BLOCK_DEFAULT_DB") == "1"
+    tasks: list[asyncio.Task] = []
+    if not in_test and CLEANUP_ENABLED:
+        tasks.append(asyncio.create_task(_cleanup_loop()))
+        observability.audit("scheduler.start", kind="cleanup", interval=CLEANUP_INTERVAL_SEC)
+    if not in_test and DB_BACKUP_ENABLED:
+        tasks.append(asyncio.create_task(_db_backup_loop()))
+        observability.audit("scheduler.start", kind="db_backup", interval=DB_BACKUP_INTERVAL_SEC)
     try:
         yield
     finally:
-        if task is not None:
-            task.cancel()
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
             with contextlib.suppress(asyncio.CancelledError):
-                await task
+                await t
 
 
 app = FastAPI(title="meetscript-ai on-prem backend", version="1.0", lifespan=lifespan)
@@ -1029,6 +1056,12 @@ def admin_metrics(user: dict = Depends(require_admin)) -> dict:
             "intervalSec": CLEANUP_INTERVAL_SEC,
             "stagingMaxAgeSec": STAGING_MAX_AGE_SEC,
             "backupMaxAgeSec": BACKUP_MAX_AGE_SEC,
+        },
+        "dbBackup": {
+            "enabled": DB_BACKUP_ENABLED,
+            "intervalSec": DB_BACKUP_INTERVAL_SEC,
+            "keep": DB_BACKUP_KEEP,
+            "count": maintenance.db_backup_count(store),
         },
     }
 

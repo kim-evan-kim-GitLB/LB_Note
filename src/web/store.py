@@ -11,6 +11,7 @@ data JSON 컬럼에 통째로 저장 → 프론트 타입과 1:1, 변환 손실 
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import sqlite3
@@ -337,3 +338,33 @@ class MeetingStore:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) AS n FROM meetings").fetchone()
         return int(row["n"]) if row else 0
+
+    def backup_to(self, dest: Path | str) -> Path:
+        """현재 DB 의 일관 스냅샷을 dest 파일로 기록(sqlite 온라인 backup API) → dest 경로.
+
+        파일 복사가 아니라 sqlite backup API 를 쓴다 — 쓰기 진행 중에도 트랜잭션 일관 스냅샷을
+        보장한다(부분 기록본 방지). 과거 meetings.db 무백업 prune 사고(사용자 비번 전부 리셋·
+        복원불가) 재발 방지용 안전장치다.
+
+        락 점유 최소화: dest 연결 생성·디렉토리 준비는 락 밖에서 한다(소스 일관성과 무관). 실제
+        backup() 만 _lock 구간에서 수행해 백업 중 본 연결의 동시 쓰기를 막는다(백업 동안 다른
+        store 쓰기/읽기도 직렬화됨 — DB 가 작아 점유는 짧다). 스냅샷은 비번 해시 포함 DB 사본이라
+        파일 0600·디렉토리 0700 로 제한한다. backup 실패 시 부분 기록본을 정리(unlink)한다.
+        """
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            dest.parent.chmod(0o700)
+        target = sqlite3.connect(str(dest))
+        try:
+            with self._lock:
+                self._conn.commit()  # 보류 트랜잭션을 닫아 일관 스냅샷 보장(방어)
+                self._conn.backup(target)
+        except Exception:
+            target.close()
+            dest.unlink(missing_ok=True)  # 부분 기록본 제거(잘못된 백업 오인 복원 방지)
+            raise
+        target.close()
+        with contextlib.suppress(OSError):
+            dest.chmod(0o600)  # 비번 해시 포함 사본 — 소유자만 접근
+        return dest
