@@ -285,7 +285,10 @@ def test_patch_transcript_with_other_fields_simultaneously():
         body = r.json()
         assert body["title"] == "동시갱신"
         assert body["transcript"][0]["edited"] is True
-        assert body["actionItems"] == [{"text": "할일"}]
+        # actionItems 는 구조 잠금 없이 통과하되 item_id 무결성만 부여(재요약 조인키 선결)
+        assert len(body["actionItems"]) == 1
+        assert body["actionItems"][0]["text"] == "할일"
+        assert len(body["actionItems"][0]["item_id"]) == 32
 
 
 def test_patch_transcript_speaker_change_422():

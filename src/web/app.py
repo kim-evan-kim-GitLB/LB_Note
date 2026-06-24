@@ -33,6 +33,7 @@ from src.postprocess.backends.agent_cli import (
 from src.postprocess.web_contract import (
     SummaryStructureError,
     TranscriptStructureError,
+    ensure_action_item_ids,
     validate_summary_edit,
     validate_transcript_edit,
 )
@@ -476,6 +477,10 @@ def create_meeting(meeting: dict, user: dict = Depends(require_user_active)) -> 
     meeting["ownerId"] = user["id"]  # 소유자는 토큰에서 강제(클라이언트 위조 방지)
     meeting.setdefault("createdAt", _now_iso())
     meeting["updatedAt"] = _now_iso()
+    # item_id 무결성(재요약 조인키): 신규/중복 항목에 uuid 부여. POST 는 신규 단발 생성
+    # (read-compare 사이클 없음)이라 store 락 밖 정규화로 충분하다(PATCH 는 _validator 안에서 수행).
+    if "actionItems" in meeting:
+        meeting["actionItems"] = ensure_action_item_ids(meeting.get("actionItems"))
 
     # 오디오 bind(옵션B). audioStagingToken 은 meeting JSON 에 영속하지 않는다(메타는 audioRef).
     token = meeting.pop("audioStagingToken", None)
@@ -510,8 +515,10 @@ def patch_meeting(
       - summary(P6): 저장본 summary 에 agenda 가 있고 patch 에 summary 가 포함되면 블록/항목
         개수·no·title·anchor·evidence·item_id 불변을 검증(위반 422)하고 SummaryItem.text 만
         편집 허용, 바뀐 항목에 edited/edited_at/original_text 를 서버가 set·evidence 스냅샷
-        동결한다(item_id 식별, 레거시 회의는 lazy 부여, grounding 우회). actionItems 구조검증은
-        이 Phase 비대상이다. 두 검증은 독립이며 다른 필드 동시 patch 를 막지 않는다.
+        동결한다(item_id 식별, 레거시 회의는 lazy 부여, grounding 우회).
+      - actionItems: UI 에서 자유 추가/삭제/편집되므로 구조를 잠그지 않고(개수/순서 가변), 재요약
+        조인키용 item_id 무결성만 보장한다(부재/중복=uuid 부여, 기존 보존). 거부(422) 없음.
+        세 처리는 독립이며 다른 필드 동시 patch 를 막지 않는다.
 
     비교+갱신+구조검증은 store.update_if_match() 로 store 락 내 원자 수행(M2: read+compare+
     validate+write 단일 구간). transcript 구조검증은 락 안에서 재조회한 저장본 기준으로
@@ -541,6 +548,8 @@ def patch_meeting(
             stored_sum = stored.get("summary") or {}
             if stored_sum.get("agenda"):  # agenda 가 있는(생성 완료) summary 만 편집 검증
                 out["summary"] = validate_summary_edit(stored_sum, p.get("summary") or {})
+        if "actionItems" in p:  # 구조 잠금 아님(자유 추가/삭제) — item_id 무결성만 보장
+            out["actionItems"] = ensure_action_item_ids(p.get("actionItems"))
         return out
 
     try:
