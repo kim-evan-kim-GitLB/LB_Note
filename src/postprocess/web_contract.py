@@ -15,7 +15,9 @@ actionitems.json)을 웹/Jira 등 다운스트림이 그대로 쓰는 형태로 
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
+import uuid
 from pathlib import Path
 
 from src.postprocess.extract_schema import seconds_to_timestamp
@@ -108,6 +110,127 @@ def validate_transcript_edit(stored: list[dict], incoming: list[dict]) -> list[d
         else:
             entry.pop("edited", None)
         out.append(entry)
+    return out
+
+
+class SummaryStructureError(ValueError):
+    """summary 편집 구조보존 검증 위반. 호출부(app.py)가 422 로 변환한다."""
+
+
+def _now_iso_micro() -> str:
+    """edited_at 용 타임스탬프(UTC·마이크로초). store._now_iso_micro 와 동일 포맷."""
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def _changed(new: dict, old: dict, key: str) -> bool:
+    """incoming 이 key 를 **명시적으로** 다른 값으로 보냈는지(불변 위반 후보).
+
+    key 가 incoming 에 없으면 변경 아님(저장본 보존). 출력은 항상 저장본 베이스라 누락은
+    안전하게 보존되고, 명시적 위조만 거부 대상이 된다.
+    """
+    if key not in new:
+        return False
+    return str(new.get(key) or "") != str(old.get(key) or "")
+
+
+def _validate_summary_items(stored_items: list, incoming_items: list, *, path: str) -> list[dict]:
+    """한 섹션(points/decisions/issues) SummaryItem 리스트 편집 검증·정규화.
+
+    구조 보존: 개수·anchor·evidence_seg_ids·item_id 불변, text 만 편집. 결과 항목은 **저장본
+    베이스**(dict(old))로 만들어 anchor/evidence/미지 필드를 보존하고 검증된 새 text·edited
+    메타만 덮어쓴다. item_id 부재(레거시)는 여기서 lazy 부여한다(무파괴 마이그레이션).
+    """
+    if len(incoming_items) != len(stored_items):
+        raise SummaryStructureError(
+            f"{path} 항목 개수 불변 위반: 저장본 {len(stored_items)} != 요청 {len(incoming_items)}"
+        )
+    out: list[dict] = []
+    for idx, (old, new) in enumerate(zip(stored_items, incoming_items)):
+        if not isinstance(new, dict):
+            raise SummaryStructureError(f"{path}[{idx}] 항목 형식 오류")
+        if _changed(new, old, "anchor"):
+            raise SummaryStructureError(f"{path}[{idx}] anchor 불변 위반")
+        if "evidence_seg_ids" in new:
+            try:
+                new_ev = [int(x) for x in (new.get("evidence_seg_ids") or [])]
+            except (TypeError, ValueError):
+                raise SummaryStructureError(f"{path}[{idx}] evidence_seg_ids 형식 오류")
+            old_ev = [int(x) for x in (old.get("evidence_seg_ids") or [])]
+            if new_ev != old_ev:
+                raise SummaryStructureError(f"{path}[{idx}] evidence_seg_ids 불변 위반(근거 게이트)")
+        # item_id: 저장본 우선. 부재(레거시)면 lazy 부여. incoming 이 다른 값을 주면 위조로 거부.
+        stored_id = old.get("item_id")
+        if not stored_id:
+            out_id = uuid.uuid4().hex
+        else:
+            out_id = str(stored_id)
+            incoming_id = new.get("item_id")
+            if incoming_id is not None and str(incoming_id) != out_id:
+                raise SummaryStructureError(f"{path}[{idx}] item_id 불변 위반")
+
+        new_text = str(new.get("text", "")).strip()
+        old_text = str(old.get("text", ""))
+        entry = dict(old)  # 저장본 베이스: evidence 스냅샷·anchor·미지 필드 동결(grounding 우회)
+        entry["text"] = new_text
+        entry["item_id"] = out_id
+        if new_text != old_text:
+            # 서버 set: 교정 표시 + 최초 original_text 동결 + edited_at 갱신. 클라 edited 무시.
+            entry["edited"] = True
+            entry["edited_at"] = _now_iso_micro()
+            entry["original_text"] = (
+                old["original_text"] if old.get("original_text") is not None else old_text
+            )
+        elif old.get("edited"):
+            entry["edited"] = True  # 기존 교정 항목은 유지(edited_at/original_text 저장본 보존)
+        else:
+            entry.pop("edited", None)
+            entry.pop("edited_at", None)
+            entry.pop("original_text", None)
+        out.append(entry)
+    return out
+
+
+def validate_summary_edit(stored: dict, incoming: dict) -> dict:
+    """summary 항목 text 교정 구조보존 검증(편집 시에만, 후방호환). P6.
+
+    저장본 summary 에 agenda 블록이 있을 때만 적용한다. 구조(블록 개수·no·title, 각 섹션 항목
+    개수·anchor·evidence_seg_ids·item_id)는 불변이고 **SummaryItem.text 만** 편집 허용한다.
+    text 가 바뀐 항목은 서버가 edited=True/edited_at/original_text(최초 동결)를 set 하고
+    evidence_seg_ids 는 저장본 그대로 동결한다 — 게이트(ground_summary)는 **생성 시점** 산출이며
+    편집 PATCH 는 grounding 을 우회한다(재드롭/anchor·time_range 재산출 없음). 근거 게이트 면제는
+    "근거 실재(저장본 evidence 보존) + text-edit 드롭만 면제"로 제한된다(D5).
+
+    결과는 **저장본(stored) 베이스**로 만들고 검증된 새 text·edited 메타만 덮어쓴다. meta·
+    agenda_index·블록 메타·미지 필드는 저장본에서 보존하며 incoming 의 임의 필드(위조)는 반영하지
+    않는다 → summary 편집으로 변조 가능한 표면을 항목 text 로 제한한다. item_id 부재(레거시 회의)는
+    이 시점에 lazy 부여(무파괴 마이그레이션)된다. 위반 시 SummaryStructureError(호출부 422).
+    """
+    stored_agenda = stored.get("agenda") or []
+    incoming_agenda = incoming.get("agenda")
+    if incoming_agenda is None:
+        return stored  # agenda 미포함 patch → 구조 편집 아님, 저장본 보존
+    if not isinstance(incoming_agenda, list):
+        raise SummaryStructureError("agenda 형식 오류")
+    if len(incoming_agenda) != len(stored_agenda):
+        raise SummaryStructureError(
+            f"agenda 블록 개수 불변 위반: 저장본 {len(stored_agenda)} != 요청 {len(incoming_agenda)}"
+        )
+    out = dict(stored)  # schema_version/meta/agenda_index 등 저장본 보존
+    out_blocks: list[dict] = []
+    for bidx, (old_blk, new_blk) in enumerate(zip(stored_agenda, incoming_agenda)):
+        if not isinstance(new_blk, dict):
+            raise SummaryStructureError(f"agenda[{bidx}] 블록 형식 오류")
+        if "no" in new_blk and str(new_blk.get("no")) != str(old_blk.get("no")):
+            raise SummaryStructureError(f"agenda[{bidx}] no 불변 위반")
+        if _changed(new_blk, old_blk, "title"):
+            raise SummaryStructureError(f"agenda[{bidx}] title 불변 위반")
+        blk = dict(old_blk)  # 블록 메타(no/title/time_range/evidence) 저장본 보존
+        for sec in ("points", "decisions", "issues"):
+            blk[sec] = _validate_summary_items(
+                old_blk.get(sec) or [], new_blk.get(sec) or [], path=f"agenda[{bidx}].{sec}"
+            )
+        out_blocks.append(blk)
+    out["agenda"] = out_blocks
     return out
 
 
