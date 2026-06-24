@@ -37,7 +37,12 @@ from src.postprocess.web_contract import (
     validate_summary_edit,
     validate_transcript_edit,
 )
-from src.web.service import extract_action_items, process_audio_to_contract
+from src.web.service import (
+    _summary_action_hints,
+    extract_action_items,
+    process_audio_to_contract,
+    summarize_meeting,
+)
 from src.web.store import MeetingStore, PreconditionFailedError
 # service import 가 config(load_dotenv)를 끌어와 .env 가 로드된 뒤 auth 를 가져온다(순서 주의).
 from src.web import auth
@@ -327,6 +332,9 @@ def delete_claude_credential(user: dict = Depends(require_user_active)) -> dict:
 # 메모리 잡 테이블. 영속(meeting 저장)은 프론트가 결과를 받아 /api/meetings 로 한다
 # (프론트의 기존 process→save 흐름 보존 → 프론트 변경 최소화).
 _jobs: dict[str, dict] = {}
+# job_id → ownerId. 잡 결과(STT contract·재요약 미리보기)는 회의 파생 데이터이므로 소유격리한다
+# (jobId 유출 시 타 사용자 폴링 차단). 잡 워커는 상태 dict 를 통째 교체하므로 소유자는 별도 맵에 둔다.
+_job_owner: dict[str, str] = {}
 _jobs_lock = threading.Lock()
 
 # 동시 STT 추론 제한(백프레셔). GPU 1장에 요청마다 모델을 load 하므로, 동시에 N개만 돌리고
@@ -402,6 +410,7 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
     # (슬롯이 비어 있으면 거의 즉시 processing, 혼잡하면 대기 → 프론트가 "처리 대기 중…" 표시.)
     with _jobs_lock:
         _jobs[job_id] = {"status": "queued"}
+        _job_owner[job_id] = user["id"]
     threading.Thread(
         target=_run_ai_job,
         args=(job_id, audio_bytes, req.mimeType, credential),
@@ -412,12 +421,185 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
 
 @app.get("/api/ai/jobs/{job_id}")
 def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
-    """잡 상태/결과 폴링. status: processing | done(result) | error(error)."""
+    """잡 상태/결과 폴링. status: processing | done(result) | error(error).
+
+    소유격리: 잡 결과는 회의 파생 데이터이므로 잡 소유자만 조회 가능(타인은 404, 존재 은닉)."""
     with _jobs_lock:
         j = _jobs.get(job_id)
-    if j is None:
+        owner = _job_owner.get(job_id)
+    if j is None or (owner is not None and owner != user["id"]):
         raise HTTPException(status_code=404, detail="job 없음")
     return {"jobId": job_id, **j}
+
+
+# ---------- 재요약 regenerate (트랙 C·P8, prompt 모드: 미리보기→확정→백업/undo) ----------
+def _ts_to_seconds(ts: object) -> float:
+    """transcript timestamp(MM:SS | HH:MM:SS) → 초. 파싱 불가 시 0.0."""
+    parts = str(ts or "").strip().split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return 0.0
+    if len(nums) == 2:
+        return float(nums[0] * 60 + nums[1])
+    if len(nums) == 3:
+        return float(nums[0] * 3600 + nums[1] * 60 + nums[2])
+    return 0.0
+
+
+def _segments_from_transcript(transcript: list) -> list[dict]:
+    """저장본 transcript → 재요약 입력 pseudo-segment([{id,start,end,text}]).
+
+    id = segmentId(토대 PR 로 영속, 없으면 위치 인덱스 폴백). text = 교정된 transcript text(편집 반영).
+    start = timestamp→초, end = 다음 항목 start(마지막은 start). 새 summary/actionItems 의
+    evidence_seg_ids 가 이 id(=segmentId) 공간을 참조하므로 transcript 와 anchor/점프가 자기정합한다.
+    """
+    segs: list[dict] = []
+    for i, e in enumerate(transcript or []):
+        if not isinstance(e, dict):
+            continue
+        text = str(e.get("text", "")).strip()
+        if not text:
+            continue
+        try:
+            sid = int(e["segmentId"]) if e.get("segmentId") is not None else i
+        except (ValueError, TypeError):
+            sid = i  # 비정수 segmentId(클라 위조 저장본) → 위치 인덱스 폴백(500 방지)
+        start = _ts_to_seconds(e.get("timestamp"))
+        segs.append({"id": sid, "start": start, "end": start, "text": text})
+    for j in range(len(segs) - 1):  # end = 다음 start(시간범위 산출용), 역순 방지
+        if segs[j + 1]["start"] > segs[j]["start"]:
+            segs[j]["end"] = segs[j + 1]["start"]
+    return segs
+
+
+def _run_regenerate_job(job_id: str, segments: list[dict], credential: dict | None) -> None:
+    """재구성 segment → 재요약(summary+actionItems) 미리보기를 잡 결과로 저장(DB 미접촉).
+
+    기존 _run_ai_job 과 동일한 동시성/자격증명/폴백 규약. STT 없이 LLM(summarize+extract)만 돈다.
+    DB 는 건드리지 않는다 — 확정(apply)에서만 백업+교체한다(prompt 모드, 무파괴).
+    """
+    with _stt_semaphore:
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "processing"}
+        try:
+            with use_credential(credential):
+                summary = summarize_meeting(segments, backend_name=SUMMARIZE_BACKEND or "passthrough")
+                hints = _summary_action_hints(summary)
+                action_items = extract_action_items(
+                    segments, backend_name=EXTRACT_BACKEND, summary_hints=hints
+                )
+            result = {"summary": summary, "actionItems": action_items}
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "done", "result": result}
+        except AgentCLIAuthError as e:
+            traceback.print_exc()
+            with _jobs_lock:
+                _jobs[job_id] = {
+                    "status": "error",
+                    "error": str(e),
+                    "error_code": "claude_auth_expired",
+                }
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/meetings/{meeting_id}/regenerate")
+def regenerate_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
+    """교정 transcript 로 summary+actionItems 재생성(비동기 잡). 미리보기만 — DB 미접촉.
+
+    소유자만. 잡 결과는 GET /api/ai/jobs/{jobId} 로 폴링(result={summary, actionItems}).
+    확정은 별도 POST .../regenerate/apply(백업+교체). 미리보기는 프론트 메모리 한정(새로고침 시 폐기).
+    """
+    m = _owned_or_404(meeting_id, user)
+    segments = _segments_from_transcript(m.get("transcript") or [])
+    if not segments:
+        raise HTTPException(status_code=400, detail="재요약할 transcript 가 없습니다.")
+    credential = auth.get_credential(user["username"])
+    job_id = uuid.uuid4().hex
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "queued"}
+        _job_owner[job_id] = user["id"]
+    threading.Thread(
+        target=_run_regenerate_job, args=(job_id, segments, credential), daemon=True
+    ).start()
+    return {"jobId": job_id, "status": "queued"}
+
+
+@app.post("/api/meetings/{meeting_id}/regenerate/apply")
+def regenerate_apply(
+    meeting_id: str,
+    payload: dict,
+    response: Response,
+    user: dict = Depends(require_user_active),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> dict:
+    """재요약 미리보기 확정 — summary+actionItems 전면 교체(적용 직전 현행을 백업). If-Match 412.
+
+    구조 전면 교체이므로 summary 편집(text-only) 검증을 거치지 않는 별도 경로다. actionItems 는
+    item_id 무결성만 정규화한다. 백업은 meeting_backup 에 기록되어 undo 로 복원 가능하다.
+    """
+    _owned_or_404(meeting_id, user)
+    summary = payload.get("summary")
+    # summary 내부 스키마(agenda/anchor/evidence)는 검증하지 않는다 — 정상 흐름은 잡 미리보기
+    # 결과(ground_summary 보장)를 그대로 확정하는 것이며, 구조 무결성은 그 신뢰를 전제한다.
+    # 자기 소유 회의에만 작용하므로 임의 dict 주입의 영향 범위는 본인뿐(타인 격리는 _owned_or_404).
+    if not isinstance(summary, dict):
+        raise HTTPException(status_code=400, detail="summary(객체)가 필요합니다.")
+    action_items = ensure_action_item_ids(payload.get("actionItems"))
+    parsed = _parse_if_match(if_match)
+    expected = None if parsed is _IF_MATCH_ANY else parsed
+    try:
+        updated = store.apply_regenerate(meeting_id, summary, action_items, expected)
+    except PreconditionFailedError as e:
+        if e.current_updated_at:
+            response.headers["ETag"] = f'"{e.current_updated_at}"'
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "error": "precondition_failed",
+                "message": "저장본이 변경되었습니다. 최신 회의를 재조회한 뒤 다시 시도하세요.",
+                "currentUpdatedAt": e.current_updated_at,
+            },
+        )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="meeting 없음")
+    response.headers["ETag"] = f'"{updated["updatedAt"]}"'
+    return updated
+
+
+@app.post("/api/meetings/{meeting_id}/regenerate/undo")
+def regenerate_undo(
+    meeting_id: str,
+    response: Response,
+    user: dict = Depends(require_user_active),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> dict:
+    """직전 재요약 적용을 되돌린다(가장 최근 백업 복원, 그 백업은 소비). If-Match 412."""
+    _owned_or_404(meeting_id, user)
+    parsed = _parse_if_match(if_match)
+    expected = None if parsed is _IF_MATCH_ANY else parsed
+    try:
+        updated, restored = store.restore_latest_backup(meeting_id, expected)
+    except PreconditionFailedError as e:
+        if e.current_updated_at:
+            response.headers["ETag"] = f'"{e.current_updated_at}"'
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "error": "precondition_failed",
+                "message": "저장본이 변경되었습니다. 최신 회의를 재조회한 뒤 다시 시도하세요.",
+                "currentUpdatedAt": e.current_updated_at,
+            },
+        )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="meeting 없음")
+    if not restored:
+        raise HTTPException(status_code=409, detail="복원할 재요약 백업이 없습니다.")
+    response.headers["ETag"] = f'"{updated["updatedAt"]}"'
+    return updated
 
 
 @app.post("/api/ai/extract-actions")

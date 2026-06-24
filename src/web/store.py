@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS meetings (
     data       TEXT NOT NULL   -- 전체 Meeting JSON(프론트 types.ts 보존)
 );
 CREATE INDEX IF NOT EXISTS idx_meetings_owner ON meetings(owner_id, created_at DESC);
+
+-- 재요약 undo 백업: 적용 직전 summary/actionItems 스냅샷(별도 저장, data 인라인 비대 회피).
+CREATE TABLE IF NOT EXISTS meeting_backup (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    meeting_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    reason     TEXT,
+    data       TEXT NOT NULL   -- {"summary":..., "actionItems":...} JSON 스냅샷
+);
+CREATE INDEX IF NOT EXISTS idx_backup_meeting ON meeting_backup(meeting_id, id DESC);
 """
 
 
@@ -197,28 +207,103 @@ class MeetingStore:
             cur.update(patch)
             cur["ownerId"] = owner
             cur["updatedAt"] = _next_etag(prev_updated)  # 갱신마다 새 ETag(단조 증가)
-            self._conn.execute(
-                "INSERT OR REPLACE INTO meetings "
-                "(id, owner_id, status, title, created_at, updated_at, data) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (
-                    cur["id"],
-                    owner,
-                    cur.get("status"),
-                    cur.get("title"),
-                    cur.get("createdAt"),
-                    cur["updatedAt"],
-                    json.dumps(cur, ensure_ascii=False),
-                ),
-            )
+            self._persist_locked(cur)  # 단일 write 경로(컬럼 동기화 일원화)
             self._conn.commit()
         return cur
 
+    def _persist_locked(self, cur: dict) -> None:
+        """meetings 행 기록(이미 _lock 보유 중에만 호출). data + 인덱스 컬럼 동기화."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meetings "
+            "(id, owner_id, status, title, created_at, updated_at, data) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                cur["id"],
+                cur.get("ownerId", "local"),
+                cur.get("status"),
+                cur.get("title"),
+                cur.get("createdAt"),
+                cur.get("updatedAt"),
+                json.dumps(cur, ensure_ascii=False),
+            ),
+        )
+
+    def apply_regenerate(
+        self,
+        meeting_id: str,
+        summary: dict,
+        action_items: list,
+        expected_updated_at: str | None,
+    ) -> dict | None:
+        """재요약 결과(summary+actionItems) 전면 교체 — 적용 직전 현행을 meeting_backup 에 스냅샷.
+
+        구조 전면 교체이므로 summary 편집(text-only) 검증을 거치지 않는 별도 경로다. compare(If-Match)
+        +백업+교체를 단일 _lock 구간에서 원자 수행한다(undo 안전·lost-update 방지). ownerId/transcript/
+        title 등 다른 필드는 보존하고 summary·actionItems·updatedAt 만 갱신한다. 없으면 None.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM meetings WHERE id=?", (meeting_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            cur = json.loads(row["data"])
+            if expected_updated_at is not None and cur.get("updatedAt") != expected_updated_at:
+                raise PreconditionFailedError(cur.get("updatedAt"))
+            # 적용 직전 현행 스냅샷 백업(undo 용). 별도 테이블에 기록.
+            snapshot = {
+                "summary": cur.get("summary"),
+                "actionItems": cur.get("actionItems", []),
+            }
+            self._conn.execute(
+                "INSERT INTO meeting_backup (meeting_id, created_at, reason, data) VALUES (?,?,?,?)",
+                (meeting_id, _now_iso_micro(), "regenerate", json.dumps(snapshot, ensure_ascii=False)),
+            )
+            cur["summary"] = summary
+            cur["actionItems"] = action_items
+            cur["updatedAt"] = _next_etag(cur.get("updatedAt"))
+            self._persist_locked(cur)
+            self._conn.commit()
+        return cur
+
+    def restore_latest_backup(
+        self, meeting_id: str, expected_updated_at: str | None
+    ) -> tuple[dict | None, bool]:
+        """가장 최근 meeting_backup 을 복원(재요약 undo). 복원 후 그 백업은 소비(삭제)한다.
+
+        반환: (갱신된 meeting | None, restored). meeting 없으면 (None, False), 백업 없으면
+        (현행 meeting, False). compare(If-Match)+복원+백업삭제를 _lock 구간에서 원자 수행한다.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM meetings WHERE id=?", (meeting_id,)
+            ).fetchone()
+            if row is None:
+                return None, False
+            cur = json.loads(row["data"])
+            if expected_updated_at is not None and cur.get("updatedAt") != expected_updated_at:
+                raise PreconditionFailedError(cur.get("updatedAt"))
+            brow = self._conn.execute(
+                "SELECT id, data FROM meeting_backup WHERE meeting_id=? ORDER BY id DESC LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
+            if brow is None:
+                return cur, False
+            snap = json.loads(brow["data"])
+            cur["summary"] = snap.get("summary")
+            cur["actionItems"] = snap.get("actionItems", [])
+            cur["updatedAt"] = _next_etag(cur.get("updatedAt"))
+            self._persist_locked(cur)
+            self._conn.execute("DELETE FROM meeting_backup WHERE id=?", (brow["id"],))
+            self._conn.commit()
+        return cur, True
+
     def delete(self, meeting_id: str) -> bool:
-        """삭제. 존재했으면 True."""
+        """삭제. 존재했으면 True. 재요약 백업(meeting_backup)도 동반 삭제(고아 행 방지)."""
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM meetings WHERE id=?", (meeting_id,)
             )
+            self._conn.execute("DELETE FROM meeting_backup WHERE meeting_id=?", (meeting_id,))
             self._conn.commit()
         return cur.rowcount > 0
