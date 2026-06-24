@@ -62,6 +62,26 @@ def test_segments_fallback_to_index_when_no_segment_id():
     assert [s["id"] for s in segs] == [0, 1], "segmentId 부재 시 위치 인덱스 폴백"
 
 
+def test_segments_non_int_segment_id_falls_back():
+    from src.web.app import _segments_from_transcript
+
+    tr = [{"text": "a", "timestamp": "00:01", "segmentId": "abc"}]  # 비정수(위조 저장본)
+    segs = _segments_from_transcript(tr)
+    assert segs[0]["id"] == 0, "비정수 segmentId → 위치 인덱스 폴백(500 방지)"
+
+
+def test_delete_removes_backups():
+    with tempfile.TemporaryDirectory() as td:
+        store = _store(Path(td))
+        cur = _seed(store)
+        store.apply_regenerate("a" * 32, {"agenda": []}, [], cur["updatedAt"])  # 백업 1건
+        store.delete("a" * 32)
+        # 회의 삭제 후 백업 고아 행 없음 → 재시드 후 undo 시 복원할 백업 없음
+        cur2 = _seed(store)
+        _, ok = store.restore_latest_backup("a" * 32, cur2["updatedAt"])
+        assert ok is False, "delete 가 meeting_backup 동반 삭제"
+
+
 # ---------- 단위: store apply/restore ----------
 def _store(tmp: Path):
     from src.web.store import MeetingStore
@@ -245,6 +265,19 @@ def test_http_apply_and_undo_roundtrip():
         # 두 번째 undo → 백업 소비됨 → 409
         ru2 = client.post(f"/api/meetings/{m['id']}/regenerate/undo", headers=h)
         assert ru2.status_code == 409, ru2.text
+
+
+def test_http_job_owner_isolation():
+    """잡 결과(회의 파생)는 소유자만 폴링 가능 — 타인은 404(존재 은닉)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1,bob:pw2") as (auth, appmod, client):
+        ha = _h(auth, appmod, "admin")
+        hb = _h(auth, appmod, "bob")
+        m = _make(client, ha)
+        job_id = client.post(f"/api/meetings/{m['id']}/regenerate", headers=ha).json()["jobId"]
+        # 타 사용자(bob)가 같은 jobId 폴링 → 404
+        assert client.get(f"/api/ai/jobs/{job_id}", headers=hb).status_code == 404
+        # 소유자(admin)는 정상 조회
+        assert client.get(f"/api/ai/jobs/{job_id}", headers=ha).status_code == 200
 
 
 def test_http_apply_stale_if_match_412():

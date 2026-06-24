@@ -207,20 +207,7 @@ class MeetingStore:
             cur.update(patch)
             cur["ownerId"] = owner
             cur["updatedAt"] = _next_etag(prev_updated)  # 갱신마다 새 ETag(단조 증가)
-            self._conn.execute(
-                "INSERT OR REPLACE INTO meetings "
-                "(id, owner_id, status, title, created_at, updated_at, data) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (
-                    cur["id"],
-                    owner,
-                    cur.get("status"),
-                    cur.get("title"),
-                    cur.get("createdAt"),
-                    cur["updatedAt"],
-                    json.dumps(cur, ensure_ascii=False),
-                ),
-            )
+            self._persist_locked(cur)  # 단일 write 경로(컬럼 동기화 일원화)
             self._conn.commit()
         return cur
 
@@ -312,10 +299,11 @@ class MeetingStore:
         return cur, True
 
     def delete(self, meeting_id: str) -> bool:
-        """삭제. 존재했으면 True."""
+        """삭제. 존재했으면 True. 재요약 백업(meeting_backup)도 동반 삭제(고아 행 방지)."""
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM meetings WHERE id=?", (meeting_id,)
             )
+            self._conn.execute("DELETE FROM meeting_backup WHERE meeting_id=?", (meeting_id,))
             self._conn.commit()
         return cur.rowcount > 0

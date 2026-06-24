@@ -332,6 +332,9 @@ def delete_claude_credential(user: dict = Depends(require_user_active)) -> dict:
 # 메모리 잡 테이블. 영속(meeting 저장)은 프론트가 결과를 받아 /api/meetings 로 한다
 # (프론트의 기존 process→save 흐름 보존 → 프론트 변경 최소화).
 _jobs: dict[str, dict] = {}
+# job_id → ownerId. 잡 결과(STT contract·재요약 미리보기)는 회의 파생 데이터이므로 소유격리한다
+# (jobId 유출 시 타 사용자 폴링 차단). 잡 워커는 상태 dict 를 통째 교체하므로 소유자는 별도 맵에 둔다.
+_job_owner: dict[str, str] = {}
 _jobs_lock = threading.Lock()
 
 # 동시 STT 추론 제한(백프레셔). GPU 1장에 요청마다 모델을 load 하므로, 동시에 N개만 돌리고
@@ -407,6 +410,7 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
     # (슬롯이 비어 있으면 거의 즉시 processing, 혼잡하면 대기 → 프론트가 "처리 대기 중…" 표시.)
     with _jobs_lock:
         _jobs[job_id] = {"status": "queued"}
+        _job_owner[job_id] = user["id"]
     threading.Thread(
         target=_run_ai_job,
         args=(job_id, audio_bytes, req.mimeType, credential),
@@ -417,10 +421,13 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
 
 @app.get("/api/ai/jobs/{job_id}")
 def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
-    """잡 상태/결과 폴링. status: processing | done(result) | error(error)."""
+    """잡 상태/결과 폴링. status: processing | done(result) | error(error).
+
+    소유격리: 잡 결과는 회의 파생 데이터이므로 잡 소유자만 조회 가능(타인은 404, 존재 은닉)."""
     with _jobs_lock:
         j = _jobs.get(job_id)
-    if j is None:
+        owner = _job_owner.get(job_id)
+    if j is None or (owner is not None and owner != user["id"]):
         raise HTTPException(status_code=404, detail="job 없음")
     return {"jobId": job_id, **j}
 
@@ -454,8 +461,10 @@ def _segments_from_transcript(transcript: list) -> list[dict]:
         text = str(e.get("text", "")).strip()
         if not text:
             continue
-        sid = e.get("segmentId")
-        sid = int(sid) if sid is not None else i
+        try:
+            sid = int(e["segmentId"]) if e.get("segmentId") is not None else i
+        except (ValueError, TypeError):
+            sid = i  # 비정수 segmentId(클라 위조 저장본) → 위치 인덱스 폴백(500 방지)
         start = _ts_to_seconds(e.get("timestamp"))
         segs.append({"id": sid, "start": start, "end": start, "text": text})
     for j in range(len(segs) - 1):  # end = 다음 start(시간범위 산출용), 역순 방지
@@ -512,6 +521,7 @@ def regenerate_meeting(meeting_id: str, user: dict = Depends(require_user_active
     job_id = uuid.uuid4().hex
     with _jobs_lock:
         _jobs[job_id] = {"status": "queued"}
+        _job_owner[job_id] = user["id"]
     threading.Thread(
         target=_run_regenerate_job, args=(job_id, segments, credential), daemon=True
     ).start()
@@ -533,6 +543,9 @@ def regenerate_apply(
     """
     _owned_or_404(meeting_id, user)
     summary = payload.get("summary")
+    # summary 내부 스키마(agenda/anchor/evidence)는 검증하지 않는다 — 정상 흐름은 잡 미리보기
+    # 결과(ground_summary 보장)를 그대로 확정하는 것이며, 구조 무결성은 그 신뢰를 전제한다.
+    # 자기 소유 회의에만 작용하므로 임의 dict 주입의 영향 범위는 본인뿐(타인 격리는 _owned_or_404).
     if not isinstance(summary, dict):
         raise HTTPException(status_code=400, detail="summary(객체)가 필요합니다.")
     action_items = ensure_action_item_ids(payload.get("actionItems"))
