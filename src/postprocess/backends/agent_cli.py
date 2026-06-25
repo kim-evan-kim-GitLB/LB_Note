@@ -248,6 +248,8 @@ class AgentCLIBackend(LLMBackend):
         sub_env.setdefault("DISABLE_OMC", "1")
         sub_env.setdefault("OMC_SKIP_HOOKS", "1")
         if cred_type == "api_key":
+            # [더미/deprecated] API 키 방식은 프론트 UI 에서 제거됐다(신규 저장 경로 없음).
+            # 기존에 저장된 api_key 자격증명의 후방호환을 위해 주입 로직만 남겨둔다.
             # API 키 사용자: ANTHROPIC_API_KEY 단독 격리(+argv 의 --bare). OAuth 무시 →
             # HOME 교정 불필요. 다른 사용자의 OAuth 토큰이 섞이지 않게 전역 OAuth env 도 제거.
             sub_env["ANTHROPIC_API_KEY"] = cred["secret"]
