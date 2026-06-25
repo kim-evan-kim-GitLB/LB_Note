@@ -21,7 +21,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -989,19 +989,63 @@ _AUDIO_MIME = {
 }
 
 
+# 오디오 스트리밍용 단기 토큰 TTL(초). 쿼리파라미터로 URL 에 실리므로 짧게(기본 1시간).
+AUDIO_TOKEN_TTL = int(os.environ.get("WEB_AUDIO_TOKEN_TTL", "3600"))
+
+
+def _audio_user(authorization: str | None, access_token: str | None) -> dict:
+    """오디오 스트리밍 인증 — Bearer 헤더(세션 토큰) 우선, 없으면 access_token 쿼리(audio 스코프 토큰).
+
+    네이티브 <audio src> 는 Authorization 헤더를 못 싣는다 → audio 스코프 단기 토큰을 쿼리로 받아
+    검증한다. Bearer 경로는 일반 세션 토큰(scope 없음), 쿼리 경로는 scope='audio' 토큰만 통과한다
+    (스코프 토큰의 다른 엔드포인트 재사용 차단). must_change_password 사용자는 require_user_active
+    와 동일하게 403. 무효/만료/스코프불일치 토큰은 401.
+    """
+    scheme, _, header_token = (authorization or "").partition(" ")
+    if scheme.lower() == "bearer" and header_token.strip():
+        user = auth.user_from_token(header_token.strip())  # 세션 토큰(scope 없음)
+    elif access_token:
+        user = auth.user_from_token(access_token.strip(), scope="audio")  # 오디오 전용 토큰
+    else:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    if user.get("mustChangePassword"):
+        raise HTTPException(
+            status_code=403,
+            detail={"error_code": "must_change_password", "message": "초기 비밀번호를 먼저 변경해야 합니다."},
+        )
+    return user
+
+
+@app.get("/api/meetings/{meeting_id}/audio-token")
+def get_audio_token(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
+    """오디오 스트리밍용 단기 토큰 발급(네이티브 <audio> Range). 소유자 검증 후 short-lived 토큰.
+
+    프론트는 이 토큰을 GET .../audio?access_token=... 쿼리로 실어 브라우저 네이티브 Range 스트리밍
+    (206)을 쓴다. 토큰 노출 창을 줄이려 TTL 을 짧게(AUDIO_TOKEN_TTL) 둔다. 세션 토큰은 URL 에 싣지 않는다.
+    """
+    _require_hex32(meeting_id, what="meetingId")
+    _owned_or_404(meeting_id, user)  # 소유자만 발급(존재·격리)
+    # scope='audio' 제한 토큰 — 탈취돼도 오디오 스트리밍 외 엔드포인트엔 재사용 불가.
+    token = auth.make_token(user["id"], ttl=AUDIO_TOKEN_TTL, scope="audio")
+    return {"token": token, "expiresIn": AUDIO_TOKEN_TTL}
+
+
 @app.get("/api/meetings/{meeting_id}/audio")
 def get_meeting_audio(
     meeting_id: str,
-    user: dict = Depends(require_user_active),
+    access_token: str | None = Query(default=None),
+    authorization: str | None = Header(default=None),
     range_header: str | None = Header(default=None, alias="Range"),
 ) -> Response:
-    """회의 원본 오디오 스트리밍. 인증 + 소유자 검증 + meetingId 화이트리스트 + HTTP Range(206).
+    """회의 원본 오디오 스트리밍. 인증(Bearer 또는 access_token 쿼리) + 소유자 검증 + Range(206).
 
+    네이티브 <audio> 는 Bearer 를 못 싣어 access_token 쿼리(단기 토큰)로 인증한다(Range 시킹 가능).
     audioRef 없거나 파일 부재면 404. 소유자 아니면 404(_owned_or_404, 존재 자체 숨김).
     meetingId 가 ^[0-9a-f]{32}$ 아니면 400(경로조립 traversal 차단). Range 미지정 시 전체(200).
     """
+    user = _audio_user(authorization, access_token)  # Bearer 또는 쿼리 토큰
     _require_hex32(meeting_id, what="meetingId")  # 경로조립 전 화이트리스트(traversal 차단)
-    m = _owned_or_404(meeting_id, user)  # 인증 + 소유자 격리
+    m = _owned_or_404(meeting_id, user)  # 소유자 격리
     path = audio_store.meeting_audio_path(meeting_id, m.get("audioRef"))
     if path is None:
         raise HTTPException(status_code=404, detail="오디오 없음")

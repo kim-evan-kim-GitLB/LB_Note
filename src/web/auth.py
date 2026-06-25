@@ -413,14 +413,46 @@ def public_user(u: dict) -> dict:
     }
 
 
-def make_token(username: str) -> str:
+def make_token(username: str, ttl: int | None = None, *, scope: str | None = None) -> str:
+    """토큰 발급. ttl(초) 지정 시 그 만료를, 미지정 시 기본 _ttl()(7일)을 쓴다.
+
+    scope 지정 시 payload 에 박아 **제한 토큰**으로 만든다(예: scope='audio' = 오디오 스트리밍 전용).
+    스코프 토큰은 user_from_token(scope=...) 으로만 통과하고, 일반 세션 검증(scope 미지정)에서는
+    거부된다 → URL 쿼리로 노출되는 오디오 토큰이 탈취돼도 다른 Bearer 엔드포인트에 재사용 불가.
+    세션 토큰은 scope 없이 발급한다(후방호환).
+    """
     now = dt.datetime.now(dt.timezone.utc)
-    payload = {"sub": username, "iat": now, "exp": now + dt.timedelta(seconds=_ttl())}
+    exp = now + dt.timedelta(seconds=ttl if ttl is not None else _ttl())
+    payload = {"sub": username, "iat": now, "exp": exp}
+    if scope is not None:
+        payload["scope"] = scope
     return jwt.encode(payload, _secret(), algorithm="HS256")
 
 
 def _decode(token: str) -> dict:
     return jwt.decode(token, _secret(), algorithms=["HS256"])
+
+
+def user_from_token(token: str, *, scope: str | None = None) -> dict:
+    """토큰 문자열 → 공개 user dict. 무효/만료/미존재/스코프불일치면 401(require_user 동일 규약).
+
+    require_user(Bearer 헤더, scope=None) 와 오디오 스트리밍(쿼리, scope='audio') 가 공유한다.
+    스코프 규약(토큰 탈취 피해 한정):
+      - scope=None(세션 검증): 토큰에 scope 클레임이 박혀 있으면 거부(제한 토큰의 세션 재사용 차단).
+      - scope='audio': 토큰 scope 가 정확히 'audio' 여야 통과.
+    """
+    try:
+        payload = _decode(token)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="토큰이 만료되었습니다.")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="토큰이 유효하지 않습니다.")
+    if payload.get("scope") != scope:
+        raise HTTPException(status_code=401, detail="토큰 범위가 올바르지 않습니다.")
+    u = store().get(payload.get("sub", ""))
+    if not u:
+        raise HTTPException(status_code=401, detail="사용자를 찾을 수 없습니다.")
+    return public_user(u)
 
 
 # ---- 모듈 싱글턴: app.py 가 init() 호출 ----
@@ -520,13 +552,4 @@ def require_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -
     """유효 Bearer 토큰 → 공개 user dict. 없거나 무효/만료/미존재 사용자면 401."""
     if cred is None or not cred.credentials:
         raise HTTPException(status_code=401, detail="인증이 필요합니다.")
-    try:
-        payload = _decode(cred.credentials)
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="토큰이 만료되었습니다.")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="토큰이 유효하지 않습니다.")
-    u = store().get(payload.get("sub", ""))
-    if not u:
-        raise HTTPException(status_code=401, detail="사용자를 찾을 수 없습니다.")
-    return public_user(u)
+    return user_from_token(cred.credentials)
