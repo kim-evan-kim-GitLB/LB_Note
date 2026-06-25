@@ -113,8 +113,11 @@ CREATE TABLE IF NOT EXISTS claude_credentials (
 );
 """
 
-# 사용자별 claude 자격증명 종류. api_key=ANTHROPIC_API_KEY(만료 없음, --bare 격리),
-# oauth_token=CLAUDE_CODE_OAUTH_TOKEN(구독 토큰, HOME 교정 불필요).
+# 사용자별 claude 자격증명 종류. oauth_token=CLAUDE_CODE_OAUTH_TOKEN(Claude Code CLI 토큰,
+# HOME 교정 불필요)이 운영 방식이다.
+# api_key=ANTHROPIC_API_KEY(만료 없음, --bare 격리)는 **더미 유지(deprecated)** — 프론트 UI 에서
+# 제거돼 신규 저장 경로가 없다. 후방호환(기존에 저장된 api_key 자격증명 동작·주입)을 위해 코드만
+# 남겨두며, 새 기능은 oauth_token 기준으로만 추가한다.
 _CRED_TYPES = ("api_key", "oauth_token")
 
 
