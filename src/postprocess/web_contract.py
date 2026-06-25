@@ -105,6 +105,70 @@ def ensure_action_item_ids(items: object) -> list[dict]:
     return out
 
 
+# 재요약 preserve_edited 가 현행 편집 항목을 모아 넣는 전용 agenda 블록 제목.
+PRESERVED_BLOCK_TITLE = "사용자 편집 보존"
+
+
+def merge_preserve_edited(
+    current_summary: dict | None,
+    current_action_items: list | None,
+    regen_summary: dict | None,
+    regen_action_items: list | None,
+) -> tuple[dict, list]:
+    """preserve_edited 병합 — 재생성본 + 현행 edited 항목 보존 → (summary, actionItems).
+
+    재요약은 항상 새 item_id(uuid)를 부여하므로 현행 편집 항목과 등치 매칭이 불가하다(유사도
+    휴리스틱 없이는). 이를 우회해 **손실 0** 으로 사용자 교정을 보존하는 확정 의미:
+      - actionItems: 재생성 결과 뒤에 현행 edited=true 항목을 그대로 덧붙인다(item_id 유지·충돌 없음).
+      - summary: 재생성 결과의 agenda 끝에 전용 '사용자 편집 보존' 블록을 추가하고, 현행 edited=true
+        SummaryItem 들을 원래 분류(points/decisions/issues)대로 담는다. 중첩 구조가 재요약마다
+        재편성돼 끼워넣을 슬롯이 없으므로 별도 블록으로 보존한다. 편집 항목이 없으면 블록을 만들지
+        않는다(재생성본 그대로). 의미상 중복(재생성본에 같은 내용 재등장)은 미리보기에서 사용자가
+        정리한다(자동 dedup 안 함 — 손실 위험 회피 우선).
+
+    반복 적용 안전(누적 중복 없음): merged 의 base 는 **재생성본(regen)** 이라 직전 적용이 남긴
+    보존 블록은 교체로 사라지고, 그 안의 edited 항목만 이번에 다시 1회 수집돼 새 보존 블록에 담긴다
+    → 같은 편집 항목이 매 적용 후에도 정확히 1개씩만 유지된다(편집은 계속 살아남되 중복되지 않음).
+    입력 항목은 dict 로 얕은 복사해 담아 호출부 payload 변이를 피한다.
+    """
+    merged_summary = dict(regen_summary or {})
+    merged_actions = list(regen_action_items or [])
+    merged_actions.extend(
+        dict(it) for it in (current_action_items or [])
+        if isinstance(it, dict) and it.get("edited")
+    )
+
+    preserved: dict[str, list] = {"points": [], "decisions": [], "issues": []}
+    for block in (current_summary or {}).get("agenda") or []:
+        if not isinstance(block, dict):
+            continue
+        for key in ("points", "decisions", "issues"):
+            for item in block.get(key) or []:
+                if isinstance(item, dict) and item.get("edited"):
+                    preserved[key].append(dict(item))
+
+    if any(preserved.values()):
+        agenda = list(merged_summary.get("agenda") or [])
+        nos = [b.get("no") for b in agenda if isinstance(b, dict) and isinstance(b.get("no"), int)]
+        next_no = (max(nos) + 1) if nos else 1
+        agenda.append({
+            "no": next_no,
+            "title": PRESERVED_BLOCK_TITLE,
+            "time_range": None,
+            "evidence_seg_ids": [],
+            "points": preserved["points"],
+            "decisions": preserved["decisions"],
+            "issues": preserved["issues"],
+        })
+        merged_summary["agenda"] = agenda
+        # agenda_index 동기화(no↔index 조인 유지) — 인덱스가 있을 때만 끝에 한 줄 추가.
+        idx = merged_summary.get("agenda_index")
+        if isinstance(idx, list):
+            merged_summary["agenda_index"] = [*idx, {"no": next_no, "title": PRESERVED_BLOCK_TITLE}]
+
+    return merged_summary, merged_actions
+
+
 class TranscriptStructureError(ValueError):
     """transcript 구조보존 검증 위반. 호출부(app.py)가 422 로 변환한다."""
 

@@ -37,6 +37,7 @@ from src.postprocess.web_contract import (
     SummaryStructureError,
     TranscriptStructureError,
     ensure_action_item_ids,
+    merge_preserve_edited,
     validate_summary_edit,
     validate_transcript_edit,
 )
@@ -602,12 +603,16 @@ def regenerate_apply(
     user: dict = Depends(require_user_active),
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> dict:
-    """재요약 미리보기 확정 — summary+actionItems 전면 교체(적용 직전 현행을 백업). If-Match 412.
+    """재요약 미리보기 확정 — summary+actionItems 교체(적용 직전 현행을 백업). If-Match 412.
 
-    구조 전면 교체이므로 summary 편집(text-only) 검증을 거치지 않는 별도 경로다. actionItems 는
-    item_id 무결성만 정규화한다. 백업은 meeting_backup 에 기록되어 undo 로 복원 가능하다.
+    mode(payload.mode, 기본 'prompt'):
+      - 'prompt'/'overwrite': 재생성본으로 전면 교체(구조 무결성은 잡 미리보기 신뢰 전제).
+      - 'preserve_edited': 재생성본 + 현행 edited=true 항목 보존 병합(merge_preserve_edited).
+        summary 는 '사용자 편집 보존' 블록 추가, actionItems 는 현행 편집 항목 덧붙임(손실 0).
+    구조 전면 교체이므로 summary 편집(text-only) 검증을 거치지 않는다. actionItems 는 item_id
+    무결성만 정규화한다. 백업은 meeting_backup 에 기록되어 undo 로 복원 가능하다.
     """
-    _owned_or_404(meeting_id, user)
+    m = _owned_or_404(meeting_id, user)
     summary = payload.get("summary")
     # summary 내부 스키마(agenda/anchor/evidence)는 검증하지 않는다 — 정상 흐름은 잡 미리보기
     # 결과(ground_summary 보장)를 그대로 확정하는 것이며, 구조 무결성은 그 신뢰를 전제한다.
@@ -615,6 +620,18 @@ def regenerate_apply(
     if not isinstance(summary, dict):
         raise HTTPException(status_code=400, detail="summary(객체)가 필요합니다.")
     action_items = ensure_action_item_ids(payload.get("actionItems"))
+    mode = str(payload.get("mode") or "prompt")
+    if mode not in ("prompt", "preserve_edited", "overwrite"):
+        raise HTTPException(status_code=400, detail="mode 값이 올바르지 않습니다.")
+    if mode == "preserve_edited":
+        # 현행(m)의 edited 항목을 재생성본에 보존 병합. m 은 락 밖 읽기본이라 병합 입력이 최신이라는
+        # 보장은 없다 — 다만 stale 입력으로 병합했더라도 store.apply_regenerate 의 If-Match 비교가
+        # 락 안에서 불일치 시 412 로 거부하므로 손상 저장은 없다(If-Match 제공 시). If-Match 미제공이면
+        # last-write-wins 라 그 사이 추가 편집이 덮일 수 있다(프론트는 항상 If-Match 전송).
+        summary, action_items = merge_preserve_edited(
+            m.get("summary"), m.get("actionItems"), summary, action_items
+        )
+        action_items = ensure_action_item_ids(action_items)  # 병합 후 item_id 무결성 재보장
     parsed = _parse_if_match(if_match)
     expected = None if parsed is _IF_MATCH_ANY else parsed
     try:
@@ -633,7 +650,7 @@ def regenerate_apply(
         )
     if updated is None:
         raise HTTPException(status_code=404, detail="meeting 없음")
-    observability.audit("regenerate.apply", meeting_id=meeting_id, owner=user["username"])
+    observability.audit("regenerate.apply", meeting_id=meeting_id, owner=user["username"], mode=mode)
     response.headers["ETag"] = f'"{updated["updatedAt"]}"'
     return updated
 
