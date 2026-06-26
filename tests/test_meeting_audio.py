@@ -471,6 +471,103 @@ def test_create_with_bad_token_rejected_400():
         assert r.status_code == 400, r.text
 
 
+# ---------- 오디오 토큰 + 쿼리 인증 스트리밍(Range 시킹) ----------
+def test_audio_token_then_stream_via_query_param():
+    """audio-token 발급(Bearer) → access_token 쿼리로 Bearer 없이 스트리밍(200·206)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        data = b"0123456789ABCDEF" * 4  # 64 bytes
+        st = _upload_staging(client, h, data)
+        m = _create_with_token(client, h, st["stagingToken"])
+        # 토큰 발급(소유자, Bearer)
+        tk = client.get(f"/api/meetings/{m['id']}/audio-token", headers=h)
+        assert tk.status_code == 200, tk.text
+        token = tk.json()["token"]
+        assert tk.json()["expiresIn"] > 0
+        # Bearer 헤더 없이 쿼리 토큰만으로 전체 스트리밍(네이티브 <audio> 흉내)
+        r = client.get(f"/api/meetings/{m['id']}/audio", params={"access_token": token})
+        assert r.status_code == 200, r.text
+        assert r.content == data
+        # 쿼리 토큰 + Range → 206
+        r2 = client.get(
+            f"/api/meetings/{m['id']}/audio",
+            params={"access_token": token},
+            headers={"Range": "bytes=10-19"},
+        )
+        assert r2.status_code == 206, r2.text
+        assert r2.content == data[10:20]
+
+
+def test_audio_stream_missing_or_invalid_token_401():
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        st = _upload_staging(client, h, b"AUDIO-DATA-XYZ")
+        m = _create_with_token(client, h, st["stagingToken"])
+        # 인증 전무(헤더·쿼리 없음) → 401
+        assert client.get(f"/api/meetings/{m['id']}/audio").status_code == 401
+        # 잘못된 쿼리 토큰 → 401
+        bad = client.get(f"/api/meetings/{m['id']}/audio", params={"access_token": "not-a-jwt"})
+        assert bad.status_code == 401, bad.text
+
+
+def test_audio_token_other_user_404():
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1,bob:pw2") as (auth, appmod, client):
+        ha = _auth_headers(auth, appmod, "admin")
+        hb = _auth_headers(auth, appmod, "bob")
+        st = _upload_staging(client, ha, b"OWNER-ONLY-AUDIO")
+        m = _create_with_token(client, ha, st["stagingToken"])
+        # 타 사용자는 토큰 발급 불가(소유자 격리) → 404
+        assert client.get(f"/api/meetings/{m['id']}/audio-token", headers=hb).status_code == 404
+        # 소유자 토큰을 타인이 자기 회의에 못 쓰는 건 _owned_or_404 가 별도 보장(여긴 발급 차단까지 검증)
+
+
+def test_make_token_ttl_and_user_from_token():
+    """make_token(ttl) 만료 단축 + user_from_token 해석."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        import jwt as _jwt
+
+        short = auth.make_token("admin", ttl=5)
+        payload = _jwt.decode(short, auth._secret(), algorithms=["HS256"])
+        assert payload["exp"] - payload["iat"] == 5
+        user = auth.user_from_token(short)
+        assert user["username"] == "admin"
+
+
+def test_audio_token_scope_isolation():
+    """audio 스코프 토큰은 다른 Bearer 엔드포인트에 재사용 불가, 세션 토큰은 audio 쿼리에 불가(401)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        st = _upload_staging(client, h, b"SCOPE-ISO-AUDIO")
+        m = _create_with_token(client, h, st["stagingToken"])
+        atok = client.get(f"/api/meetings/{m['id']}/audio-token", headers=h).json()["token"]
+        # audio 토큰을 Bearer(세션)로 → 401(스코프 박힌 토큰의 세션 재사용 차단)
+        assert client.get("/api/meetings", headers={"Authorization": f"Bearer {atok}"}).status_code == 401
+        # audio 토큰을 audio GET 의 Bearer 로 써도 거부(Bearer 경로는 세션 스코프 요구) → 401
+        assert client.get(
+            f"/api/meetings/{m['id']}/audio", headers={"Authorization": f"Bearer {atok}"}
+        ).status_code == 401
+        # 세션 토큰(scope 없음)을 audio 쿼리로 → 401(쿼리 경로는 audio 스코프 요구)
+        sess = auth.make_token("admin")
+        assert client.get(
+            f"/api/meetings/{m['id']}/audio", params={"access_token": sess}
+        ).status_code == 401
+
+
+def test_audio_must_change_password_403():
+    """초기 비번 미변경(must_change) 사용자는 audio-token 발급·스트리밍 모두 403."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1,carol:pw3") as (auth, appmod, client):
+        # carol 은 set_password 미호출 → 시드 must_change_password=1 유지.
+        h_carol = {"Authorization": f"Bearer {auth.make_token('carol')}"}
+        mid = "f" * 32
+        # 토큰 발급 차단(require_user_active 403)
+        assert client.get(f"/api/meetings/{mid}/audio-token", headers=h_carol).status_code == 403
+        # 직접 조립한 audio 스코프 토큰으로 스트리밍 호출해도 _audio_user 403(소유자 검증 전 게이트)
+        atok = auth.make_token("carol", ttl=60, scope="audio")
+        assert client.get(
+            f"/api/meetings/{mid}/audio", params={"access_token": atok}
+        ).status_code == 403
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
