@@ -23,10 +23,18 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
-from src.web import audio_store, maintenance, observability
+from src.web import (
+    audio_store,
+    google_calendar,
+    google_drive,
+    google_oauth,
+    maintenance,
+    meeting_doc,
+    observability,
+)
 
 from src.postprocess.backends.agent_cli import (
     AgentCLIAuthError,
@@ -81,6 +89,24 @@ DB_BACKUP_INTERVAL_SEC = float(
     os.environ.get("WEB_DB_BACKUP_INTERVAL_SEC", str(maintenance.DEFAULT_DB_BACKUP_INTERVAL))
 )
 DB_BACKUP_KEEP = int(os.environ.get("WEB_DB_BACKUP_KEEP", str(maintenance.DEFAULT_DB_BACKUP_KEEP)))
+
+# ---------- Google Drive 회의록 동기화(사용자별 OAuth) ----------
+# 콜백 state(신원+CSRF) 토큰 TTL(초, 기본 10분) — 동의 왕복은 짧다.
+GOOGLE_STATE_TTL = int(os.environ.get("WEB_GOOGLE_STATE_TTL", "600"))
+# 콜백 완료 후 프론트로 302 리다이렉트할 오리진. 미설정이면 상대경로(/settings)로 이동(동일출처).
+FRONTEND_ORIGIN = os.environ.get("WEB_FRONTEND_ORIGIN", "").rstrip("/")
+# Docs 변환 import 한도(~10MB) 방어 — transcript 세그먼트 상한(기본 무제한=None).
+_max_seg_env = os.environ.get("WEB_DRIVE_MAX_TRANSCRIPT_SEGMENTS", "").strip()
+DRIVE_MAX_TRANSCRIPT_SEGMENTS = int(_max_seg_env) if _max_seg_env.isdigit() else None
+# 회의 삭제 시 드라이브 파일 동반 삭제 여부(기본 0=유지 — 사용자 본인 드라이브 자산 보존).
+DRIVE_DELETE_ON_MEETING_DELETE = os.environ.get("WEB_DRIVE_DELETE_ON_MEETING_DELETE", "0") == "1"
+# 캘린더 양방향 연동: 대상 캘린더(기본 primary=본인 기본 캘린더). 일정 읽기 기본 조회 창(일).
+DEFAULT_CALENDAR_ID = os.environ.get("WEB_CALENDAR_ID", "primary")
+CALENDAR_WINDOW_DAYS = int(os.environ.get("WEB_CALENDAR_WINDOW_DAYS", "30"))
+# 앱 회의를 캘린더 이벤트로 쓸 때 시간대(dateTime 에 오프셋 없을 때 Google 에 넘길 timeZone).
+CALENDAR_TIMEZONE = os.environ.get("WEB_CALENDAR_TIMEZONE", "Asia/Seoul")
+# 회의 삭제 시 캘린더 이벤트 동반 삭제 여부(기본 0=유지).
+CALENDAR_DELETE_ON_MEETING_DELETE = os.environ.get("WEB_CALENDAR_DELETE_ON_MEETING_DELETE", "0") == "1"
 
 
 async def _cleanup_loop() -> None:
@@ -434,6 +460,9 @@ _jobs_lock = threading.Lock()
 # 나머지는 대기시킨다 → OOM/연산 경합 방지. 대기 중 잡 status='queued'(프론트가 "처리 대기 중…" 표시).
 # 기본 1(직렬). WEB_STT_CONCURRENCY 로 조정(예: VRAM 여유 시 2). (모델 상주/유휴 언로드는 v2.)
 _stt_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_STT_CONCURRENCY", "1"))))
+
+# Drive 동기화 동시성 제한(네트워크 I/O — GPU 와 무관해 _stt_semaphore 와 분리). 기본 2.
+_drive_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_DRIVE_CONCURRENCY", "2"))))
 
 
 def _run_ai_job(
@@ -889,7 +918,12 @@ def delete_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -
     meetingId 화이트리스트(^[0-9a-f]{32}$) 통과분만 오디오 디렉토리 경로를 조립한다(traversal 차단).
     형식 위반 meetingId 는 오디오 삭제를 건너뛴다(DB 삭제만; 그런 id 는 오디오가 있을 수 없음).
     """
-    _owned_or_404(meeting_id, user)  # 소유 확인 후에만 삭제
+    m = _owned_or_404(meeting_id, user)  # 소유 확인 후에만 삭제
+    # 구글 자산(드라이브 파일·캘린더 이벤트) 동반 삭제(옵션, 기본 OFF=유지). DB 삭제 전에 ref 확보.
+    gdrive_ref = m.get("gdriveRef") if DRIVE_DELETE_ON_MEETING_DELETE else None
+    gcal_ref = m.get("gcalRef") if CALENDAR_DELETE_ON_MEETING_DELETE else None
+    if gdrive_ref or gcal_ref:
+        _delete_google_assets_async(user["username"], gdrive_ref, gcal_ref)
     store.delete(meeting_id)
     audio_removed = False
     if _HEX32_RE.match(meeting_id):
@@ -898,6 +932,37 @@ def delete_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -
         "meeting.delete", meeting_id=meeting_id, owner=user["username"], audio=audio_removed
     )
     return {"ok": True}
+
+
+def _delete_google_assets_async(
+    username: str, gdrive_ref: dict | None, gcal_ref: dict | None
+) -> None:
+    """회의 삭제 시 구글 자산(드라이브 문서/오디오·캘린더 이벤트) 삭제(best-effort, 백그라운드).
+
+    네트워크 I/O 라 삭제 응답을 막지 않게 데몬 스레드로 던지고, 토큰 갱신 1회로 둘 다 정리한다.
+    공유 드라이브 루트 폴더는 보존(다른 회의 파일). 실패는 무시(본인 자산이라 잔존해도 안전).
+    연동 해제 상태면 조용히 skip."""
+    doc_id = (gdrive_ref or {}).get("docId")
+    audio_id = (gdrive_ref or {}).get("audioId")
+    event_id = (gcal_ref or {}).get("eventId")
+    cal_id = (gcal_ref or {}).get("calendarId") or DEFAULT_CALENDAR_ID
+    if not (doc_id or audio_id or event_id):
+        return
+
+    def _run() -> None:
+        cred = auth.get_google_credential(username)
+        if not cred:
+            return
+        try:
+            access_token = google_oauth.refresh_access_token(cred["refresh_token"])
+            if doc_id or audio_id:
+                google_drive.delete_files(access_token, [doc_id, audio_id])
+            if event_id:
+                google_calendar.delete_event(access_token, event_id, calendar_id=cal_id)
+        except Exception:  # noqa: BLE001 — best-effort 정리(실패 무시)
+            traceback.print_exc()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------- 원본 오디오 영속(플랜 v4 트랙 C·Phase 4, D7-id 옵션B) ----------
@@ -1097,6 +1162,308 @@ def get_meeting_audio(
             "Content-Length": str(length),
         },
     )
+
+
+# ---------- Google Drive 회의록 동기화(사용자별 OAuth) ----------
+@app.get("/api/settings/google/status")
+def google_status(user: dict = Depends(require_user_active)) -> dict:
+    """현재 사용자 Google 연동 상태(refresh_token 비노출). configured=서버가 연동을 지원하는지."""
+    st = auth.google_status(user["username"])
+    st["configured"] = google_oauth.oauth_configured()  # 프론트가 '연동' 버튼 노출 판단
+    return st
+
+
+@app.post("/api/settings/google/connect")
+def google_connect(user: dict = Depends(require_user_active)) -> dict:
+    """동의 URL 발급 → {authUrl}. state=scope 'google_oauth' 단기 토큰(신원+CSRF).
+
+    프론트가 authUrl 로 이동해 사용자가 본인 Google 계정 동의를 마치면 callback 으로 돌아온다.
+    서버 미설정(env 없음)이면 503(관리자 설정 필요).
+    """
+    if not google_oauth.oauth_configured():
+        raise HTTPException(status_code=503, detail="Google 연동이 설정되지 않았습니다(관리자 문의).")
+    state = auth.make_token(user["id"], ttl=GOOGLE_STATE_TTL, scope="google_oauth")
+    try:
+        url = google_oauth.build_consent_url(state)
+    except google_oauth.GoogleOAuthError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"authUrl": url}
+
+
+def _google_redirect(status: str) -> RedirectResponse:
+    """콜백 후 프론트 설정 페이지로 302(?google=connected|error). 오리진 미설정 시 상대경로."""
+    base = f"{FRONTEND_ORIGIN}/settings" if FRONTEND_ORIGIN else "/settings"
+    return RedirectResponse(url=f"{base}?google={status}", status_code=302)
+
+
+@app.get("/api/integrations/google/callback")
+def google_callback(
+    state: str = Query(...),
+    code: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+) -> Response:
+    """Google OAuth 콜백 — code→refresh_token 교환·저장 후 프론트로 302.
+
+    인증은 Bearer 가 아니라 state(scope='google_oauth' JWT)로 한다(브라우저 리다이렉트라 헤더 없음).
+    state 검증(신원·CSRF)은 user_from_token 이 담당 — 무효/만료/위조/스코프불일치면 401(재사용 차단).
+    동의 거부(error)·code 누락·교환 실패는 프론트로 google=error 리다이렉트(사용자 안내).
+    """
+    user = auth.user_from_token(state, scope="google_oauth")  # 무효 state → 401(CSRF 차단)
+    if error or not code:
+        observability.audit("google.connect_error", owner=user["username"], reason=error or "no_code")
+        return _google_redirect("error")
+    try:
+        tok = google_oauth.exchange_code(code)
+        auth.set_google_credential(user["username"], tok["refresh_token"], email=tok.get("email"))
+    except google_oauth.GoogleOAuthError as e:
+        observability.audit("google.connect_error", owner=user["username"], reason=type(e).__name__)
+        return _google_redirect("error")
+    observability.audit("google.connect", owner=user["username"], email=tok.get("email"))
+    return _google_redirect("connected")
+
+
+@app.delete("/api/settings/google")
+def google_disconnect(user: dict = Depends(require_user_active)) -> dict:
+    """Google 연동 해제 — refresh_token 폐기(best-effort) + 로컬 자격증명 삭제."""
+    cred = auth.get_google_credential(user["username"])
+    if cred and cred.get("refresh_token"):
+        google_drive.revoke(cred["refresh_token"])  # best-effort(실패 무시)
+    cleared = auth.clear_google_credential(user["username"])
+    observability.audit("google.disconnect", owner=user["username"], cleared=cleared)
+    return {"ok": True, "cleared": cleared, "status": auth.google_status(user["username"])}
+
+
+def _run_drive_sync_job(
+    job_id: str, meeting_id: str, owner_id: str, username: str, google_cred: dict
+) -> None:
+    """회의록(Docs)+오디오를 사용자 본인 Drive 로 업로드/재동기화 → 잡 결과에 gdriveRef·docUrl.
+
+    네트워크 I/O 라 _drive_semaphore(STT 와 분리) 하에 돈다. refresh_token 무효면 error_code=
+    google_auth_expired 로 프론트 재연동 유도. 성공 시 gdriveRef 를 meeting.data 에 영속(멱등 재동기화
+    토대)한다. 잡 인메모리 규약은 _run_ai_job 과 동일(status queued→processing→done|error).
+    """
+    with _drive_semaphore:
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "processing"}
+        try:
+            access_token = google_oauth.refresh_access_token(google_cred["refresh_token"])
+            m = store.get(meeting_id)
+            if m is None or m.get("ownerId") != owner_id:
+                raise RuntimeError("meeting 없음")  # 잡 대기 중 삭제/이전된 경합
+            # 루트 폴더 확보(없으면 생성 → 영속). drive.file 스코프로 앱이 만든 폴더만 접근.
+            folder_id = google_drive.ensure_root_folder(access_token, google_cred.get("root_folder_id"))
+            if folder_id != google_cred.get("root_folder_id"):
+                auth.set_google_root_folder(username, folder_id)
+            gref = m.get("gdriveRef") or {}
+            title = meeting_doc.doc_title(m)
+            html = meeting_doc.render_meeting_html(
+                m, max_transcript_segments=DRIVE_MAX_TRANSCRIPT_SEGMENTS
+            )
+            doc_id = google_drive.upsert_doc(access_token, folder_id, html, title, gref.get("docId"))
+            audio_id = gref.get("audioId")
+            audio_ref = m.get("audioRef")
+            if audio_ref:
+                path = audio_store.meeting_audio_path(meeting_id, audio_ref)
+                if path is not None:
+                    ext = (audio_ref.get("format") or "bin").strip().lower()
+                    mime = _AUDIO_MIME.get(ext, "application/octet-stream")
+                    audio_id = google_drive.upsert_audio(
+                        access_token, folder_id, path, mime, f"{title}.{ext}", gref.get("audioId")
+                    )
+            doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+            new_ref = {
+                "docId": doc_id,
+                "audioId": audio_id,
+                "folderId": folder_id,
+                "docUrl": doc_url,
+                "syncedAt": _now_iso(),
+            }
+            # gdriveRef 를 meeting.data 에 영속(서버 주도라 If-Match 없이 병합). 소유격리는 위에서 확인.
+            store.update_if_match(meeting_id, {"gdriveRef": new_ref}, None)
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "done", "result": {"gdriveRef": new_ref, "docUrl": doc_url}}
+            observability.audit("drive.sync_done", meeting_id=meeting_id, owner=username)
+        except google_oauth.GoogleAuthExpired as e:
+            traceback.print_exc()
+            with _jobs_lock:
+                _jobs[job_id] = {
+                    "status": "error",
+                    "error": str(e),
+                    "error_code": "google_auth_expired",
+                }
+        except Exception as e:  # noqa: BLE001 — 폴백 원칙(잡은 멈추지 않고 error 로 종료)
+            traceback.print_exc()
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/meetings/{meeting_id}/drive-sync")
+def drive_sync(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
+    """회의록+오디오를 본인 Google Drive 로 내보내기/재동기화(백그라운드 잡) → {jobId}.
+
+    소유자만. 미연동이면 400 error_code=google_not_connected(프론트 연동 유도). 진행은
+    GET /api/ai/jobs/{jobId} 로 폴링(done: result={gdriveRef, docUrl} / error: error_code).
+    """
+    _require_hex32(meeting_id, what="meetingId")
+    _owned_or_404(meeting_id, user)  # 소유·존재 게이트
+    google_cred = auth.get_google_credential(user["username"])
+    if not google_cred:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": "google_not_connected", "message": "Google Drive 연동이 필요합니다."},
+        )
+    job_id = uuid.uuid4().hex
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "queued"}
+        _job_owner[job_id] = user["id"]
+    threading.Thread(
+        target=_run_drive_sync_job,
+        args=(job_id, meeting_id, user["id"], user["username"], google_cred),
+        daemon=True,
+    ).start()
+    observability.audit("drive.sync_request", meeting_id=meeting_id, owner=user["username"])
+    return {"jobId": job_id, "status": "queued"}
+
+
+# ---------- Google Calendar 양방향 연동 ----------
+def _google_access_token(username: str) -> str:
+    """저장된 refresh_token → 단기 access_token(동기 캘린더 호출용). 미연동 400, 만료 401(재연동 유도)."""
+    cred = auth.get_google_credential(username)
+    if not cred:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": "google_not_connected", "message": "Google 연동이 필요합니다."},
+        )
+    try:
+        return google_oauth.refresh_access_token(cred["refresh_token"])
+    except google_oauth.GoogleAuthExpired:
+        raise HTTPException(
+            status_code=401,
+            detail={"error_code": "google_auth_expired", "message": "Google 재연동이 필요합니다."},
+        )
+    except google_oauth.GoogleOAuthError as e:
+        raise HTTPException(status_code=502, detail=f"Google 인증 실패: {e}")
+
+
+def _rfc3339(offset_days: int = 0) -> str:
+    """현재(UTC) 기준 offset_days 를 더한 RFC3339 문자열(캘린더 timeMin/timeMax 기본값)."""
+    return (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=offset_days)
+    ).isoformat(timespec="seconds")
+
+
+@app.get("/api/google/calendar/events")
+def google_calendar_events(
+    user: dict = Depends(require_user_active),
+    time_min: str | None = Query(default=None, alias="timeMin"),
+    time_max: str | None = Query(default=None, alias="timeMax"),
+) -> list[dict]:
+    """구글 캘린더 → 앱: 본인 캘린더 일정 목록(원시 event dict). 프론트가 앱 회의와 합쳐 표시.
+
+    timeMin/timeMax(RFC3339) 미지정 시 now ~ now+CALENDAR_WINDOW_DAYS. 미연동 400, 만료 401.
+    """
+    access = _google_access_token(user["username"])
+    tmin = time_min or _rfc3339(0)
+    tmax = time_max or _rfc3339(CALENDAR_WINDOW_DAYS)
+    try:
+        items = google_calendar.list_events(
+            access, time_min=tmin, time_max=tmax, calendar_id=DEFAULT_CALENDAR_ID
+        )
+    except google_calendar.GoogleCalendarError as e:
+        raise HTTPException(status_code=502, detail=f"캘린더 조회 실패: {e}")
+    observability.incr("calendar.events_fetch")
+    return items
+
+
+def _parse_duration_minutes(duration: object) -> int:
+    """'HH:MM' 형식 회의 길이 → 분. 파싱 불가/비정상이면 기본 60분."""
+    parts = str(duration or "").strip().split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return 60
+    if len(nums) == 2:
+        minutes = nums[0] * 60 + nums[1]
+    elif len(nums) == 1:
+        minutes = nums[0]
+    else:
+        return 60
+    return minutes if minutes > 0 else 60
+
+
+def _meeting_to_calendar_event(m: dict) -> dict:
+    """앱 회의 → 구글 캘린더 이벤트 body(앱→구글 쓰기). start=date(없으면 createdAt), end=start+duration.
+
+    description 에 회의록(Drive) 링크·안건 제목을 담고, participants 의 email 을 attendees 로 넣는다.
+    dateTime 에 오프셋이 없으면 timeZone 을 함께 넘겨 Google 이 로컬시각으로 해석하게 한다.
+    """
+    title = str(m.get("title") or "").strip() or "회의"
+    start_iso = str(m.get("date") or m.get("createdAt") or "").strip()
+    # ISO 파싱('Z' → +00:00 보정). 실패 시 지금 시각(UTC).
+    try:
+        start_dt = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    except ValueError:
+        start_dt = dt.datetime.now(dt.timezone.utc)
+    end_dt = start_dt + dt.timedelta(minutes=_parse_duration_minutes(m.get("duration")))
+    has_tz = start_dt.tzinfo is not None
+    start_field: dict = {"dateTime": start_dt.isoformat()}
+    end_field: dict = {"dateTime": end_dt.isoformat()}
+    if not has_tz:  # 오프셋 없는 로컬시각 → timeZone 명시(Google 이 UTC 로 오해하지 않게)
+        start_field["timeZone"] = CALENDAR_TIMEZONE
+        end_field["timeZone"] = CALENDAR_TIMEZONE
+
+    desc_parts: list[str] = []
+    gref = m.get("gdriveRef") or {}
+    if gref.get("docUrl"):
+        desc_parts.append(f"회의록: {gref['docUrl']}")
+    for block in (m.get("summary") or {}).get("agenda") or []:
+        if isinstance(block, dict) and str(block.get("title") or "").strip():
+            desc_parts.append(f"- {block['title']}")
+
+    attendees = []
+    for p in m.get("participants") or []:
+        email = str((p or {}).get("email") or "").strip() if isinstance(p, dict) else ""
+        if "@" in email:
+            attendees.append({"email": email})
+
+    body: dict = {"summary": title, "start": start_field, "end": end_field}
+    if desc_parts:
+        body["description"] = "\n".join(desc_parts)
+    if attendees:
+        body["attendees"] = attendees
+    return body
+
+
+@app.post("/api/meetings/{meeting_id}/calendar-sync")
+def calendar_sync(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
+    """앱 → 구글 캘린더: 회의를 캘린더 이벤트로 생성/갱신(동기). gcalRef(eventId) 기반 멱등.
+
+    소유자만. 미연동 400, 만료 401. 저장된 gcalRef.eventId 가 있으면 같은 일정을 갱신(중복 없음).
+    성공 시 gcalRef 를 meeting.data 에 영속하고 {gcalRef} 반환(htmlLink 로 '캘린더에서 열기').
+    """
+    _require_hex32(meeting_id, what="meetingId")
+    m = _owned_or_404(meeting_id, user)
+    access = _google_access_token(user["username"])
+    gref = m.get("gcalRef") or {}
+    cal_id = gref.get("calendarId") or DEFAULT_CALENDAR_ID
+    try:
+        event_id, html_link = google_calendar.upsert_event(
+            access,
+            calendar_id=cal_id,
+            event_body=_meeting_to_calendar_event(m),
+            event_id=gref.get("eventId"),
+        )
+    except google_calendar.GoogleCalendarError as e:
+        raise HTTPException(status_code=502, detail=f"캘린더 동기화 실패: {e}")
+    new_ref = {
+        "eventId": event_id,
+        "htmlLink": html_link,
+        "calendarId": cal_id,
+        "syncedAt": _now_iso(),
+    }
+    store.update_if_match(meeting_id, {"gcalRef": new_ref}, None)
+    observability.audit("calendar.sync", meeting_id=meeting_id, owner=user["username"])
+    return {"gcalRef": new_ref}
 
 
 @app.get("/api/admin/metrics")

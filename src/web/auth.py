@@ -111,6 +111,17 @@ CREATE TABLE IF NOT EXISTS claude_credentials (
     secret     TEXT NOT NULL,   -- 평문 보관(현 .env/~/.claude 수준). API 응답엔 절대 미노출.
     updated_at TEXT
 );
+-- 사용자별 Google Drive 연동 자격증명(회의록 동기화). claude_credentials 와 PK(username)가
+-- 겹치므로 같은 테이블에 섞지 않고 **별도 테이블**로 둔다. refresh_token 은 장수명 오프라인
+-- 자격증명이라 _enc_secret(Fernet)로 암호화 저장한다(CRED_ENC_KEY 있으면). root_folder_id 는
+-- drive.file 스코프로 앱이 만든 회의록 루트 폴더 id(재동기화 시 재사용). email 은 표시용.
+CREATE TABLE IF NOT EXISTS google_credentials (
+    username       TEXT PRIMARY KEY,
+    refresh_token  TEXT NOT NULL,   -- _enc_secret(Fernet, 접두사 enc:fernet:). API 응답 절대 미노출.
+    email          TEXT,            -- 연결된 구글 계정(표시용). 없으면 None.
+    root_folder_id TEXT,            -- drive.file 앱 루트 폴더 id(회의록 저장 위치)
+    updated_at     TEXT
+);
 """
 
 # 사용자별 claude 자격증명 종류. oauth_token=CLAUDE_CODE_OAUTH_TOKEN(Claude Code CLI 토큰,
@@ -375,6 +386,21 @@ class UserStore:
                     (_ENC_PREFIX + cipher.encrypt(r["secret"].encode()).decode(), r["username"]),
                 )
                 migrated += 1
+            # google_credentials.refresh_token 도 동일 규약으로 재암호화(레거시 평문만, 멱등).
+            grows = self._conn.execute(
+                "SELECT username, refresh_token FROM google_credentials"
+            ).fetchall()
+            for r in grows:
+                if r["refresh_token"].startswith(_ENC_PREFIX):
+                    continue
+                self._conn.execute(
+                    "UPDATE google_credentials SET refresh_token=? WHERE username=?",
+                    (
+                        _ENC_PREFIX + cipher.encrypt(r["refresh_token"].encode()).decode(),
+                        r["username"],
+                    ),
+                )
+                migrated += 1
             if migrated:
                 self._conn.commit()
         return migrated
@@ -397,6 +423,85 @@ class UserStore:
         if not cred:
             return {"configured": False, "type": None, "updated_at": None}
         return {"configured": True, "type": cred["type"], "updated_at": cred["updated_at"]}
+
+    # ---- 사용자별 Google Drive 자격증명(google_credentials 테이블) ----
+    def set_google_credential(
+        self, username: str, refresh_token: str, *, email: str | None = None
+    ) -> None:
+        """Google refresh_token 저장/갱신(재연동). refresh_token 은 _enc_secret 로 암호화 보관.
+
+        재연동(prompt=consent)마다 새 refresh_token 이 오므로 upsert 로 덮어쓴다. root_folder_id 는
+        여기서 건드리지 않는다(연동 자체와 폴더 확보는 별개 — 폴더는 첫 동기화 때 set_google_root_folder).
+        기존 행 재연동 시에도 root_folder_id 는 보존한다(같은 계정 재연동이면 폴더 유효).
+        """
+        refresh_token = (refresh_token or "").strip()
+        if not refresh_token:
+            raise ValueError("refresh_token 이 비어 있습니다.")
+        stored = _enc_secret(refresh_token)  # CRED_ENC_KEY 있으면 암호화, 없으면 평문(하위호환)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO google_credentials "
+                "(username, refresh_token, email, root_folder_id, updated_at) "
+                "VALUES (?,?,?,NULL,?) "
+                "ON CONFLICT(username) DO UPDATE SET "
+                "refresh_token=excluded.refresh_token, email=excluded.email, "
+                "updated_at=excluded.updated_at",  # root_folder_id 는 보존(재연동 시 유효 폴더 유지)
+                (username, stored, email, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            self._conn.commit()
+
+    def get_google_credential(self, username: str) -> dict | None:
+        """Google 자격증명(refresh_token 포함, **내부 주입 전용**). 없으면 None.
+
+        반환: {"refresh_token": ..., "email": ..., "root_folder_id": ..., "updated_at": ...}.
+        refresh_token 은 절대 API 응답에 싣지 않는다(공개 상태는 google_status()). 암호문인데
+        키 없음/불일치로 복호 불가면 미설정으로 취급(None) — 디스크 데이터는 보존.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT refresh_token, email, root_folder_id, updated_at "
+                "FROM google_credentials WHERE username=?",
+                (username,),
+            ).fetchone()
+        if not row:
+            return None
+        refresh_token = _dec_secret(row["refresh_token"])
+        if not refresh_token:
+            return None  # 암호문인데 키 없음/불일치 → 미설정 취급(데이터는 보존)
+        return {
+            "refresh_token": refresh_token,
+            "email": row["email"],
+            "root_folder_id": row["root_folder_id"],
+            "updated_at": row["updated_at"],
+        }
+
+    def set_google_root_folder(self, username: str, folder_id: str | None) -> None:
+        """drive.file 앱 루트 폴더 id 영속(첫 동기화 때 생성 후 재사용). 행 없으면 무시."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE google_credentials SET root_folder_id=? WHERE username=?",
+                (folder_id, username),
+            )
+            self._conn.commit()
+
+    def clear_google_credential(self, username: str) -> bool:
+        """Google 연동 해제(자격증명 삭제). 삭제된 행이 있으면 True."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM google_credentials WHERE username=?", (username,)
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def google_status(self, username: str) -> dict:
+        """Google 연동 공개 상태(refresh_token **비노출**). 설정 UI 용.
+
+        반환: {"connected": bool, "email": str|None, "updatedAt": str|None}.
+        """
+        cred = self.get_google_credential(username)
+        if not cred:
+            return {"connected": False, "email": None, "updatedAt": None}
+        return {"connected": True, "email": cred["email"], "updatedAt": cred["updated_at"]}
 
 
 def public_user(u: dict) -> dict:
@@ -537,6 +642,29 @@ def clear_credential(username: str) -> bool:
 def credential_status(username: str) -> dict:
     """secret 비노출 공개 상태."""
     return store().credential_status(username)
+
+
+# ---- 모듈 레벨 Google 자격증명 헬퍼(싱글턴 store 위임) ----
+def set_google_credential(username: str, refresh_token: str, *, email: str | None = None) -> None:
+    store().set_google_credential(username, refresh_token, email=email)
+
+
+def get_google_credential(username: str) -> dict | None:
+    """refresh_token 포함 — 내부 주입 전용. API 응답에 그대로 싣지 말 것."""
+    return store().get_google_credential(username)
+
+
+def set_google_root_folder(username: str, folder_id: str | None) -> None:
+    store().set_google_root_folder(username, folder_id)
+
+
+def clear_google_credential(username: str) -> bool:
+    return store().clear_google_credential(username)
+
+
+def google_status(username: str) -> dict:
+    """refresh_token 비노출 공개 상태."""
+    return store().google_status(username)
 
 
 def update_profile(username: str, **fields) -> dict | None:
