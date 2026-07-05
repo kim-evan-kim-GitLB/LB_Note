@@ -24,6 +24,11 @@ dependencies = [
     "passlib>=1.7",
     "python-multipart>=0.0.32",
     "cryptography>=43",
+    # 사용자별 Google Drive 회의록 동기화(google_oauth/google_drive). 서버사이드 OAuth
+    # authorization-code + Drive/Docs 업로드. 아웃바운드 인터넷 필요(oauth2/www.googleapis.com).
+    "google-auth>=2.30",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.130",
 ]
 
 # torch/torchaudio 는 GPU 아키텍처별 휠이 달라 상호 배타 extra 로 분리.
