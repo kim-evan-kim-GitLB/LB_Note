@@ -122,6 +122,16 @@ CREATE TABLE IF NOT EXISTS google_credentials (
     root_folder_id TEXT,            -- drive.file 앱 루트 폴더 id(회의록 저장 위치)
     updated_at     TEXT
 );
+-- 앱 레벨 Google OAuth 클라이언트 설정(배포당 1개 앱 신분증 = client_id/secret). 사용자별이 아니라
+-- provider 단일 행. 관리자(role=admin)가 인앱에서 설정 → .env/재시작 없이 즉시 반영. client_secret 은
+-- _enc_secret(Fernet)로 암호화. 미설정이면 google_oauth 가 env(GOOGLE_OAUTH_*)로 폴백한다(하위호환).
+CREATE TABLE IF NOT EXISTS app_oauth_config (
+    provider      TEXT PRIMARY KEY,   -- 'google'
+    client_id     TEXT,
+    client_secret TEXT,               -- _enc_secret(Fernet). API 응답 절대 미노출.
+    redirect_uri  TEXT,
+    updated_at    TEXT
+);
 """
 
 # 사용자별 claude 자격증명 종류. oauth_token=CLAUDE_CODE_OAUTH_TOKEN(Claude Code CLI 토큰,
@@ -401,6 +411,19 @@ class UserStore:
                     ),
                 )
                 migrated += 1
+            # app_oauth_config.client_secret 도 동일 규약(레거시 평문만 암호화, 멱등).
+            crows = self._conn.execute(
+                "SELECT provider, client_secret FROM app_oauth_config"
+            ).fetchall()
+            for r in crows:
+                sec = r["client_secret"] or ""
+                if not sec or sec.startswith(_ENC_PREFIX):
+                    continue
+                self._conn.execute(
+                    "UPDATE app_oauth_config SET client_secret=? WHERE provider=?",
+                    (_ENC_PREFIX + cipher.encrypt(sec.encode()).decode(), r["provider"]),
+                )
+                migrated += 1
             if migrated:
                 self._conn.commit()
         return migrated
@@ -502,6 +525,61 @@ class UserStore:
         if not cred:
             return {"connected": False, "email": None, "updatedAt": None}
         return {"connected": True, "email": cred["email"], "updatedAt": cred["updated_at"]}
+
+    # ---- 앱 레벨 Google OAuth 클라이언트 설정(app_oauth_config, provider='google') ----
+    def set_google_oauth_config(
+        self, client_id: str, client_secret: str, redirect_uri: str
+    ) -> None:
+        """관리자가 앱 OAuth 클라이언트(client_id/secret/redirect_uri) 설정. secret 은 Fernet 암호화.
+
+        단일 provider 행(upsert). 세 값 모두 필수(비면 ValueError) — 부분 설정은 oauth_configured
+        판단을 모호하게 하므로 한 번에 완결한다.
+        """
+        client_id = (client_id or "").strip()
+        client_secret = (client_secret or "").strip()
+        redirect_uri = (redirect_uri or "").strip()
+        if not (client_id and client_secret and redirect_uri):
+            raise ValueError("client_id/client_secret/redirect_uri 는 모두 필요합니다.")
+        stored = _enc_secret(client_secret)  # CRED_ENC_KEY 있으면 암호화, 없으면 평문(하위호환)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO app_oauth_config "
+                "(provider, client_id, client_secret, redirect_uri, updated_at) "
+                "VALUES ('google',?,?,?,?) "
+                "ON CONFLICT(provider) DO UPDATE SET "
+                "client_id=excluded.client_id, client_secret=excluded.client_secret, "
+                "redirect_uri=excluded.redirect_uri, updated_at=excluded.updated_at",
+                (client_id, stored, redirect_uri, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            self._conn.commit()
+
+    def get_google_oauth_config(self) -> dict | None:
+        """앱 OAuth 설정(client_secret 복호 포함, **내부 전용**). 없으면 None.
+
+        반환: {"client_id", "client_secret", "redirect_uri", "updated_at"}. client_secret 은
+        절대 API 응답에 싣지 말 것(공개 상태는 app.py/google_oauth 가 secret 제외 후 구성).
+        암호문인데 키 없음/불일치로 복호 불가면 client_secret="" 로 둔다(설정 미완 취급).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT client_id, client_secret, redirect_uri, updated_at "
+                "FROM app_oauth_config WHERE provider='google'"
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "client_id": row["client_id"],
+            "client_secret": _dec_secret(row["client_secret"] or ""),
+            "redirect_uri": row["redirect_uri"],
+            "updated_at": row["updated_at"],
+        }
+
+    def clear_google_oauth_config(self) -> bool:
+        """앱 OAuth 설정 삭제(→ env 폴백으로 복귀). 삭제된 행이 있으면 True."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM app_oauth_config WHERE provider='google'")
+            self._conn.commit()
+        return cur.rowcount > 0
 
 
 def public_user(u: dict) -> dict:
@@ -665,6 +743,20 @@ def clear_google_credential(username: str) -> bool:
 def google_status(username: str) -> dict:
     """refresh_token 비노출 공개 상태."""
     return store().google_status(username)
+
+
+# ---- 모듈 레벨 앱 OAuth 설정 헬퍼(싱글턴 store 위임) ----
+def set_google_oauth_config(client_id: str, client_secret: str, redirect_uri: str) -> None:
+    store().set_google_oauth_config(client_id, client_secret, redirect_uri)
+
+
+def get_google_oauth_config() -> dict | None:
+    """client_secret 포함 — 내부 전용. API 응답에 그대로 싣지 말 것."""
+    return store().get_google_oauth_config()
+
+
+def clear_google_oauth_config() -> bool:
+    return store().clear_google_oauth_config()
 
 
 def update_profile(username: str, **fields) -> dict | None:
