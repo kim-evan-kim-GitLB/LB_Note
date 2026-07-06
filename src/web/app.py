@@ -275,6 +275,20 @@ class ProfileRequest(BaseModel):
     jobTitle: str | None = None
 
 
+class AdminUserUpdateRequest(BaseModel):
+    """관리자 사용자 정보 수정. 모두 선택 — 보낸 필드만 갱신."""
+    displayName: str | None = None
+    englishName: str | None = None
+    jobTitle: str | None = None
+    role: str | None = None
+    email: str | None = None
+
+
+class AdminResetPasswordRequest(BaseModel):
+    """관리자 비번 초기화. newPassword 필수(초기화 후 must_change_password=1)."""
+    newPassword: str
+
+
 class GoogleOAuthConfigRequest(BaseModel):
     """관리자 앱 OAuth 클라이언트 설정(client_id/secret/redirect_uri). 셋 다 필수."""
     clientId: str
@@ -344,6 +358,19 @@ def _clean_name(value: str, *, field: str, required: bool) -> str:
     # 제어문자(줄바꿈/탭 포함) 금지 — 표시명에 부적합.
     if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
         raise HTTPException(status_code=422, detail=f"{field}: 제어문자/줄바꿈은 사용할 수 없습니다.")
+    return v
+
+
+def _clean_email(value: str) -> str | None:
+    """이메일 간단 검증·정규화. trim 후 빈 문자열이면 None(미설정), 값 있으면 '@' 포함 요구.
+    길이 상한은 표시명과 동일(MAX_NAME_LEN). 위반 시 422."""
+    v = value.strip()
+    if not v:
+        return None  # 빈 문자열 → 미설정(None 저장)
+    if len(v) > MAX_NAME_LEN:
+        raise HTTPException(status_code=422, detail=f"email: 최대 {MAX_NAME_LEN}자입니다.")
+    if "@" not in v:
+        raise HTTPException(status_code=422, detail="email: 올바른 이메일 형식이 아닙니다.")
     return v
 
 
@@ -1505,6 +1532,78 @@ def delete_google_oauth_config(user: dict = Depends(require_admin)) -> dict:
     cleared = auth.clear_google_oauth_config()
     observability.audit("google.oauth_config_clear", by=user["username"], cleared=cleared)
     return {"ok": True, "cleared": cleared, "status": google_oauth.config_status()}
+
+
+# ---------- 관리자: 사용자 명부 관리 + 참석자 피커 디렉터리 ----------
+@app.get("/api/admin/users")
+def admin_list_users(user: dict = Depends(require_admin)) -> dict:
+    """전체 사용자 명부(관리자 전용, 비번 해시 미노출)."""
+    return {"users": auth.list_users()}
+
+
+@app.patch("/api/admin/users/{username}")
+def admin_update_user(
+    username: str, req: AdminUserUpdateRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """관리자 사용자 정보 수정. 이름 필드는 _clean_name, email 은 _clean_email 로 검증.
+
+    가드: (a) 본인 role 을 admin→user 로 낮추기 금지, (b) 대상이 마지막 admin 이면 강등 금지.
+    """
+    fields: dict = {}
+    if req.displayName is not None:
+        fields["display_name"] = _clean_name(req.displayName, field="displayName", required=True)
+    if req.englishName is not None:
+        fields["english_name"] = _clean_name(req.englishName, field="englishName", required=False)
+    if req.jobTitle is not None:
+        fields["job_title"] = _clean_name(req.jobTitle, field="jobTitle", required=False)
+    if req.email is not None:
+        fields["email"] = _clean_email(req.email)
+    if req.role is not None:
+        if req.role not in ("user", "admin"):
+            raise HTTPException(status_code=422, detail="role 은 'user'|'admin' 만 허용됩니다.")
+        fields["role"] = req.role
+        # 강등(admin→user) 가드 — 대상의 현재 role 을 조회.
+        if req.role == "user":
+            target = users.get(username)
+            if target is None:
+                raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+            if (target.get("role") or "user") == "admin":
+                # (a) 본인 강등 금지(관리 콘솔에서 자기 권한을 실수로 잃지 않게).
+                if username == user["username"]:
+                    raise HTTPException(status_code=409, detail="본인 권한은 강등할 수 없습니다.")
+                # (b) 마지막 관리자 강등 금지.
+                if auth.count_admins() <= 1:
+                    raise HTTPException(status_code=409, detail="마지막 관리자는 강등할 수 없습니다.")
+    updated = auth.admin_update_user(username, **fields)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+    observability.audit(
+        "admin.user.update", user=user["username"], target=username, fields=",".join(fields)
+    )
+    return updated
+
+
+@app.post("/api/admin/users/{username}/reset-password")
+def admin_reset_password(
+    username: str, req: AdminResetPasswordRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """관리자 비번 초기화 → must_change_password=1(대상은 다음 로그인 시 강제변경). 비번 미반환."""
+    new_pw = req.newPassword or ""
+    if len(new_pw) < MIN_PASSWORD_LEN:
+        raise HTTPException(
+            status_code=400, detail=f"새 비밀번호는 {MIN_PASSWORD_LEN}자 이상이어야 합니다."
+        )
+    if not auth.admin_reset_password(username, new_pw):
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+    observability.audit("admin.user.reset_password", user=user["username"], target=username)
+    return {"ok": True}
+
+
+# ---------- 참석자 피커용 디렉터리(인증 사용자 전체) ----------
+@app.get("/api/directory")
+def get_directory(user: dict = Depends(require_user_active)) -> dict:
+    """참석자 피커용 경량 디렉터리([{username, displayName, email}]). 민감필드 미포함."""
+    return {"users": auth.list_directory()}
 
 
 @app.get("/api/admin/metrics")
