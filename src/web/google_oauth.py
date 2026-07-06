@@ -43,21 +43,61 @@ class GoogleAuthExpired(GoogleOAuthError):
     """refresh_token 무효/취소(invalid_grant) — 사용자 재연동 필요. endpoint 가 error_code 로 안내."""
 
 
+def _db_config() -> dict | None:
+    """관리자가 인앱 설정한 앱 OAuth 클라이언트(DB). 없거나 store 미초기화면 None(→ env 폴백).
+
+    client_id/secret/redirect_uri 는 DB(관리자 설정) 우선, 없으면 env(GOOGLE_OAUTH_*)로 폴백한다.
+    google_oauth 는 store 참조를 갖지 않으므로 매 호출 시 auth 를 지연 import 해 조회한다."""
+    try:
+        from src.web import auth
+        return auth.get_google_oauth_config()
+    except Exception:  # noqa: BLE001 — store 미초기화/조회 실패는 env 폴백으로 흡수
+        return None
+
+
 def _client_id() -> str:
+    cfg = _db_config()
+    if cfg and (cfg.get("client_id") or "").strip():
+        return cfg["client_id"].strip()
     return os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip()
 
 
 def _client_secret() -> str:
+    cfg = _db_config()
+    if cfg and (cfg.get("client_secret") or "").strip():
+        return cfg["client_secret"].strip()
     return os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
 
 
 def _redirect_uri() -> str:
+    cfg = _db_config()
+    if cfg and (cfg.get("redirect_uri") or "").strip():
+        return cfg["redirect_uri"].strip()
     return os.environ.get("GOOGLE_OAUTH_REDIRECT_URI", "").strip()
 
 
 def oauth_configured() -> bool:
-    """연동에 필요한 env(CLIENT_ID/SECRET/REDIRECT_URI)가 모두 있는지. google 라이브러리는 불검사."""
+    """client_id/secret/redirect_uri 가 (DB 또는 env 에) 모두 있는지. google 라이브러리는 불검사."""
     return bool(_client_id() and _client_secret() and _redirect_uri())
+
+
+def config_status() -> dict:
+    """관리자용 앱 OAuth 설정 공개 상태(**client_secret 절대 미노출**).
+
+    반환: {configured, source('db'|'env'|'none'), clientId, redirectUri, updatedAt}. client_id/
+    redirect_uri 는 비밀이 아니라 표시한다(설정 확인용). client_secret 은 어떤 필드에도 싣지 않는다.
+    """
+    cfg = _db_config()
+    db_has = bool(cfg and (cfg.get("client_id") or "").strip())
+    env_has = bool(os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip())
+    source = "db" if db_has else ("env" if env_has else "none")
+    return {
+        "configured": oauth_configured(),
+        "source": source,
+        "clientId": _client_id(),
+        "redirectUri": _redirect_uri(),
+        "updatedAt": (cfg or {}).get("updated_at") if db_has else None,
+    }
 
 
 def _client_config() -> dict:
@@ -86,8 +126,17 @@ def _build_flow(state: str | None = None):
         from google_auth_oauthlib.flow import Flow
     except ImportError as e:  # 라이브러리 미설치
         raise GoogleOAuthError(f"google-auth-oauthlib 미설치: {e}") from e
+    # PKCE 비활성화(autogenerate_code_verifier=False): 우리는 동의(build_consent_url)와 콜백
+    # (exchange_code)에서 각각 별개의 Flow 인스턴스를 새로 만드는 stateless 설계라, 라이브러리가
+    # 자동 생성하는 code_verifier 가 두 단계 사이에 유실된다 → 토큰 교환 시 (invalid_grant)
+    # "Missing code verifier". client_secret 을 가진 confidential 웹앱이라 PKCE 는 선택사항이므로
+    # 끈다(대신 client_secret 으로 클라이언트를 인증). 이러면 code_challenge 자체를 안 보낸다.
     return Flow.from_client_config(
-        _client_config(), scopes=GOOGLE_SCOPES, state=state, redirect_uri=_redirect_uri()
+        _client_config(),
+        scopes=GOOGLE_SCOPES,
+        state=state,
+        redirect_uri=_redirect_uri(),
+        autogenerate_code_verifier=False,
     )
 
 

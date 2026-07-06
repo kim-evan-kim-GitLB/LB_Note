@@ -275,6 +275,13 @@ class ProfileRequest(BaseModel):
     jobTitle: str | None = None
 
 
+class GoogleOAuthConfigRequest(BaseModel):
+    """관리자 앱 OAuth 클라이언트 설정(client_id/secret/redirect_uri). 셋 다 필수."""
+    clientId: str
+    clientSecret: str
+    redirectUri: str
+
+
 # 셀프 비번 변경 시 새 비밀번호 최소 길이.
 MIN_PASSWORD_LEN = 8
 
@@ -1216,7 +1223,10 @@ def google_callback(
         tok = google_oauth.exchange_code(code)
         auth.set_google_credential(user["username"], tok["refresh_token"], email=tok.get("email"))
     except google_oauth.GoogleOAuthError as e:
-        observability.audit("google.connect_error", owner=user["username"], reason=type(e).__name__)
+        traceback.print_exc()  # 실제 사유(토큰 교환 실패 메시지)를 서버 로그에 남긴다
+        observability.audit(
+            "google.connect_error", owner=user["username"], reason=f"{type(e).__name__}: {e}"
+        )
         return _google_redirect("error")
     observability.audit("google.connect", owner=user["username"], email=tok.get("email"))
     return _google_redirect("connected")
@@ -1466,6 +1476,37 @@ def calendar_sync(meeting_id: str, user: dict = Depends(require_user_active)) ->
     return {"gcalRef": new_ref}
 
 
+# ---------- 관리자: 앱 Google OAuth 클라이언트 설정(① client_id/secret, .env/재시작 불필요) ----------
+@app.get("/api/admin/google-oauth-config")
+def get_google_oauth_config(user: dict = Depends(require_admin)) -> dict:
+    """앱 OAuth 설정 상태(관리자, **client_secret 미노출**): {configured, source, clientId, redirectUri, updatedAt}."""
+    return google_oauth.config_status()
+
+
+@app.put("/api/admin/google-oauth-config")
+def put_google_oauth_config(
+    req: GoogleOAuthConfigRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """관리자가 앱 OAuth 클라이언트(client_id/secret/redirect_uri) 저장. secret 은 DB Fernet 암호화.
+
+    저장 즉시 반영(재시작 불필요) — google_oauth 가 DB 우선으로 읽는다. secret 은 응답에 미포함.
+    """
+    try:
+        auth.set_google_oauth_config(req.clientId, req.clientSecret, req.redirectUri)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    observability.audit("google.oauth_config_set", by=user["username"])
+    return google_oauth.config_status()
+
+
+@app.delete("/api/admin/google-oauth-config")
+def delete_google_oauth_config(user: dict = Depends(require_admin)) -> dict:
+    """앱 OAuth 설정 삭제(→ env 폴백으로 복귀)."""
+    cleared = auth.clear_google_oauth_config()
+    observability.audit("google.oauth_config_clear", by=user["username"], cleared=cleared)
+    return {"ok": True, "cleared": cleared, "status": google_oauth.config_status()}
+
+
 @app.get("/api/admin/metrics")
 def admin_metrics(user: dict = Depends(require_admin)) -> dict:
     """운영 관측 스냅샷(관리자 전용) — 카운터·저장량·디스크·정리 설정.
@@ -1513,5 +1554,24 @@ def health() -> dict:
 # ---------- 정적 프론트 서빙(컨테이너; dev에서는 비활성) ----------
 if FRONTEND_DIST and Path(FRONTEND_DIST).is_dir():
     from fastapi.staticfiles import StaticFiles
-    # API 라우트 뒤에 mount → /api/* 가 우선, 나머지는 SPA index.html.
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+    from starlette.exceptions import HTTPException as _StarletteHTTPException
+    from starlette.responses import FileResponse
+
+    _SPA_INDEX = str(Path(FRONTEND_DIST) / "index.html")
+
+    class _SPAStaticFiles(StaticFiles):
+        """SPA 폴백 — 존재하지 않는 경로(예: /settings, /settings?google=connected)는 404 대신
+        index.html 을 돌려 클라이언트 라우터가 처리하게 한다. OAuth 콜백이 302 로 보내는 /settings
+        착지 지점이 백엔드 라우트가 아니어서 FastAPI 404({"detail":"Not Found"})가 뜨던 문제를 해결.
+        실제 정적 자산(assets/*)은 그대로 서빙되고, /api/* 오타 등은 404 를 유지한다."""
+
+        async def get_response(self, path, scope):  # type: ignore[override]
+            try:
+                return await super().get_response(path, scope)
+            except _StarletteHTTPException as exc:
+                if exc.status_code == 404 and not path.startswith("api"):
+                    return FileResponse(_SPA_INDEX)
+                raise
+
+    # API 라우트 뒤에 mount → /api/* 가 우선, 나머지는 SPA index.html(폴백 포함).
+    app.mount("/", _SPAStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
