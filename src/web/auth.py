@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS users (
     role          TEXT DEFAULT 'user',   -- 권한(user/developer/admin). 직함과 무관.
     english_name  TEXT,                  -- 영어 이름(이메일 @앞). 아바타 이니셜·보조 표기용.
     job_title     TEXT,                  -- 직함(대표이사/팀장/프로 등). 권한 role 과 별개.
+    email         TEXT,                  -- 업무 이메일. 참석자 피커·캘린더 attendee 채움용.
     -- 관리자 부여/시드 비번을 본인이 아직 안 바꿈 → 1. 셀프 변경 시 0. 신규 행 기본 1
     -- (관리자가 준 초기 비번은 반드시 한 번 교체하도록 강제). 데이터 엔드포인트는 1이면 403.
     must_change_password INTEGER NOT NULL DEFAULT 1,
@@ -155,7 +156,7 @@ class UserStore:
         with self._lock:
             self._conn.executescript(_USERS_SCHEMA)
             # 기존 DB 마이그레이션: 신규 컬럼이 없으면 추가(이미 있으면 OperationalError 무시).
-            for col in ("english_name", "job_title"):
+            for col in ("english_name", "job_title", "email"):
                 try:
                     self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
                 except sqlite3.OperationalError:
@@ -299,10 +300,123 @@ class UserStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT username, password_hash, display_name, role, english_name, job_title, "
-                "must_change_password FROM users WHERE username=?",
+                "email, must_change_password FROM users WHERE username=?",
                 (username,),
             ).fetchone()
         return dict(row) if row else None
+
+    # ---- 관리자용 사용자 명부 ----
+    def _admin_user_shape(self, row: dict) -> dict:
+        """관리자 명부 항목 shape(비번 해시 절대 제외). display_name 없으면 username 폴백."""
+        return {
+            "username": row["username"],
+            "displayName": row["display_name"] or row["username"],
+            "role": row["role"] or "user",
+            "englishName": row["english_name"],
+            "jobTitle": row["job_title"],
+            "email": row["email"],
+            "mustChangePassword": bool(row["must_change_password"]),
+        }
+
+    def list_users(self) -> list[dict]:
+        """전체 사용자를 관리용 shape로 반환(비번 해시 절대 제외). display_name 기준 정렬."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT username, display_name, role, english_name, job_title, email, "
+                "must_change_password FROM users"
+            ).fetchall()
+        items = [self._admin_user_shape(dict(r)) for r in rows]
+        items.sort(key=lambda u: u["displayName"])
+        return items
+
+    def admin_update_user(
+        self,
+        username: str,
+        *,
+        display_name=None,
+        english_name=None,
+        job_title=None,
+        role=None,
+        email=None,
+    ) -> dict | None:
+        """관리자 사용자 정보 수정. None 인 필드는 미변경(보낸 것만 갱신).
+
+        display_name 이 갱신되면 name_source='user' 로 찍어 seed 재실행이 덮지 않게 한다
+        (update_profile 패턴). role 은 {'user','admin'} 만 허용(그 외 ValueError). 대상 없으면
+        None. 갱신 필드 0개면 name_source 승격 없이 현재 값 그대로 반환.
+        """
+        if role is not None and role not in ("user", "admin"):
+            raise ValueError(f"role 은 'user'|'admin' 만 허용: {role!r}")
+        sets: list[str] = []
+        params: list = []
+        # display_name 이 실제로 갱신될 때만 name_source='user' 로 승격(빈 변경이 seed 보호
+        # 플래그를 임의로 켜지 않게).
+        if display_name is not None:
+            sets.append("display_name=?")
+            params.append(display_name)
+            sets.append("name_source='user'")
+        if english_name is not None:
+            sets.append("english_name=?")
+            params.append(english_name)
+        if job_title is not None:
+            sets.append("job_title=?")
+            params.append(job_title)
+        if role is not None:
+            sets.append("role=?")
+            params.append(role)
+        if email is not None:
+            sets.append("email=?")
+            params.append(email)
+        # 갱신 필드 0개: no-op. 현재 사용자 반환(행 없으면 None) — name_source 승격 금지.
+        if not sets:
+            cur = self.get(username)
+            return self._admin_user_shape(cur) if cur else None
+        with self._lock:
+            res = self._conn.execute(
+                f"UPDATE users SET {', '.join(sets)} WHERE username=?",
+                (*params, username),
+            )
+            self._conn.commit()
+        if res.rowcount == 0:
+            return None
+        return self._admin_user_shape(self.get(username))
+
+    def admin_reset_password(self, username: str, new_password: str) -> bool:
+        """관리자 비번 초기화. password_hash 재설정 + must_change_password=1(다음 로그인 시
+        강제변경). set_password(must_change_password=0)와 달리 게이트를 다시 켠다. 대상 없으면 False.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET password_hash=?, must_change_password=1 WHERE username=?",
+                (pbkdf2_sha256.hash(new_password), username),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def list_directory(self) -> list[dict]:
+        """참석자 피커용 경량 목록. [{username, displayName, email}], display_name 기준 정렬.
+        민감정보(role/비번/must_change) 미포함."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT username, display_name, email FROM users"
+            ).fetchall()
+        items = [
+            {
+                "username": r["username"],
+                "displayName": r["display_name"] or r["username"],
+                "email": r["email"],
+            }
+            for r in rows
+        ]
+        items.sort(key=lambda u: u["displayName"])
+        return items
+
+    def count_admins(self) -> int:
+        """role='admin' 사용자 수(마지막 admin 강등 가드용)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) AS c FROM users WHERE role='admin'"
+            ).fetchone()["c"]
 
     def count(self) -> int:
         with self._lock:
@@ -762,6 +876,32 @@ def clear_google_oauth_config() -> bool:
 def update_profile(username: str, **fields) -> dict | None:
     """본인 표시명 self-edit(싱글턴 store 위임). 공개 user dict 반환(없으면 None)."""
     return store().update_profile(username, **fields)
+
+
+# ---- 모듈 레벨 관리자 명부/디렉터리 헬퍼(싱글턴 store 위임) ----
+def list_users() -> list[dict]:
+    """관리용 사용자 명부(비번 해시 미포함)."""
+    return store().list_users()
+
+
+def admin_update_user(username: str, **fields) -> dict | None:
+    """관리자 사용자 정보 수정(싱글턴 store 위임). 갱신본 반환(없으면 None)."""
+    return store().admin_update_user(username, **fields)
+
+
+def admin_reset_password(username: str, new_password: str) -> bool:
+    """관리자 비번 초기화(must_change_password=1). 대상 없으면 False."""
+    return store().admin_reset_password(username, new_password)
+
+
+def list_directory() -> list[dict]:
+    """참석자 피커용 경량 디렉터리([{username, displayName, email}])."""
+    return store().list_directory()
+
+
+def count_admins() -> int:
+    """role='admin' 사용자 수."""
+    return store().count_admins()
 
 
 # ---- FastAPI 의존성: Bearer 토큰 검증 → 현재 사용자 ----
