@@ -1428,28 +1428,54 @@ def _parse_duration_minutes(duration: object) -> int:
     return minutes if minutes > 0 else 60
 
 
+def _date_only(value: str) -> str:
+    """ISO datetime 또는 'YYYY-MM-DD' 에서 날짜 부분(YYYY-MM-DD)만 추출('T' 앞 10자)."""
+    return str(value or "").strip().split("T", 1)[0][:10]
+
+
 def _meeting_to_calendar_event(m: dict) -> dict:
     """앱 회의 → 구글 캘린더 이벤트 body(앱→구글 쓰기). start=date(없으면 createdAt), end=start+duration.
 
-    description 에 회의록(Drive) 링크·안건 제목을 담고, participants 의 email 을 attendees 로 넣는다.
-    dateTime 에 오프셋이 없으면 timeZone 을 함께 넘겨 Google 이 로컬시각으로 해석하게 한다.
+    종일(allDay) 회의는 date 필드(날짜만)로 매핑한다 — Google all-day 의 end 는 배타적(exclusive)
+    이라 사용자 포함형(inclusive) 종료일(endDate, 없으면 date)에 +1일 한다. location 이 있으면 넣고,
+    사용자 description 은 자동 파트(회의록 링크·안건 제목)보다 위에 붙인다. participants 의 email 은
+    attendees 로 넣는다. timed 이벤트에서 dateTime 에 오프셋이 없으면 timeZone 을 함께 넘겨
+    Google 이 로컬시각으로 해석하게 한다.
     """
     title = str(m.get("title") or "").strip() or "회의"
-    start_iso = str(m.get("date") or m.get("createdAt") or "").strip()
-    # ISO 파싱('Z' → +00:00 보정). 실패 시 지금 시각(UTC).
-    try:
-        start_dt = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-    except ValueError:
-        start_dt = dt.datetime.now(dt.timezone.utc)
-    end_dt = start_dt + dt.timedelta(minutes=_parse_duration_minutes(m.get("duration")))
-    has_tz = start_dt.tzinfo is not None
-    start_field: dict = {"dateTime": start_dt.isoformat()}
-    end_field: dict = {"dateTime": end_dt.isoformat()}
-    if not has_tz:  # 오프셋 없는 로컬시각 → timeZone 명시(Google 이 UTC 로 오해하지 않게)
-        start_field["timeZone"] = CALENDAR_TIMEZONE
-        end_field["timeZone"] = CALENDAR_TIMEZONE
+    if m.get("allDay"):
+        # 종일: date(날짜만) → end 는 배타적이므로 (endDate 또는 date) + 1일. timeZone 불필요.
+        start_date = _date_only(m.get("date") or m.get("createdAt"))
+        end_inclusive = _date_only(m.get("endDate") or m.get("date") or m.get("createdAt"))
+        try:
+            end_exclusive = (
+                dt.date.fromisoformat(end_inclusive) + dt.timedelta(days=1)
+            ).isoformat()
+        except ValueError:  # 파싱 불가 시 시작일 기준 하루짜리
+            end_exclusive = (
+                dt.date.fromisoformat(start_date) + dt.timedelta(days=1)
+            ).isoformat() if start_date else start_date
+        start_field: dict = {"date": start_date}
+        end_field: dict = {"date": end_exclusive}
+    else:
+        start_iso = str(m.get("date") or m.get("createdAt") or "").strip()
+        # ISO 파싱('Z' → +00:00 보정). 실패 시 지금 시각(UTC).
+        try:
+            start_dt = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        except ValueError:
+            start_dt = dt.datetime.now(dt.timezone.utc)
+        end_dt = start_dt + dt.timedelta(minutes=_parse_duration_minutes(m.get("duration")))
+        has_tz = start_dt.tzinfo is not None
+        start_field = {"dateTime": start_dt.isoformat()}
+        end_field = {"dateTime": end_dt.isoformat()}
+        if not has_tz:  # 오프셋 없는 로컬시각 → timeZone 명시(Google 이 UTC 로 오해하지 않게)
+            start_field["timeZone"] = CALENDAR_TIMEZONE
+            end_field["timeZone"] = CALENDAR_TIMEZONE
 
     desc_parts: list[str] = []
+    user_desc = str(m.get("description") or "").strip()
+    if user_desc:  # 사용자 입력 설명을 자동 파트보다 위에 배치
+        desc_parts.append(user_desc)
     gref = m.get("gdriveRef") or {}
     if gref.get("docUrl"):
         desc_parts.append(f"회의록: {gref['docUrl']}")
@@ -1464,6 +1490,9 @@ def _meeting_to_calendar_event(m: dict) -> dict:
             attendees.append({"email": email})
 
     body: dict = {"summary": title, "start": start_field, "end": end_field}
+    location = str(m.get("location") or "").strip()
+    if location:
+        body["location"] = location
     if desc_parts:
         body["description"] = "\n".join(desc_parts)
     if attendees:

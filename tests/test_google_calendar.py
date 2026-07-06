@@ -175,6 +175,81 @@ def test_meeting_to_event_defaults():
         assert "06:00:00" in body["end"]["dateTime"]  # +60분
 
 
+def test_meeting_to_event_all_day():
+    with _tmp() as (_auth, appmod, _client):
+        # 종일 2일 회의: 사용자 포함형 종료일(07-11) → Google 배타적 end = +1일(07-12).
+        m = {
+            "title": "워크숍",
+            "allDay": True,
+            "date": "2026-07-10",
+            "endDate": "2026-07-11",
+        }
+        body = appmod._meeting_to_calendar_event(m)
+        assert body["start"] == {"date": "2026-07-10"}
+        assert body["end"] == {"date": "2026-07-12"}  # 배타적 종료 = 포함형+1일
+        assert "timeZone" not in body["start"]  # 종일은 timeZone 불필요
+
+
+def test_meeting_to_event_all_day_single():
+    with _tmp() as (_auth, appmod, _client):
+        # endDate 없는 하루짜리 종일 → date 기준 +1일.
+        m = {"title": "휴가", "allDay": True, "date": "2026-07-10"}
+        body = appmod._meeting_to_calendar_event(m)
+        assert body["start"] == {"date": "2026-07-10"}
+        assert body["end"] == {"date": "2026-07-11"}
+
+
+def test_meeting_to_event_location():
+    with _tmp() as (_auth, appmod, _client):
+        m = {"title": "회의", "date": "2026-07-10T02:00:00Z", "location": "3층 회의실"}
+        body = appmod._meeting_to_calendar_event(m)
+        assert body["location"] == "3층 회의실"
+        # location 없으면 미포함
+        body2 = appmod._meeting_to_calendar_event({"date": "2026-07-10T02:00:00Z"})
+        assert "location" not in body2
+
+
+def test_meeting_to_event_user_description():
+    with _tmp() as (_auth, appmod, _client):
+        m = {
+            "date": "2026-07-10T02:00:00Z",
+            "description": "사용자 설명입니다",
+            "gdriveRef": {"docUrl": "https://docs.google.com/document/d/doc1/edit"},
+            "summary": {"agenda": [{"title": "일정 확정"}]},
+        }
+        body = appmod._meeting_to_calendar_event(m)
+        lines = body["description"].splitlines()
+        assert lines[0] == "사용자 설명입니다"  # 자동 파트보다 위
+        assert any("docs.google.com/document/d/doc1" in ln for ln in lines[1:])
+        assert any("일정 확정" in ln for ln in lines[1:])
+        # 사용자 description 없으면 기존 동작(자동 파트만)
+        body2 = appmod._meeting_to_calendar_event(
+            {"date": "2026-07-10T02:00:00Z", "gdriveRef": {"docUrl": "https://x/y"}}
+        )
+        assert body2["description"].splitlines()[0].startswith("회의록:")
+
+
+def test_meeting_create_roundtrip_new_fields():
+    with _tmp() as (auth, appmod, client):
+        h = _headers(auth, appmod, "admin")
+        payload = {
+            "id": uuid.uuid4().hex,
+            "title": "종일 회의",
+            "allDay": True,
+            "date": "2026-07-10",
+            "endDate": "2026-07-11",
+            "location": "본사",
+            "description": "설명",
+        }
+        r = client.post("/api/meetings", json=payload, headers=h)
+        assert r.status_code == 200, r.text
+        created = r.json()
+        assert created.get("id")  # 프론트 자동 calendar-sync 용 id 반환
+        got = client.get(f"/api/meetings/{created['id']}", headers=h).json()
+        for k in ("allDay", "endDate", "location", "description"):
+            assert got.get(k) == payload[k]  # 신규 필드 라운드트립
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
