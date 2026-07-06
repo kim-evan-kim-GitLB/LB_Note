@@ -112,12 +112,41 @@ def test_list_directory_lean():
         assert got["dev"] == "dev@corp.io"
 
 
+def test_list_directory_effective_email_from_username():
+    """email override 가 없고 username 이 이메일이면 username 을 effective email 로 쓴다.
+    '@' 없는 계정(admin 등)은 email=None. override 가 있으면 override 우선."""
+    with tempfile.TemporaryDirectory() as td:
+        _auth, store = _fresh_auth(Path(td))
+        store.seed_user("hong@litbig.com", "pw", display_name="홍길동")
+        store.admin_update_user("dev", email="override@corp.io")  # override 우선 확인
+        got = {u["username"]: u["email"] for u in store.list_directory()}
+        assert got["hong@litbig.com"] == "hong@litbig.com"  # username 자동 도출
+        assert got["admin"] is None                          # '@' 없음 → None
+        assert got["dev"] == "override@corp.io"              # override 우선
+
+
 def test_count_admins():
     with tempfile.TemporaryDirectory() as td:
         _auth, store = _fresh_auth(Path(td))
         assert store.count_admins() == 1
         store.admin_update_user("dev", role="admin")
         assert store.count_admins() == 2
+
+
+def test_developer_role_normalized_to_user():
+    """레거시 role='developer' 는 관리자 뷰에서 '사용자'(user)로 정규화된다.
+
+    시드 비관리자는 developer 로 저장되지만, 편집 select(user/admin)·PATCH role 검증과
+    맞지 않으면 저장이 막힌다 → shape 단계에서 admin 외 전부 user 로 노출·수렴.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        _auth, store = _fresh_auth(Path(td))
+        store.seed_user("leg", "pw", role="developer")
+        got = next(u for u in store.list_users() if u["username"] == "leg")
+        assert got["role"] == "user"
+        # 이름만 수정해도 role 은 'user' 로 노출(developer 재노출 금지)
+        updated = store.admin_update_user("leg", display_name="레거시")
+        assert updated["role"] == "user"
 
 
 # ---------- HTTP: 관리자 엔드포인트 ----------

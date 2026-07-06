@@ -307,11 +307,16 @@ class UserStore:
 
     # ---- 관리자용 사용자 명부 ----
     def _admin_user_shape(self, row: dict) -> dict:
-        """관리자 명부 항목 shape(비번 해시 절대 제외). display_name 없으면 username 폴백."""
+        """관리자 명부 항목 shape(비번 해시 절대 제외). display_name 없으면 username 폴백.
+
+        role 은 관리자/사용자 2종으로 정규화한다. 시드 비관리자는 'developer'(레거시)로
+        저장되지만 gating 은 admin 만 의미가 있어 developer 등 비-admin 은 'user' 로 노출한다
+        (편집 select 값 일치·PATCH role 검증 통과). 편집·저장 시 DB 값도 'user' 로 수렴한다.
+        """
         return {
             "username": row["username"],
             "displayName": row["display_name"] or row["username"],
-            "role": row["role"] or "user",
+            "role": "admin" if row["role"] == "admin" else "user",
             "englishName": row["english_name"],
             "jobTitle": row["job_title"],
             "email": row["email"],
@@ -395,7 +400,11 @@ class UserStore:
 
     def list_directory(self) -> list[dict]:
         """참석자 피커용 경량 목록. [{username, displayName, email}], display_name 기준 정렬.
-        민감정보(role/비번/must_change) 미포함."""
+        민감정보(role/비번/must_change) 미포함.
+
+        email 은 effective 값: 저장된 override 가 있으면 그것, 없고 username 이 이메일
+        형태('@' 포함)면 username 을 사용한다(사내 계정은 username=이메일). 캘린더 attendee
+        가 이 email 을 쓰므로, 대부분 사용자는 관리자가 email 을 따로 채우지 않아도 연동된다."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT username, display_name, email FROM users"
@@ -404,7 +413,7 @@ class UserStore:
             {
                 "username": r["username"],
                 "displayName": r["display_name"] or r["username"],
-                "email": r["email"],
+                "email": r["email"] or (r["username"] if "@" in r["username"] else None),
             }
             for r in rows
         ]
