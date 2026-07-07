@@ -236,6 +236,19 @@ def _changed(new: dict, old: dict, key: str) -> bool:
     return str(new.get(key) or "") != str(old.get(key) or "")
 
 
+def _sanitize_label(value: object, fallback: object = "", *, maxlen: int = 300) -> str:
+    """요약 자유 텍스트 라벨(주제/안건 제목/안건 한줄요약) 정리 — 제어문자→공백·공백 정규화·길이 제한.
+
+    항목 근거(anchor/evidence)와 달리 라벨은 소유자 교정 대상이라 편집을 허용하되, 제어문자와
+    과도한 길이만 방어한다. 비문자/누락이면 fallback(저장본 값)을 사용한다.
+    """
+    if not isinstance(value, str):
+        return str(fallback) if fallback is not None else ""
+    cleaned = "".join(ch if ord(ch) >= 32 else " " for ch in value)  # 개행/탭 등 제어문자→공백
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned[:maxlen]
+
+
 def _validate_summary_items(stored_items: list, incoming_items: list, *, path: str) -> list[dict]:
     """한 섹션(points/decisions/issues) SummaryItem 리스트 편집 검증·정규화.
 
@@ -297,19 +310,19 @@ def _validate_summary_items(stored_items: list, incoming_items: list, *, path: s
 
 
 def validate_summary_edit(stored: dict, incoming: dict) -> dict:
-    """summary 항목 text 교정 구조보존 검증(편집 시에만, 후방호환). P6.
+    """summary 편집 구조보존 검증(편집 시에만, 후방호환). P6.
 
-    저장본 summary 에 agenda 블록이 있을 때만 적용한다. 구조(블록 개수·no·title, 각 섹션 항목
-    개수·anchor·evidence_seg_ids·item_id)는 불변이고 **SummaryItem.text 만** 편집 허용한다.
-    text 가 바뀐 항목은 서버가 edited=True/edited_at/original_text(최초 동결)를 set 하고
-    evidence_seg_ids 는 저장본 그대로 동결한다 — 게이트(ground_summary)는 **생성 시점** 산출이며
-    편집 PATCH 는 grounding 을 우회한다(재드롭/anchor·time_range 재산출 없음). 근거 게이트 면제는
-    "근거 실재(저장본 evidence 보존) + text-edit 드롭만 면제"로 제한된다(D5).
+    저장본 summary 에 agenda 블록이 있을 때만 적용한다. **구조 무결성**(블록 개수·no, 각 섹션
+    항목 개수·anchor·evidence_seg_ids·item_id, agenda_index 개수·no)은 불변이다. 편집 허용 표면:
+      - **항목 text**(points/decisions/issues): 바뀌면 edited=True/edited_at/original_text(최초 동결)
+        set, evidence_seg_ids 는 저장본 동결(grounding 우회 — D5).
+      - **자유 텍스트 라벨**: 안건 제목(block.title)·주제(meta.subject)·안건 목록(agenda_index
+        title/summary). 소유자 교정 대상이라 편집 허용하되 _sanitize_label 로 제어문자·길이만 방어.
 
-    결과는 **저장본(stored) 베이스**로 만들고 검증된 새 text·edited 메타만 덮어쓴다. meta·
-    agenda_index·블록 메타·미지 필드는 저장본에서 보존하며 incoming 의 임의 필드(위조)는 반영하지
-    않는다 → summary 편집으로 변조 가능한 표면을 항목 text 로 제한한다. item_id 부재(레거시 회의)는
-    이 시점에 lazy 부여(무파괴 마이그레이션)된다. 위반 시 SummaryStructureError(호출부 422).
+    결과는 **저장본(stored) 베이스**로 만든다. 편집 표면(항목 text·위 라벨)만 검증 후 덮어쓰고,
+    그 외 필드(meta 의 주제 외 항목·블록 근거 메타·미지 필드)는 저장본에서 보존한다 → 편집으로
+    변조 가능한 표면을 텍스트·라벨로 제한한다. item_id 부재(레거시)는 lazy 부여(무파괴 마이그레이션).
+    위반 시 SummaryStructureError(호출부 422).
     """
     stored_agenda = stored.get("agenda") or []
     incoming_agenda = incoming.get("agenda")
@@ -328,15 +341,48 @@ def validate_summary_edit(stored: dict, incoming: dict) -> dict:
             raise SummaryStructureError(f"agenda[{bidx}] 블록 형식 오류")
         if "no" in new_blk and str(new_blk.get("no")) != str(old_blk.get("no")):
             raise SummaryStructureError(f"agenda[{bidx}] no 불변 위반")
-        if _changed(new_blk, old_blk, "title"):
-            raise SummaryStructureError(f"agenda[{bidx}] title 불변 위반")
-        blk = dict(old_blk)  # 블록 메타(no/title/time_range/evidence) 저장본 보존
+        blk = dict(old_blk)  # 블록 메타(no/time_range/evidence) 저장본 보존
+        # 안건 제목: 자유 텍스트 라벨 → 편집 허용(sanitize). 구조(no/개수/근거)는 아래에서 불변 유지.
+        if "title" in new_blk:
+            blk["title"] = _sanitize_label(new_blk.get("title"), old_blk.get("title"))
         for sec in ("points", "decisions", "issues"):
             blk[sec] = _validate_summary_items(
                 old_blk.get(sec) or [], new_blk.get(sec) or [], path=f"agenda[{bidx}].{sec}"
             )
         out_blocks.append(blk)
     out["agenda"] = out_blocks
+    # 주제(meta.subject): 편집 허용. 그 외 meta 필드(참석자/부서/작성자 등)는 저장본 보존(위조 방지).
+    stored_meta = stored.get("meta") or {}
+    incoming_meta = incoming.get("meta")
+    if isinstance(incoming_meta, dict) and "subject" in incoming_meta:
+        out["meta"] = {
+            **stored_meta,
+            "subject": _sanitize_label(incoming_meta.get("subject"), stored_meta.get("subject", "")),
+        }
+    # 안건 목록(agenda_index): 제목·한줄요약 텍스트 편집 허용(개수·no 는 불변).
+    stored_index = stored.get("agenda_index") or []
+    incoming_index = incoming.get("agenda_index")
+    if incoming_index is not None:
+        if not isinstance(incoming_index, list) or len(incoming_index) != len(stored_index):
+            got = len(incoming_index) if isinstance(incoming_index, list) else "형식오류"
+            raise SummaryStructureError(
+                f"agenda_index 개수 불변 위반: 저장본 {len(stored_index)} != 요청 {got}"
+            )
+        new_index: list[dict] = []
+        for iidx, (old_e, new_e) in enumerate(zip(stored_index, incoming_index)):
+            if not isinstance(new_e, dict):
+                raise SummaryStructureError(f"agenda_index[{iidx}] 형식 오류")
+            if "no" in new_e and str(new_e.get("no")) != str(old_e.get("no")):
+                raise SummaryStructureError(f"agenda_index[{iidx}] no 불변 위반")
+            entry = dict(old_e)
+            if "title" in new_e:
+                entry["title"] = _sanitize_label(new_e.get("title"), old_e.get("title"))
+            if "summary" in new_e:
+                entry["summary"] = _sanitize_label(
+                    new_e.get("summary"), old_e.get("summary", ""), maxlen=600
+                )
+            new_index.append(entry)
+        out["agenda_index"] = new_index
     return out
 
 
