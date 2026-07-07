@@ -154,10 +154,29 @@ def test_item_count_change_rejected():
         validate_summary_edit(stored, incoming)
 
 
-def test_block_title_change_rejected():
+def test_block_title_edit_accepted():
+    """안건 제목은 자유 텍스트 라벨 → 소유자 편집 허용(구조 아님)."""
     stored = _summary()
     incoming = copy.deepcopy(stored)
-    incoming["agenda"][0]["title"] = "위조제목"
+    incoming["agenda"][0]["title"] = "교정된 안건 제목"
+    out = validate_summary_edit(stored, incoming)
+    assert out["agenda"][0]["title"] == "교정된 안건 제목"
+
+
+def test_summary_label_control_chars_stripped():
+    """라벨 편집은 제어문자→공백·공백 정규화로 방어(개행/탭 주입 무해화)."""
+    stored = _summary()
+    incoming = copy.deepcopy(stored)
+    incoming["agenda"][0]["title"] = "제목\n\t줄바꿈  공백"
+    out = validate_summary_edit(stored, incoming)
+    assert out["agenda"][0]["title"] == "제목 줄바꿈 공백"
+
+
+def test_agenda_index_count_change_rejected():
+    """안건 목록 텍스트는 편집 허용하되 개수(구조)는 불변 — 항목 추가 시 422."""
+    stored = _summary()
+    incoming = copy.deepcopy(stored)
+    incoming["agenda_index"].append({"no": 2, "title": "위조추가", "summary": ""})
     with pytest.raises(SummaryStructureError):
         validate_summary_edit(stored, incoming)
 
@@ -207,15 +226,20 @@ def test_item_id_forgery_rejected():
         validate_summary_edit(stored, incoming)
 
 
-def test_meta_and_agenda_index_preserved_against_forgery():
+def test_subject_and_agenda_index_editable_but_other_meta_preserved():
+    """주제·안건목록 텍스트는 편집 허용. 단, 주제 외 meta 필드(참석자 등)는 위조 방지로 저장본 보존."""
     stored = _summary()
     incoming = copy.deepcopy(stored)
-    incoming["meta"]["subject"] = "위조주제"
-    incoming["agenda_index"][0]["title"] = "위조인덱스"
+    incoming["meta"]["subject"] = "교정 주제"
+    incoming["meta"]["attendees"] = ["위조참석자"]      # 비편집 필드 위조 시도
+    incoming["agenda_index"][0]["title"] = "교정 인덱스"
+    incoming["agenda_index"][0]["summary"] = "교정 요약줄"
     _first_point(incoming)["text"] = "정상교정"
     out = validate_summary_edit(stored, incoming)
-    assert out["meta"]["subject"] == "주제", "meta 는 저장본 보존(편집 표면 아님)"
-    assert out["agenda_index"][0]["title"] == "안건1", "agenda_index 저장본 보존"
+    assert out["meta"]["subject"] == "교정 주제", "주제는 편집 허용"
+    assert out["meta"]["attendees"] == ["김"], "주제 외 meta 필드는 저장본 보존(위조 방지)"
+    assert out["agenda_index"][0]["title"] == "교정 인덱스"
+    assert out["agenda_index"][0]["summary"] == "교정 요약줄"
 
 
 def test_empty_stored_agenda_passthrough():
