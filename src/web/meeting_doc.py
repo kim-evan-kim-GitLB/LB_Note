@@ -123,6 +123,33 @@ def _render_transcript(meeting: dict, max_segments: int | None) -> list[str]:
     return out
 
 
+def render_email_body(meeting: dict) -> str:
+    """회의록 발송 이메일 본문(HTML) — 요약 + 액션아이템만(전사 제외). 전문은 첨부 PDF 로 보낸다.
+
+    Gmail 본문으로 쓰는 self-contained HTML. 요약/액션이 모두 비면 안내 문구만 담는다.
+    """
+    title = doc_title(meeting)
+    body: list[str] = [f"<h2>{_esc(title)}</h2>"]
+    created = str(meeting.get("createdAt") or "").strip()
+    if created:
+        body.append(f"<p><strong>일시:</strong> {_esc(created)}</p>")
+    body.extend(_render_participants(meeting))
+    summary = _render_summary(meeting)
+    actions = _render_action_items(meeting)
+    if not summary and not actions:
+        body.append("<p>요약·액션아이템이 아직 없습니다. 상세 내용은 첨부된 회의록을 확인해 주세요.</p>")
+    else:
+        body.extend(summary)
+        body.extend(actions)
+    body.append("<hr><p style=\"color:#888;font-size:12px\">상세 회의록은 첨부 파일을 참고하세요.</p>")
+    inner = "\n".join(body)
+    return (
+        '<!DOCTYPE html>\n<html lang="ko"><head><meta charset="utf-8">'
+        f"<title>{_esc(title)}</title></head>\n"
+        f'<body style="font-family:sans-serif;line-height:1.6">\n{inner}\n</body></html>'
+    )
+
+
 def render_meeting_html(meeting: dict, *, max_transcript_segments: int | None = None) -> str:
     """회의록(요약+액션+transcript)을 단일 self-contained HTML 문서로 렌더.
 
