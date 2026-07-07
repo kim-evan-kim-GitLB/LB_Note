@@ -16,8 +16,11 @@ env:
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import json
 import os
+import threading
+import time
 
 # 요청 스코프. email 은 full URL 로 명시(구글이 'email' → userinfo.email 로 확장해 반환하므로
 # 요청/부여 스코프를 일치시켜 scope-change 잡음을 줄인다). openid 는 id_token(email 추출) 발급용.
@@ -191,8 +194,8 @@ def exchange_code(code: str) -> dict:
     }
 
 
-def refresh_access_token(refresh_token: str) -> str:
-    """refresh_token → 단기 access_token. 무효/취소(invalid_grant)면 GoogleAuthExpired."""
+def _refresh_creds(refresh_token: str):
+    """refresh_token 으로 access_token 을 재발급한 Credentials 반환(내부). 무효면 GoogleAuthExpired."""
     if not oauth_configured():
         raise GoogleOAuthError("Google OAuth 미설정.")
     try:
@@ -218,4 +221,34 @@ def refresh_access_token(refresh_token: str) -> str:
         raise GoogleOAuthError(f"access_token 갱신 실패: {type(e).__name__}: {e}") from e
     if not creds.token:
         raise GoogleOAuthError("access_token 이 비어 있습니다.")
+    return creds
+
+
+def refresh_access_token(refresh_token: str) -> str:
+    """refresh_token → 단기 access_token. 무효/취소(invalid_grant)면 GoogleAuthExpired."""
+    return _refresh_creds(refresh_token).token
+
+
+# access_token 캐시(refresh_token → (token, 만료 epoch)). 오디오 재생 Range 요청은 재생 1건당
+# 수십 회라, 매번 토큰 재발급하면 Google 토큰 엔드포인트를 과호출한다 → 만료 skew 전까지 재사용.
+_token_cache: dict[str, tuple[str, float]] = {}
+_token_cache_lock = threading.Lock()
+
+
+def refresh_access_token_cached(refresh_token: str, *, skew_seconds: float = 120.0) -> str:
+    """refresh_access_token 의 캐시판. 만료 skew 초 전까지 access_token 을 재사용(재생 프록시용)."""
+    now = time.time()
+    with _token_cache_lock:
+        hit = _token_cache.get(refresh_token)
+        if hit is not None and hit[1] - skew_seconds > now:
+            return hit[0]
+    creds = _refresh_creds(refresh_token)  # 락 밖에서 네트워크 I/O
+    expiry = getattr(creds, "expiry", None)
+    # creds.expiry 는 naive UTC datetime — epoch 로 환산. 없으면 보수적으로 5분만 캐시.
+    if expiry is not None:
+        expiry_epoch = expiry.replace(tzinfo=dt.timezone.utc).timestamp()
+    else:
+        expiry_epoch = now + 300.0
+    with _token_cache_lock:
+        _token_cache[refresh_token] = (creds.token, expiry_epoch)
     return creds.token
