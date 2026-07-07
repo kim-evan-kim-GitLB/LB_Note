@@ -27,11 +27,14 @@ import time
 #   - drive.file: 앱이 만든 회의록 문서/오디오만(최소권한, non-sensitive).
 #   - calendar.events: 캘린더 일정 읽기+쓰기(양방향 연동). read(events.list)·write(events.insert/update)
 #     둘 다 커버. sensitive 스코프이나 동의화면 Internal(Workspace)이라 구글 검증 불필요.
+#   - gmail.send: 회의록 발송(사용자 본인 Gmail 로 전송, 읽기 없음). restricted 스코프이나 동의화면
+#     Internal(Workspace) 이라 구글 검증 불필요. 부여 스코프가 늘어 기존 연동 사용자는 재동의 필요.
 GOOGLE_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 
 _AUTH_URI = "https://accounts.google.com/o/oauth2/auth"

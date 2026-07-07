@@ -171,6 +171,21 @@ def upsert_audio(
     return response["id"]
 
 
+def export_doc(access_token: str, doc_id: str, mime: str = "application/pdf") -> bytes:
+    """Google Docs 문서를 지정 포맷(기본 PDF)으로 export → bytes. 이메일 첨부용.
+
+    files.export(mimeType=...) — Docs 네이티브 문서를 PDF/DOCX 등으로 변환해 받는다.
+    404/403 이면 GoogleDriveError(호출부가 매핑). 대용량은 export 한도(10MB) 내 가정.
+    """
+    service = _drive(access_token)
+    from googleapiclient.errors import HttpError
+
+    try:
+        return service.files().export(fileId=doc_id, mimeType=mime).execute()
+    except HttpError as e:
+        raise GoogleDriveError(f"문서 export 실패({_status(e)}): {e}") from e
+
+
 def stream_media(access_token: str, file_id: str, range_header: str | None):
     """Drive 파일을 alt=media 로 GET → (status_code, headers: dict, reader) 릴레이용.
 

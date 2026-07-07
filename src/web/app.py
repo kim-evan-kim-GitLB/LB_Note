@@ -30,6 +30,7 @@ from src.web import (
     audio_store,
     google_calendar,
     google_drive,
+    google_gmail,
     google_oauth,
     maintenance,
     meeting_doc,
@@ -1437,6 +1438,29 @@ def _run_drive_sync_job(
                     del _drive_sync_inflight[meeting_id]
 
 
+def _start_drive_sync(meeting_id: str, user_id: str, username: str, google_cred: dict) -> dict:
+    """drive-sync 백그라운드 잡 시작(in-flight 디둡) → {jobId, status}. 진행 중이면 기존 잡 재사용.
+
+    중복 폴더/Doc 레이스 방지(자동+수동/연속 저장·이메일 후속 동기화가 겹칠 때). 잡은 회의록+오디오
+    를 올리고 오디오 업로드 성공 시 로컬 원본을 정리한다.
+    """
+    with _jobs_lock:
+        existing = _drive_sync_inflight.get(meeting_id)
+        if existing is not None and _jobs.get(existing, {}).get("status") in ("queued", "processing"):
+            return {"jobId": existing, "status": _jobs[existing]["status"]}
+        job_id = uuid.uuid4().hex
+        _jobs[job_id] = {"status": "queued"}
+        _job_owner[job_id] = user_id
+        _drive_sync_inflight[meeting_id] = job_id
+    threading.Thread(
+        target=_run_drive_sync_job,
+        args=(job_id, meeting_id, user_id, username, google_cred),
+        daemon=True,
+    ).start()
+    observability.audit("drive.sync_request", meeting_id=meeting_id, owner=username)
+    return {"jobId": job_id, "status": "queued"}
+
+
 @app.post("/api/meetings/{meeting_id}/drive-sync")
 def drive_sync(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
     """회의록+오디오를 본인 Google Drive 로 내보내기/재동기화(백그라운드 잡) → {jobId}.
@@ -1452,22 +1476,111 @@ def drive_sync(meeting_id: str, user: dict = Depends(require_user_active)) -> di
             status_code=400,
             detail={"error_code": "google_not_connected", "message": "Google Drive 연동이 필요합니다."},
         )
-    with _jobs_lock:
-        # 이미 진행 중인 동기화가 있으면 재사용(자동+수동/연속 저장 디둡 — 중복 폴더/Doc 레이스 방지).
-        existing = _drive_sync_inflight.get(meeting_id)
-        if existing is not None and _jobs.get(existing, {}).get("status") in ("queued", "processing"):
-            return {"jobId": existing, "status": _jobs[existing]["status"]}
-        job_id = uuid.uuid4().hex
-        _jobs[job_id] = {"status": "queued"}
-        _job_owner[job_id] = user["id"]
-        _drive_sync_inflight[meeting_id] = job_id
-    threading.Thread(
-        target=_run_drive_sync_job,
-        args=(job_id, meeting_id, user["id"], user["username"], google_cred),
-        daemon=True,
-    ).start()
-    observability.audit("drive.sync_request", meeting_id=meeting_id, owner=user["username"])
-    return {"jobId": job_id, "status": "queued"}
+    return _start_drive_sync(meeting_id, user["id"], user["username"], google_cred)
+
+
+def _ensure_drive_doc(access_token: str, m: dict, google_cred: dict, username: str) -> str:
+    """회의의 Drive 회의록 Doc 을 보장 → docId. 없으면 폴더/하위폴더 확보 후 생성·영속(멱등).
+
+    이메일 첨부(export)용으로 Doc 만 만든다(오디오는 후속 백그라운드 동기화가 담당). 새로 만들면
+    gdriveRef(docId/folderId/docUrl) 를 meeting.data 에 병합 저장해 이후 동기화가 재사용한다.
+    """
+    gref = m.get("gdriveRef") or {}
+    doc_id = gref.get("docId")
+    if doc_id:
+        return doc_id
+    folder_id = google_drive.ensure_root_folder(access_token, google_cred.get("root_folder_id"))
+    if folder_id != google_cred.get("root_folder_id"):
+        auth.set_google_root_folder(username, folder_id)
+    subfolder_id = google_drive.ensure_subfolder(
+        access_token, folder_id, _drive_subfolder_name(m), gref.get("folderId")
+    )
+    html = meeting_doc.render_meeting_html(m, max_transcript_segments=DRIVE_MAX_TRANSCRIPT_SEGMENTS)
+    doc_id = google_drive.upsert_doc(access_token, subfolder_id, html, "회의록", None)
+    new_ref = {
+        **gref,
+        "docId": doc_id,
+        "folderId": subfolder_id,
+        "docUrl": f"https://docs.google.com/document/d/{doc_id}/edit",
+        "syncedAt": _now_iso(),
+    }
+    store.update_if_match(m["id"], {"gdriveRef": new_ref}, None)
+    return doc_id
+
+
+def _clean_email_list(raw: object) -> list[str]:
+    """이메일 리스트 정리 — '@' 포함·중복(대소문자 무시) 제거. 리스트 아니면 빈 리스트."""
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in raw:
+        e = str(x or "").strip()
+        if "@" in e and len(e) <= MAX_NAME_LEN and e.lower() not in seen:
+            seen.add(e.lower())
+            out.append(e)
+    return out
+
+
+@app.post("/api/meetings/{meeting_id}/send-email")
+def send_meeting_email(
+    meeting_id: str, payload: dict, user: dict = Depends(require_user_active)
+) -> dict:
+    """회의록을 참석자에게 이메일 발송(본인 Gmail). 본문=요약+액션, 첨부=회의록 PDF.
+
+    body: {to:[...], cc:[...], subject?}. 소유자만. 미연동 400(google_not_connected),
+    gmail.send 미동의 400(google_scope_missing → 재연동), 만료 400(google_auth_expired).
+    발송 성공 시 회의록/오디오 Drive 영속(백그라운드) 도 함께 트리거한다.
+    """
+    _require_hex32(meeting_id, what="meetingId")
+    m = _owned_or_404(meeting_id, user)  # 소유·존재 게이트
+    google_cred = auth.get_google_credential(user["username"])
+    if not google_cred:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": "google_not_connected", "message": "Google 연동이 필요합니다."},
+        )
+    to = _clean_email_list(payload.get("to"))
+    cc = _clean_email_list(payload.get("cc"))
+    if not to:
+        raise HTTPException(status_code=422, detail="받는사람(수신자) 이메일이 최소 1명 필요합니다.")
+    subject = str(payload.get("subject") or "").strip() or meeting_doc.doc_title(m)
+    try:
+        access = google_oauth.refresh_access_token(google_cred["refresh_token"])
+        doc_id = _ensure_drive_doc(access, m, google_cred, user["username"])
+        pdf = google_drive.export_doc(access, doc_id, "application/pdf")
+        html = meeting_doc.render_email_body(m)
+        sender = google_cred.get("email") or user["username"]
+        pdf_name = f"{_sanitize_drive_name(meeting_doc.doc_title(m))}.pdf"
+        msg_id = google_gmail.send_message(
+            access, sender=sender, to=to, cc=cc, subject=subject,
+            html_body=html, attachment=pdf, attachment_name=pdf_name,
+        )
+    except google_oauth.GoogleAuthExpired as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": "google_auth_expired", "message": "Google 재연동이 필요합니다."},
+        ) from e
+    except google_gmail.GmailScopeMissing as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "google_scope_missing",
+                "message": "메일 발송 권한 동의가 필요합니다. Google 연동을 다시 진행해 주세요.",
+            },
+        ) from e
+    except (google_gmail.GoogleGmailError, google_drive.GoogleDriveError, google_oauth.GoogleOAuthError) as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=502,
+            detail={"error_code": "email_send_failed", "message": f"이메일 발송 실패: {e}"},
+        ) from e
+    # 발송 성공 → 회의록/오디오 Drive 영속(백그라운드; Doc 존재하므로 재생성 없이 오디오+정리).
+    _start_drive_sync(meeting_id, user["id"], user["username"], google_cred)
+    observability.audit(
+        "email.sent", meeting_id=meeting_id, owner=user["username"], to=len(to), cc=len(cc)
+    )
+    return {"ok": True, "messageId": msg_id, "sentTo": to, "cc": cc}
 
 
 # ---------- Google Calendar 양방향 연동 ----------
