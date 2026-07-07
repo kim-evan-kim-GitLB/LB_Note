@@ -189,6 +189,35 @@ def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
 
 
+# KST(고정 +9, DST 없음) — Drive 하위 폴더 이름의 날짜/시간 스탬프용.
+_KST = dt.timezone(dt.timedelta(hours=9))
+
+
+def _kst_stamp(iso: str) -> str:
+    """ISO 타임스탬프(UTC) → KST `YYYY-MM-DD_HHMM`. 파싱 실패 시 빈 문자열."""
+    try:
+        d = dt.datetime.fromisoformat(iso.strip())
+    except (ValueError, AttributeError):
+        return ""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.astimezone(_KST).strftime("%Y-%m-%d_%H%M")
+
+
+def _sanitize_drive_name(name: str) -> str:
+    """Drive 폴더/파일 이름으로 안전하게 정리. 경로 구분자·제어문자 제거, 공백 정규화, 길이 제한."""
+    cleaned = "".join(("-" if c in "/\\" else c) for c in name if ord(c) >= 32)
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned[:100] or "회의록"
+
+
+def _drive_subfolder_name(m: dict) -> str:
+    """회의별 Drive 하위 폴더 이름 `{회의명}_{YYYY-MM-DD}_{HHMM}`(KST). createdAt 기준으로 안정적."""
+    title = _sanitize_drive_name(str(m.get("title") or "").strip() or "회의록")
+    stamp = _kst_stamp(str(m.get("createdAt") or ""))
+    return f"{title}_{stamp}" if stamp else title
+
+
 # If-Match `*`(존재하면 일치) 표식. 비교를 생략하되, 락 안에서 "존재" 자체는 보장된다.
 _IF_MATCH_ANY = object()
 
@@ -488,6 +517,9 @@ _jobs: dict[str, dict] = {}
 # job_id → ownerId. 잡 결과(STT contract·재요약 미리보기)는 회의 파생 데이터이므로 소유격리한다
 # (jobId 유출 시 타 사용자 폴링 차단). 잡 워커는 상태 dict 를 통째 교체하므로 소유자는 별도 맵에 둔다.
 _job_owner: dict[str, str] = {}
+# meeting_id → 진행 중 drive-sync job_id. 저장 시 자동 동기화 + 수동 버튼이 같은 회의에 동시에
+# 걸릴 때 중복 잡(→ 하위폴더/Doc 중복 생성 레이스)을 막는다. 잡 종료 시 해제. _jobs_lock 로 보호.
+_drive_sync_inflight: dict[str, str] = {}
 _jobs_lock = threading.Lock()
 
 # 동시 STT 추론 제한(백프레셔). GPU 1장에 요청마다 모델을 load 하므로, 동시에 N개만 돌리고
@@ -978,9 +1010,10 @@ def _delete_google_assets_async(
     연동 해제 상태면 조용히 skip."""
     doc_id = (gdrive_ref or {}).get("docId")
     audio_id = (gdrive_ref or {}).get("audioId")
+    folder_id = (gdrive_ref or {}).get("folderId")
     event_id = (gcal_ref or {}).get("eventId")
     cal_id = (gcal_ref or {}).get("calendarId") or DEFAULT_CALENDAR_ID
-    if not (doc_id or audio_id or event_id):
+    if not (doc_id or audio_id or folder_id or event_id):
         return
 
     def _run() -> None:
@@ -989,7 +1022,12 @@ def _delete_google_assets_async(
             return
         try:
             access_token = google_oauth.refresh_access_token(cred["refresh_token"])
-            if doc_id or audio_id:
+            root_id = cred.get("root_folder_id")
+            # 회의별 하위 폴더(LB_NOTE/{회의명_날짜})면 폴더째 삭제 → 빈 폴더 잔존 방지(내용 동반 삭제).
+            # 단, folderId 가 루트와 같으면(구 flat 회의) 루트 삭제 금지 — 개별 파일만 지운다.
+            if folder_id and folder_id != root_id:
+                google_drive.delete_files(access_token, [folder_id])
+            elif doc_id or audio_id:
                 google_drive.delete_files(access_token, [doc_id, audio_id])
             if event_id:
                 google_calendar.delete_event(access_token, event_id, calendar_id=cal_id)
@@ -1129,6 +1167,56 @@ def get_audio_token(meeting_id: str, user: dict = Depends(require_user_active)) 
     return {"token": token, "expiresIn": AUDIO_TOKEN_TTL}
 
 
+def _stream_audio_from_drive(m: dict, user: dict, range_header: str | None) -> Response:
+    """로컬 원본이 없는 회의의 오디오를 Drive 에서 Range 프록시 스트리밍(업로드 후 정리된 원본).
+
+    gdriveRef.audioId + 사용자 Google 연동 필요. 접근불가/미연동/만료/오류는 404 로 은닉(존재 노출
+    회피, 로컬 부재 404 와 동일 UX). 토큰은 캐시판(refresh_access_token_cached)으로 Range 폭주 완화.
+    """
+    gref = m.get("gdriveRef") or {}
+    audio_id = gref.get("audioId")
+    if not audio_id:
+        raise HTTPException(status_code=404, detail="오디오 없음")
+    cred = auth.get_google_credential(user["username"])
+    if not cred:
+        raise HTTPException(status_code=404, detail="오디오 없음")  # 연동 해제 → 접근 불가
+    try:
+        access = google_oauth.refresh_access_token_cached(cred["refresh_token"])
+        status, hdrs, reader = google_drive.stream_media(access, audio_id, range_header)
+    except (
+        google_oauth.GoogleAuthExpired,
+        google_oauth.GoogleOAuthError,
+        google_drive.GoogleDriveError,
+    ) as e:
+        raise HTTPException(status_code=404, detail="오디오 없음") from e
+    observability.incr("audio.stream.drive")
+    if status == 416:  # 범위 불만족 → 릴레이
+        return Response(
+            status_code=416,
+            headers={
+                "Content-Range": hdrs.get("Content-Range", "bytes */0"),
+                "Accept-Ranges": "bytes",
+            },
+        )
+    ext = (m.get("audioRef") or {}).get("format", "bin")
+    media_type = hdrs.get("Content-Type") or _AUDIO_MIME.get(ext, "application/octet-stream")
+
+    def _proxy():
+        try:
+            while chunk := reader.read(_RANGE_CHUNK):
+                yield chunk
+        finally:
+            with contextlib.suppress(Exception):
+                reader.close()
+
+    relay = {"Accept-Ranges": "bytes"}
+    if hdrs.get("Content-Range"):
+        relay["Content-Range"] = hdrs["Content-Range"]
+    if hdrs.get("Content-Length"):
+        relay["Content-Length"] = hdrs["Content-Length"]
+    return StreamingResponse(_proxy(), status_code=status, media_type=media_type, headers=relay)
+
+
 @app.get("/api/meetings/{meeting_id}/audio")
 def get_meeting_audio(
     meeting_id: str,
@@ -1147,7 +1235,8 @@ def get_meeting_audio(
     m = _owned_or_404(meeting_id, user)  # 소유자 격리
     path = audio_store.meeting_audio_path(meeting_id, m.get("audioRef"))
     if path is None:
-        raise HTTPException(status_code=404, detail="오디오 없음")
+        # 로컬 원본 부재 → Drive 업로드 후 정리됐으면 Drive 에서 프록시, 아니면 404.
+        return _stream_audio_from_drive(m, user, range_header)
     observability.incr("audio.stream")  # Range 1요청당 1(재생 1건은 보통 다수 요청)
     size = path.stat().st_size
     ext = (m.get("audioRef") or {}).get("format", "bin")
@@ -1292,11 +1381,16 @@ def _run_drive_sync_job(
             if folder_id != google_cred.get("root_folder_id"):
                 auth.set_google_root_folder(username, folder_id)
             gref = m.get("gdriveRef") or {}
-            title = meeting_doc.doc_title(m)
+            # 회의별 하위 폴더 확보(LB_NOTE/{회의명_날짜_시간}). 재싱크 시 gref.folderId 재사용.
+            subfolder_id = google_drive.ensure_subfolder(
+                access_token, folder_id, _drive_subfolder_name(m), gref.get("folderId")
+            )
             html = meeting_doc.render_meeting_html(
                 m, max_transcript_segments=DRIVE_MAX_TRANSCRIPT_SEGMENTS
             )
-            doc_id = google_drive.upsert_doc(access_token, folder_id, html, title, gref.get("docId"))
+            doc_id = google_drive.upsert_doc(
+                access_token, subfolder_id, html, "회의록", gref.get("docId")
+            )
             audio_id = gref.get("audioId")
             audio_ref = m.get("audioRef")
             if audio_ref:
@@ -1305,18 +1399,22 @@ def _run_drive_sync_job(
                     ext = (audio_ref.get("format") or "bin").strip().lower()
                     mime = _AUDIO_MIME.get(ext, "application/octet-stream")
                     audio_id = google_drive.upsert_audio(
-                        access_token, folder_id, path, mime, f"{title}.{ext}", gref.get("audioId")
+                        access_token, subfolder_id, path, mime, f"원본.{ext}", gref.get("audioId")
                     )
             doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
             new_ref = {
                 "docId": doc_id,
                 "audioId": audio_id,
-                "folderId": folder_id,
+                "folderId": subfolder_id,
                 "docUrl": doc_url,
                 "syncedAt": _now_iso(),
             }
             # gdriveRef 를 meeting.data 에 영속(서버 주도라 If-Match 없이 병합). 소유격리는 위에서 확인.
             store.update_if_match(meeting_id, {"gdriveRef": new_ref}, None)
+            # 원본 오디오가 Drive 에 안전히 올라갔으면(audioId 확정) 로컬 원본 삭제 → 디스크 회수.
+            # audioRef 메타(format/size)는 meeting.data 에 남아 재생 프록시가 Drive 에서 스트리밍한다.
+            if audio_id and audio_store.delete_meeting_audio(meeting_id):
+                observability.audit("audio.local_pruned", meeting_id=meeting_id, owner=username)
             with _jobs_lock:
                 _jobs[job_id] = {"status": "done", "result": {"gdriveRef": new_ref, "docUrl": doc_url}}
             observability.audit("drive.sync_done", meeting_id=meeting_id, owner=username)
@@ -1332,6 +1430,11 @@ def _run_drive_sync_job(
             traceback.print_exc()
             with _jobs_lock:
                 _jobs[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        finally:
+            # in-flight 해제(내가 등록한 잡일 때만) → 이후 동기화 재요청 허용.
+            with _jobs_lock:
+                if _drive_sync_inflight.get(meeting_id) == job_id:
+                    del _drive_sync_inflight[meeting_id]
 
 
 @app.post("/api/meetings/{meeting_id}/drive-sync")
@@ -1349,10 +1452,15 @@ def drive_sync(meeting_id: str, user: dict = Depends(require_user_active)) -> di
             status_code=400,
             detail={"error_code": "google_not_connected", "message": "Google Drive 연동이 필요합니다."},
         )
-    job_id = uuid.uuid4().hex
     with _jobs_lock:
+        # 이미 진행 중인 동기화가 있으면 재사용(자동+수동/연속 저장 디둡 — 중복 폴더/Doc 레이스 방지).
+        existing = _drive_sync_inflight.get(meeting_id)
+        if existing is not None and _jobs.get(existing, {}).get("status") in ("queued", "processing"):
+            return {"jobId": existing, "status": _jobs[existing]["status"]}
+        job_id = uuid.uuid4().hex
         _jobs[job_id] = {"status": "queued"}
         _job_owner[job_id] = user["id"]
+        _drive_sync_inflight[meeting_id] = job_id
     threading.Thread(
         target=_run_drive_sync_job,
         args=(job_id, meeting_id, user["id"], user["username"], google_cred),

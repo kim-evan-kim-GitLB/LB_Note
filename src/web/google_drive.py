@@ -11,7 +11,8 @@ from __future__ import annotations
 from pathlib import Path
 
 # 앱 전용 루트 폴더 이름(drive.file 스코프로 생성). 사용자 드라이브에 이 폴더가 보인다.
-ROOT_FOLDER_NAME = "회의록 (meetscript)"
+# 구조: LB_NOTE/{회의명_날짜_시간}/{회의록(Docs), 원본.{ext}}
+ROOT_FOLDER_NAME = "LB_NOTE"
 _FOLDER_MIME = "application/vnd.google-apps.folder"
 _DOC_MIME = "application/vnd.google-apps.document"
 
@@ -61,6 +62,47 @@ def ensure_root_folder(access_token: str, folder_id: str | None) -> str:
         ).execute()
     except HttpError as e:
         raise GoogleDriveError(f"루트 폴더 생성 실패: {e}") from e
+    return created["id"]
+
+
+def ensure_subfolder(
+    access_token: str, parent_id: str, name: str, folder_id: str | None
+) -> str:
+    """parent_id 아래 회의별 하위 폴더 확보 → 하위 폴더 id.
+
+    folder_id 가 유효하면 그대로 재사용(멱등 재동기화). 없거나 404/삭제면 parent 아래에서
+    name 으로 검색해 있으면 그 폴더, 없으면 새로 생성한다(중복 폴더 생성 방지).
+    """
+    service = _drive(access_token)
+    from googleapiclient.errors import HttpError
+
+    if folder_id:
+        try:
+            meta = service.files().get(fileId=folder_id, fields="id,trashed").execute()
+            if not meta.get("trashed"):
+                return meta["id"]
+        except HttpError as e:
+            if _status(e) not in (403, 404):
+                raise GoogleDriveError(f"하위 폴더 조회 실패: {e}") from e
+            # 403/404 → 폴더가 사라짐 → 아래에서 검색/재생성
+    escaped = name.replace("\\", "\\\\").replace("'", "\\'")  # Drive q 문자열 이스케이프
+    query = (
+        f"name = '{escaped}' and '{parent_id}' in parents "
+        f"and mimeType = '{_FOLDER_MIME}' and trashed = false"
+    )
+    try:
+        res = service.files().list(
+            q=query, fields="files(id)", pageSize=1, spaces="drive"
+        ).execute()
+        found = res.get("files") or []
+        if found:
+            return found[0]["id"]
+        created = service.files().create(
+            body={"name": name, "mimeType": _FOLDER_MIME, "parents": [parent_id]},
+            fields="id",
+        ).execute()
+    except HttpError as e:
+        raise GoogleDriveError(f"하위 폴더 생성 실패: {e}") from e
     return created["id"]
 
 
@@ -127,6 +169,36 @@ def upsert_audio(
     except HttpError as e:
         raise GoogleDriveError(f"오디오 업로드 실패: {e}") from e
     return response["id"]
+
+
+def stream_media(access_token: str, file_id: str, range_header: str | None):
+    """Drive 파일을 alt=media 로 GET → (status_code, headers: dict, reader) 릴레이용.
+
+    로컬 원본을 Drive 업로드 후 삭제한 회의의 오디오 재생 프록시. Range 헤더를 그대로 전달해
+    부분 응답(206)을 받고, 호출부가 status/헤더(Content-Range·Content-Length·Content-Type)를
+    클라이언트에 그대로 중계한다. reader 는 read(n) 가능한 file-like(스트리밍·close 는 호출부).
+    401/403/404 는 접근 불가 → GoogleDriveError(호출부가 404 로 은닉). 416 은 그대로 릴레이.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if range_header:
+        headers["Range"] = range_header
+    req = urllib.request.Request(url, headers=headers)  # 기본 GET
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)  # noqa: S310 — 고정 https 엔드포인트
+    except urllib.error.HTTPError as e:
+        if e.code == 416:  # 범위 불만족 → 헤더만 릴레이(본문 없음). fd 는 즉시 닫는다.
+            hdrs = e.headers
+            e.close()
+            return 416, hdrs, None
+        raise GoogleDriveError(f"Drive 오디오 GET 실패({e.code})") from e
+    except urllib.error.URLError as e:
+        raise GoogleDriveError(f"Drive 오디오 스트리밍 실패: {e}") from e
+    # resp.headers 는 email.message.Message → 케이스 무시 .get 지원(상류 헤더 케이스 변화에 강건).
+    return getattr(resp, "status", 200), resp.headers, resp
 
 
 def delete_files(access_token: str, file_ids: list[str]) -> int:
