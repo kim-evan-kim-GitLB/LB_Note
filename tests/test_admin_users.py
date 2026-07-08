@@ -149,6 +149,27 @@ def test_developer_role_normalized_to_user():
         assert updated["role"] == "user"
 
 
+def test_create_user_and_duplicate():
+    with tempfile.TemporaryDirectory() as td:
+        _auth, store = _fresh_auth(Path(td))
+        assert store.create_user("newbie", "litbig1234", display_name="새사람", role="user") is True
+        row = store.get("newbie")
+        assert row is not None
+        assert row["must_change_password"] == 1  # 첫 로그인 시 강제 변경
+        assert row["display_name"] == "새사람" and row["role"] == "user"
+        # 중복 생성 거부 — 기존 비번/역할을 덮지 않는다(upsert 와 다름)
+        assert store.create_user("newbie", "other", role="admin") is False
+        assert store.get("newbie")["role"] == "user"
+
+
+def test_delete_user_store():
+    with tempfile.TemporaryDirectory() as td:
+        _auth, store = _fresh_auth(Path(td))
+        assert store.delete("dev") is True
+        assert store.get("dev") is None
+        assert store.delete("ghost") is False
+
+
 # ---------- HTTP: 관리자 엔드포인트 ----------
 @contextlib.contextmanager
 def _client_for(td: Path, users: str):
@@ -308,6 +329,81 @@ def test_http_directory_lean_and_authenticated():
         assert "role" not in r.text and "mustChangePassword" not in r.text
         # 미인증 401
         assert client.get("/api/directory").status_code == 401
+
+
+def test_http_create_user():
+    with _tmp() as (auth, appmod, client):
+        ha = _headers(auth, appmod, "admin")
+        # 비관리자 403
+        hd = _headers(auth, appmod, "dev")
+        assert client.post(
+            "/api/admin/users", json={"username": "u1"}, headers=hd
+        ).status_code == 403
+        # 미인증 401
+        assert client.post("/api/admin/users", json={"username": "u1"}).status_code == 401
+        # 생성 201 + shape + mustChangePassword=True, 초기 비번 미노출
+        r = client.post(
+            "/api/admin/users", json={"username": "newbie", "displayName": "새사람"}, headers=ha
+        )
+        assert r.status_code == 201
+        j = r.json()
+        assert j["username"] == "newbie" and j["displayName"] == "새사람"
+        assert j["role"] == "user" and j["mustChangePassword"] is True
+        # 초기 비번은 1회 반환(관리자가 사용자에게 전달용) — 해시는 절대 미노출
+        assert j["initialPassword"] == "litbig1234" and "password_hash" not in r.text
+        # 목록 반영
+        names = {u["username"] for u in client.get("/api/admin/users", headers=ha).json()["users"]}
+        assert "newbie" in names
+        # 중복 409
+        assert client.post(
+            "/api/admin/users", json={"username": "newbie"}, headers=ha
+        ).status_code == 409
+        # 공백/스페이스 포함 username 422
+        assert client.post(
+            "/api/admin/users", json={"username": "   "}, headers=ha
+        ).status_code == 422
+        assert client.post(
+            "/api/admin/users", json={"username": "a b"}, headers=ha
+        ).status_code == 422
+        # 잘못된 role 422
+        assert client.post(
+            "/api/admin/users", json={"username": "u2", "role": "super"}, headers=ha
+        ).status_code == 422
+
+
+def test_http_create_user_can_login_with_initial_password():
+    with _tmp() as (auth, appmod, client):
+        ha = _headers(auth, appmod, "admin")
+        client.post("/api/admin/users", json={"username": "flowuser", "role": "admin"}, headers=ha)
+        # 서버 기본 초기 비번으로 로그인 가능(생성 시 발급된 값)
+        lr = client.post(
+            "/api/auth/login",
+            json={"username": "flowuser", "password": appmod.NEW_USER_INITIAL_PASSWORD},
+        )
+        assert lr.status_code == 200
+        # 생성 role(admin) 반영
+        got = next(
+            u for u in client.get("/api/admin/users", headers=ha).json()["users"]
+            if u["username"] == "flowuser"
+        )
+        assert got["role"] == "admin"
+
+
+def test_http_delete_user():
+    with _tmp() as (auth, appmod, client):
+        ha = _headers(auth, appmod, "admin")
+        # 비관리자 403 / 미인증 401
+        hd = _headers(auth, appmod, "dev")
+        assert client.delete("/api/admin/users/dev", headers=hd).status_code == 403
+        assert client.delete("/api/admin/users/dev").status_code == 401
+        # 없는 사용자 404
+        assert client.delete("/api/admin/users/ghost", headers=ha).status_code == 404
+        # 본인 삭제 409
+        assert client.delete("/api/admin/users/admin", headers=ha).status_code == 409
+        # 일반 사용자 삭제 200 → 목록에서 제거
+        assert client.delete("/api/admin/users/dev", headers=ha).status_code == 200
+        names = {u["username"] for u in client.get("/api/admin/users", headers=ha).json()["users"]}
+        assert "dev" not in names
 
 
 def _run():
