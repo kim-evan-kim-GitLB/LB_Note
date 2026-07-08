@@ -6,7 +6,8 @@ Google 이 Docs 네이티브 문서로 변환한다(target mimeType=application/
 text/markdown import 는 공식 미보증이라 제외한다(설계 결정, docs/2026-06-26...).
 
 렌더 대상(meeting.data JSON, 프론트 types.ts 보존):
-  - summary.agenda: [{no, title, decisions:[...], issues:[...]}] → h2/h3 + 목록
+  - summary.agenda: [{no, title, time_range, points:[{text,anchor}], decisions:[...], issues:[...]}]
+      → h3(안건 제목+시간범위) + points 목록(논의 본문) + 결정사항/이슈 목록
   - actionItems: [{text, owner, due, anchor, item_id}] → owner/due 표기 목록
   - transcript: [{segmentId, timestamp, speakerId, text, edited}] → 화자·시각 문단
   - participants: [...] → 머리말 목록
@@ -18,12 +19,27 @@ text/markdown import 는 공식 미보증이라 제외한다(설계 결정, docs
 """
 from __future__ import annotations
 
+import datetime as dt
 import html
+
+# KST(고정 +9, DST 없음) — 문서/이메일 제목의 날짜·시간 스탬프용(app._KST 와 동일 규약).
+_KST = dt.timezone(dt.timedelta(hours=9))
 
 
 def _esc(value: object) -> str:
     """None/숫자 포함 임의 값을 안전한 HTML 텍스트로. 개행은 그대로(문단 처리는 호출부)."""
     return html.escape(str(value if value is not None else ""), quote=False)
+
+
+def _title_stamp(iso: str) -> str:
+    """ISO 타임스탬프(UTC 또는 naive) → KST `YYYY-MM-DD HH:MM`. 파싱 실패 시 빈 문자열."""
+    try:
+        d = dt.datetime.fromisoformat(iso.strip())
+    except (ValueError, AttributeError):
+        return ""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.astimezone(_KST).strftime("%Y-%m-%d %H:%M")
 
 
 def _item_text(item: object) -> str:
@@ -38,10 +54,16 @@ def _item_text(item: object) -> str:
 
 
 def doc_title(meeting: dict) -> str:
-    """드라이브 문서 제목. meeting.title 우선, 없으면 생성일 기반 폴백."""
+    """문서/이메일 제목. `{meeting.title} (YYYY-MM-DD HH:MM)`(KST, createdAt 기준).
+
+    제목 뒤에 생성 날짜·시간을 붙여 회의록을 시각으로 구분한다(앱/DB 의 title 자체는 불변 —
+    이 스탬프는 표시용 파생값이라 재동기화해도 createdAt 기준으로 안정적, 중복 스탬프 없음).
+    title 이 없으면 생성일 기반 폴백(스탬프 없이)한다.
+    """
     title = str(meeting.get("title") or "").strip()
     if title:
-        return title
+        stamp = _title_stamp(str(meeting.get("createdAt") or ""))
+        return f"{title} ({stamp})" if stamp else title
     created = str(meeting.get("createdAt") or "").strip()
     return f"회의록 {created}" if created else "회의록"
 
@@ -65,7 +87,21 @@ def _render_summary(meeting: dict) -> list[str]:
         no = block.get("no")
         title = _item_text(block) or "안건"
         heading = f"{no}. {title}" if no is not None else title
+        time_range = str(block.get("time_range") or "").strip()
+        if time_range:
+            heading = f"{heading} ({time_range})"
         out.append(f"<h3>{_esc(heading)}</h3>")
+        # 안건별 논의 내용(요약의 본문). points[].text 를 anchor 시각과 함께 목록으로 렌더한다.
+        # 이 블록이 누락되면 안건 제목만 남고 실제 요약이 통째로 사라진다(핵심 수정 지점).
+        points = [p for p in (block.get("points") or []) if _item_text(p).strip()]
+        if points:
+            out.append("<ul>")
+            for p in points:
+                text = _esc(_item_text(p))
+                anchor = str(p.get("anchor") or "").strip() if isinstance(p, dict) else ""
+                suffix = f" <em>({_esc(anchor)})</em>" if anchor else ""
+                out.append(f"<li>{text}{suffix}</li>")
+            out.append("</ul>")
         decisions = [d for d in (block.get("decisions") or []) if _item_text(d).strip()]
         if decisions:
             out.append("<p><strong>결정사항</strong></p><ul>")

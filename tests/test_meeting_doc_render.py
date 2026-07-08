@@ -24,6 +24,11 @@ _MEETING = {
             {
                 "no": 1,
                 "title": "출시 일정",
+                "time_range": "12:00 ~ 15:30",
+                "points": [
+                    {"text": "베타 피드백 반영 후 배포 일정을 확정했다", "anchor": "12:10"},
+                    {"text": "QA 범위를 핵심 플로우로 좁히기로 논의", "anchor": "13:05"},
+                ],
                 "decisions": [{"text": "7월 2주차 배포"}, "QA 우선"],
                 "issues": ["도메인 확보 필요"],
             }
@@ -42,8 +47,14 @@ _MEETING = {
 
 def test_render_contains_all_sections():
     html = meeting_doc.render_meeting_html(_MEETING)
-    assert "<h1>6월 기획 회의</h1>" in html
+    # 제목 뒤에 KST 날짜·시간 스탬프(UTC 01:00 → KST 10:00)
+    assert "<h1>6월 기획 회의 (2026-06-30 10:00)</h1>" in html
     assert "요약" in html and "출시 일정" in html
+    assert "12:00 ~ 15:30" in html  # 안건 time_range 가 제목에 표기
+    # points(논의 본문)가 실제로 렌더된다 — 이게 빠지면 안건 제목만 남는 회귀
+    assert "베타 피드백 반영 후 배포 일정을 확정했다" in html
+    assert "QA 범위를 핵심 플로우로 좁히기로 논의" in html
+    assert "12:10" in html  # point anchor 시각
     assert "7월 2주차 배포" in html and "QA 우선" in html  # dict·str 둘 다
     assert "도메인 확보 필요" in html
     assert "액션 아이템" in html and "도메인 신청" in html
@@ -78,8 +89,15 @@ def test_max_transcript_segments_truncates():
     assert "일부만 표시" in html
 
 
-def test_doc_title_fallback():
+def test_doc_title_stamp_and_fallback():
+    # title + createdAt → 뒤에 KST 날짜·시간 스탬프(UTC 01:00 → KST 10:00)
+    assert (
+        meeting_doc.doc_title({"title": "제목", "createdAt": "2026-06-30T01:00:00+00:00"})
+        == "제목 (2026-06-30 10:00)"
+    )
+    # createdAt 없으면 스탬프 없이 title 그대로
     assert meeting_doc.doc_title({"title": "제목"}) == "제목"
+    # title 없으면 생성일 기반 폴백(스탬프 미적용)
     assert meeting_doc.doc_title({"createdAt": "2026-06-30"}) == "회의록 2026-06-30"
     assert meeting_doc.doc_title({}) == "회의록"
 
