@@ -319,6 +319,13 @@ class AdminResetPasswordRequest(BaseModel):
     newPassword: str
 
 
+class AdminUserCreateRequest(BaseModel):
+    """관리자 신규 사용자 생성. username 필수, role 기본 'user'. 초기 비번은 서버 기본값."""
+    username: str
+    displayName: str | None = None
+    role: str = "user"
+
+
 class GoogleOAuthConfigRequest(BaseModel):
     """관리자 앱 OAuth 클라이언트 설정(client_id/secret/redirect_uri). 셋 다 필수."""
     clientId: str
@@ -328,6 +335,10 @@ class GoogleOAuthConfigRequest(BaseModel):
 
 # 셀프 비번 변경 시 새 비밀번호 최소 길이.
 MIN_PASSWORD_LEN = 8
+
+# 관리자 신규 생성 계정의 초기 비밀번호(첫 로그인 시 강제 변경). env 로 교체 가능.
+# 공용 기본 비번은 강제 변경 게이트(must_change_password=1)로 위험을 완화한다.
+NEW_USER_INITIAL_PASSWORD = os.environ.get("WEB_NEW_USER_INITIAL_PASSWORD", "litbig1234")
 
 # 표시명 필드 최대 길이.
 MAX_NAME_LEN = 64
@@ -1846,6 +1857,54 @@ def admin_reset_password(
     if not auth.admin_reset_password(username, new_pw):
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
     observability.audit("admin.user.reset_password", user=user["username"], target=username)
+    return {"ok": True}
+
+
+@app.post("/api/admin/users", status_code=201)
+def admin_create_user(
+    req: AdminUserCreateRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """관리자 신규 사용자 생성. 초기 비번은 서버 기본값(NEW_USER_INITIAL_PASSWORD)이며 대상은
+    첫 로그인 시 강제 변경한다(must_change_password=1). username 중복이면 409, 생성된 사용자
+    (비번 미포함)를 반환한다.
+    """
+    username = (req.username or "").strip()
+    if not username or any(c.isspace() for c in username):
+        raise HTTPException(status_code=422, detail="username 은 공백 없이 입력해야 합니다.")
+    if req.role not in ("user", "admin"):
+        raise HTTPException(status_code=422, detail="role 은 'user'|'admin' 만 허용됩니다.")
+    display_name = username
+    if req.displayName is not None:
+        display_name = _clean_name(req.displayName, field="displayName", required=False) or username
+    if not auth.create_user(
+        username, NEW_USER_INITIAL_PASSWORD, display_name=display_name, role=req.role
+    ):
+        raise HTTPException(status_code=409, detail="이미 존재하는 사용자입니다.")
+    observability.audit(
+        "admin.user.create", user=user["username"], target=username, role=req.role
+    )
+    created = next((u for u in auth.list_users() if u["username"] == username), None)
+    result = created or {"username": username, "displayName": display_name, "role": req.role}
+    # 관리자가 신규 사용자에게 전달할 초기 비번을 1회 반환한다(첫 로그인 시 강제 변경 대상).
+    return {**result, "initialPassword": NEW_USER_INITIAL_PASSWORD}
+
+
+@app.delete("/api/admin/users/{username}")
+def admin_delete_user(username: str, user: dict = Depends(require_admin)) -> dict:
+    """관리자 사용자 삭제. 계정만 제거하고 소유 회의록은 보존한다(소유자 없는 상태로 잔존).
+
+    가드: (a) 본인 삭제 금지, (b) 마지막 관리자 삭제 금지.
+    """
+    if username == user["username"]:
+        raise HTTPException(status_code=409, detail="본인 계정은 삭제할 수 없습니다.")
+    target = users.get(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+    if (target.get("role") or "user") == "admin" and auth.count_admins() <= 1:
+        raise HTTPException(status_code=409, detail="마지막 관리자는 삭제할 수 없습니다.")
+    if not auth.delete_user(username):
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+    observability.audit("admin.user.delete", user=user["username"], target=username)
     return {"ok": True}
 
 

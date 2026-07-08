@@ -214,6 +214,32 @@ class UserStore:
             )
             self._conn.commit()
 
+    def create_user(
+        self, username: str, password: str, *, display_name=None, role="user"
+    ) -> bool:
+        """관리자 신규 사용자 생성. 이미 존재하면 False(중복 거부 — upsert 와 달리 덮어쓰지 않음).
+
+        신규 계정은 must_change_password=1 → 첫 로그인 시 초기 비번을 강제 변경한다.
+        """
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO users "
+                    "(username, password_hash, display_name, role, must_change_password, created_at) "
+                    "VALUES (?,?,?,?,1,?)",
+                    (
+                        username,
+                        pbkdf2_sha256.hash(password),
+                        display_name or username,
+                        role,
+                        dt.datetime.now().isoformat(timespec="seconds"),
+                    ),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                return False  # username UNIQUE 충돌 = 이미 존재
+        return True
+
     def seed_user(self, username: str, password: str, *, display_name=None, role="user") -> None:
         """부팅 시드용 — 없으면 env 비번으로 생성, 있으면 **비번은 보존**하고 역할·표시명만 동기화.
 
@@ -911,6 +937,16 @@ def list_directory() -> list[dict]:
 def count_admins() -> int:
     """role='admin' 사용자 수."""
     return store().count_admins()
+
+
+def create_user(username: str, password: str, *, display_name=None, role="user") -> bool:
+    """관리자 신규 사용자 생성(싱글턴 store 위임). 이미 존재하면 False."""
+    return store().create_user(username, password, display_name=display_name, role=role)
+
+
+def delete_user(username: str) -> bool:
+    """사용자 삭제(싱글턴 store 위임). 대상 없으면 False. 소유 회의록 등은 보존한다."""
+    return store().delete(username)
 
 
 # ---- FastAPI 의존성: Bearer 토큰 검증 → 현재 사용자 ----
