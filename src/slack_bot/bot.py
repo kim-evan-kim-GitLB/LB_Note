@@ -65,7 +65,7 @@ def dispatch(text: str, user_id: str, channel_id: str, say, slack_client) -> Non
             if not rest:
                 say("공지 내용을 입력해 주세요. 예) `공지 오늘 18시 서버 점검`")
             else:
-                say(handlers.handle_notice(slack_client, rest, channel_id))
+                say(handlers.handle_notice(slack_client, rest, channel_id, user_id))
         elif cmd == "requirement":
             if not rest:
                 say("요구사항 내용을 입력해 주세요. 예) `요구사항 화자분리 기능`")
