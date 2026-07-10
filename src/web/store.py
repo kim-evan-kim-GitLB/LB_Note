@@ -77,6 +77,18 @@ CREATE TABLE IF NOT EXISTS requirements (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_requirements_status ON requirements(status, id DESC);
+
+-- 공지사항(웹 관리자 콘솔 작성 → Slack 봇 `공지` 가 최신 활성 공지를 읽어 배포). active=1 만 노출.
+CREATE TABLE IF NOT EXISTS notices (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT,                            -- 선택(제목)
+    body       TEXT NOT NULL,                   -- 공지 본문
+    active     INTEGER NOT NULL DEFAULT 1,      -- 1=활성(배포/노출 대상), 0=숨김
+    created_by TEXT,                            -- 작성 관리자 username
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notices_active ON notices(active, id DESC);
 """
 
 
@@ -436,3 +448,101 @@ class RequirementStore:
                     "FROM requirements ORDER BY id DESC"
                 ).fetchall()
         return [dict(r) for r in rows]
+
+
+class NoticeStore:
+    """공지사항 저장(스레드 안전). 웹 관리자 콘솔이 작성/관리하고 Slack 봇이 최신 활성 공지를 읽는다.
+
+    RequirementStore 와 동일 패턴(같은 DB, 독립 연결/락). 스키마는 _SCHEMA 로 idempotent 보장.
+    """
+
+    _COLS = "id, title, body, active, created_by, created_at, updated_at"
+
+    def __init__(self, db_path: Path | str | None = None) -> None:
+        self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+        _guard_default_db(self.db_path.resolve())
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        with self._lock:
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
+
+    def add(self, body: str, *, title: str | None = None, created_by: str | None = None) -> dict:
+        """공지 1건 작성(active=1) → 생성 행 dict. created_at/updated_at 은 동일 시각."""
+        now = _now_iso_micro()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO notices (title, body, active, created_by, created_at, updated_at) "
+                "VALUES (?,?,1,?,?,?)",
+                (title, body, created_by, now, now),
+            )
+            self._conn.commit()
+            rowid = cur.lastrowid
+        return self.get(rowid)  # type: ignore[return-value]
+
+    def get(self, notice_id: int) -> dict | None:
+        """단건 조회. 없으면 None."""
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._COLS} FROM notices WHERE id=?", (notice_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest(self) -> dict | None:
+        """가장 최근 **활성**(active=1) 공지. 없으면 None. 봇 `공지` 가 읽는 진입점."""
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._COLS} FROM notices WHERE active=1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list(self) -> list[dict]:
+        """전체 공지 목록(최신 id 우선) — 관리자 콘솔용."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._COLS} FROM notices ORDER BY id DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update(
+        self,
+        notice_id: int,
+        *,
+        body: str | None = None,
+        title: str | None = None,
+        active: bool | None = None,
+    ) -> dict | None:
+        """지정 필드만 갱신(None 은 미변경). 대상 없으면 None. updated_at 갱신."""
+        sets: list[str] = []
+        params: list = []
+        if body is not None:
+            sets.append("body=?")
+            params.append(body)
+        if title is not None:
+            sets.append("title=?")
+            params.append(title)
+        if active is not None:
+            sets.append("active=?")
+            params.append(1 if active else 0)
+        if not sets:
+            return self.get(notice_id)  # 변경 없음 → 현재 상태 반환
+        sets.append("updated_at=?")
+        params.append(_now_iso_micro())
+        params.append(notice_id)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE notices SET {', '.join(sets)} WHERE id=?", params
+            )
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+        return self.get(notice_id)
+
+    def delete(self, notice_id: int) -> bool:
+        """공지 삭제. 삭제된 행이 있으면 True."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM notices WHERE id=?", (notice_id,))
+            self._conn.commit()
+            return cur.rowcount > 0

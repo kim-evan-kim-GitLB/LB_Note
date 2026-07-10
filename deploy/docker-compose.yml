@@ -81,14 +81,6 @@ services:
     environment:
       # 호스트 loopback 이 아니라 compose 서비스 DNS 로 웹 API 호출(웹은 8088 을 호스트에 안 엶).
       LBNOTE_API_BASE: "http://meetscript:8088"
-    # `상태` 명령의 GPU 라인(nvidia-smi)용. GPU 미할당이어도 봇은 동작(해당 라인만 생략).
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 
   # ----- TLS 리버스 프록시 -----
   # meetscript 앞단에서 HTTPS 를 종단한다(자체 CA). 사용자는 https://<LAN-IP>:HOST_PORT 로

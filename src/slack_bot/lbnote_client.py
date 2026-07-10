@@ -82,6 +82,24 @@ def metrics() -> dict:
     return _request("GET", "/api/admin/metrics", admin=True)
 
 
+def get_user_role(username: str) -> str | None:
+    """LB Note 계정 role 조회(admin 권한). 매칭 계정 없으면 None.
+
+    공지 권한 게이트용 — 요청자 Slack 이메일(==username 가정)로 관리자 명부에서 role 을 찾는다.
+    `GET /api/admin/users` 재사용(신규 엔드포인트 없이). username 정확 매칭.
+    """
+    data = _request("GET", "/api/admin/users", admin=True)
+    for u in data.get("users", []):
+        if u.get("username") == username:
+            return u.get("role")
+    return None
+
+
+def get_latest_notice() -> dict | None:
+    """가장 최근 활성 공지 조회(admin). 없으면 None. 봇 `공지` 가 읽어 배포한다."""
+    return _request("GET", "/api/notices/latest", admin=True).get("notice")
+
+
 def create_requirement(text: str, reporter: str | None) -> dict:
     """요구사항 적재(source='slack'). 생성 행(id 포함) 반환."""
     return _request(

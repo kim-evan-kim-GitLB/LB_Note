@@ -5,7 +5,6 @@ slack_bolt 를 import 하지 않는다(bot.py 전용). LB Note 호출은 lbnote_
 from __future__ import annotations
 
 import secrets
-import subprocess
 
 from src.slack_bot import config, lbnote_client
 
@@ -56,67 +55,75 @@ def handle_reset(slack_client, user_id: str) -> str:
 
 
 def handle_status(client) -> str:
-    """health + metrics(+GPU) 요약 블록. 절대 예외를 상위로 던지지 않는다(에러도 문자열)."""
-    lines: list[str] = ["*LB Note 서버 상태*"]
+    """일반 사용자용 서비스 상태 — '정상/주의' 한 줄 판정만. 내부 지표는 노출하지 않는다.
+
+    이 봇의 목적: 관리자가 없을 때 사용자가 '지금 LB Note 를 써도 되는지' 스스로 판단하고,
+    문제면 무엇을 해야 하는지 안다. 그래서 백엔드명·인증·GPU·디스크 수치 같은 운영 지표는 감추고
+    사용자 관점의 판정과 조치만 돌려준다. 절대 예외를 상위로 던지지 않는다(에러도 문자열).
+    """
+    # 1) 서버 응답(health) — 사용자에게 가장 중요한 '지금 되나?' 신호.
     try:
-        h = client.health()
-        lines.append(
-            "- 백엔드: clean="
-            f"{h.get('clean_backend')} / extract={h.get('extract_backend')} / "
-            f"summarize={h.get('summarize_backend')}"
+        client.health()
+    except Exception:  # noqa: BLE001
+        return (
+            "⚠️ 지금 LB Note 에 연결되지 않아요.\n"
+            "잠시 후 다시 시도해 주세요. 계속되면 관리자에게 알려주세요."
         )
-        lines.append(f"- 인증 사용자 수: {h.get('auth_users')}")
-        ca = h.get("claude_auth") or {}
-        lines.append(f"- Claude 인증: ok={ca.get('ok')} ({ca.get('reason', '')})")
-    except Exception as e:  # noqa: BLE001
-        lines.append(f"- health 조회 실패: {e}")
+    # 2) 저장 공간이 거의 차면 업로드가 실패할 수 있어 미리 알린다(수치는 숨김). metrics 는
+    #    관리자 조회라 실패할 수 있으나, 서버가 응답한 이상 사용에는 지장 없어 정상으로 본다.
     try:
-        m = client.metrics()
-        disk = m.get("disk") or {}
-        lines.append(
-            f"- 회의록: {m.get('meetings')}건 / 백업: {m.get('backups')}건"
-        )
-        if disk:
-            used_gb = (disk.get("used") or 0) / (1024**3)
-            total_gb = (disk.get("total") or 0) / (1024**3)
-            lines.append(
-                f"- 디스크: {used_gb:.1f}/{total_gb:.1f} GB ({disk.get('percent')}%)"
+        pct = (client.metrics().get("disk") or {}).get("percent")
+        if isinstance(pct, (int, float)) and pct >= 90:
+            return (
+                "⚠️ 저장 공간이 거의 찼어요.\n"
+                "회의록 업로드가 실패할 수 있으니 관리자에게 알려주세요."
             )
-    except Exception as e:  # noqa: BLE001
-        lines.append(f"- metrics 조회 실패: {e}")
-    gpu = _gpu_line()
-    if gpu:
-        lines.append(gpu)
-    return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        pass
+    return (
+        "✅ LB Note 정상 이용 가능\n"
+        "지금 회의록 업로드와 요약을 사용하실 수 있어요."
+    )
 
 
-def _gpu_line() -> str | None:
-    """nvidia-smi 로 GPU 사용률/메모리 1줄. 없으면 None(예외 삼킴)."""
+def handle_notice(slack_client, channel_id: str, user_id: str) -> str:
+    """공지 배포 — **LB Note 관리자(role=admin)만**. DB의 최신 활성 공지를 읽어 게시한다.
+
+    공지는 관리자→사용자 방향이라 권한 게이트를 둔다(요청자 Slack 이메일→LB Note role 확인).
+    내용은 웹 관리자 콘솔에서 작성되며(DB), 봇은 최신 공지를 읽어 SLACK_NOTICE_CHANNEL
+    (없으면 명령 채널)에 브로드캐스트한다.
+    """
+    # 1) 관리자 권한 확인(요청자 이메일 == LB Note username 가정).
     try:
-        out = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=utilization.gpu,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if out.returncode != 0 or not out.stdout.strip():
-            return None
-        first = out.stdout.strip().splitlines()[0]
-        util, mem_used, mem_total = (p.strip() for p in first.split(","))
-        return f"- GPU: 사용률 {util}% / 메모리 {mem_used}/{mem_total} MB"
+        info = slack_client.users_info(user=user_id)
+        email = (info["user"]["profile"] or {}).get("email")
     except Exception:
-        return None
-
-
-def handle_notice(slack_client, text: str, channel_id: str) -> str:
-    """공지 브로드캐스트 — SLACK_NOTICE_CHANNEL(없으면 명령 채널)로 게시."""
+        email = None
+    if not email:
+        return (
+            "공지 권한을 확인할 수 없습니다. "
+            "Slack 프로필에 회사 이메일이 설정되어 있는지 확인해 주세요."
+        )
+    try:
+        role = lbnote_client.get_user_role(email)
+    except Exception:
+        return "공지 권한 확인 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+    if role != "admin":
+        return "공지는 관리자만 배포할 수 있습니다."
+    # 2) DB 최신 공지 조회.
+    try:
+        notice = lbnote_client.get_latest_notice()
+    except Exception:
+        return "공지 조회 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+    if not notice or not (notice.get("body") or "").strip():
+        return "등록된 공지가 없습니다. 관리자 콘솔에서 공지를 먼저 등록해 주세요."
+    title = (notice.get("title") or "").strip()
+    body = notice["body"].strip()
+    text = "📢 *공지*\n" + (f"*{title}*\n" if title else "") + body
+    # 3) 브로드캐스트.
     target = config.SLACK_NOTICE_CHANNEL or channel_id
     try:
-        slack_client.chat_postMessage(channel=target, text=f"📢 *공지*\n{text}")
+        slack_client.chat_postMessage(channel=target, text=text)
     except Exception:
         return "공지 게시에 실패했습니다. 채널 설정을 확인해 주세요."
     return f"공지를 <#{target}> 채널에 게시했습니다."
@@ -128,7 +135,10 @@ def handle_requirement(client, text: str, reporter: str | None) -> str:
         created = client.create_requirement(text, reporter)
     except Exception:
         return "요구사항 접수 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
-    return f"요구사항 접수 완료 (#{created.get('id')})"
+    return (
+        f"요구사항이 접수됐어요. (접수번호 #{created.get('id')})\n"
+        "확인 후 반영하겠습니다. 감사합니다."
+    )
 
 
 def help_text() -> str:
@@ -136,9 +146,9 @@ def help_text() -> str:
     return (
         "*LB Note Bot 사용법*\n"
         "`@LBNoteBot <서브명령>` 또는 `/lbnote <서브명령>`\n"
-        "- `상태` / `status` — 서버 상태(백엔드·인증·디스크·GPU) 요약\n"
+        "- `상태` / `status` — 지금 LB Note 를 이용할 수 있는지 확인\n"
         "- `비번초기화` / `reset` — 본인 LB Note 비밀번호 초기화(임시비번 DM 전송)\n"
-        "- `공지 <내용>` / `notice <내용>` — 지정 채널에 공지 브로드캐스트\n"
+        "- `공지` / `notice` — 최근 공지를 배포(관리자 전용, 내용은 관리자 콘솔에서 작성)\n"
         "- `요구사항 <내용>` / `req <내용>` — 요구사항/건의 접수\n"
         "- `help` — 이 도움말"
     )

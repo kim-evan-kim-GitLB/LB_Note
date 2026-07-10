@@ -15,6 +15,8 @@
 | 비번초기화 권한 | **본인 셀프서비스** — 임시 비번은 **DM** 으로만 전달 |
 | 본인 증명 | **Slack 프로필 이메일 == LB Note `username`** 정확매칭 (가정) |
 | 공지 대상 | **Slack 채널 브로드캐스트만** (DB/웹 미저장) |
+| 공지 권한 | **LB Note `role=admin` 만** 배포(요청자 이메일→계정 role 확인, `GET /api/admin/users` 재사용) |
+| 공지 내용 소스 | **DB `notices` 테이블**(웹 관리자 콘솔 작성/관리). 봇은 최신 활성 공지를 읽어 배포. 웹앱 배너 노출로 확장 가능 |
 | 요구사항 저장 | **LB Note DB `requirements` 테이블 신설** |
 
 > **가정(중요):** LB Note 계정 `username` 이 곧 회사 이메일(`peter@litbig.com` 등, 56명 중 `admin` 만 예외).
@@ -53,8 +55,8 @@ Slack 워크스페이스
 | 서브명령 | 동작 | 응답 위치 |
 |----------|------|-----------|
 | `비번초기화` / `reset` | 요청자 이메일→username 매칭 → 임시비번 생성 → `admin_reset_password` 호출 → **DM 전송** | DM(비번), 채널엔 "DM 확인" 안내만 |
-| `상태` / `status` | health+metrics(+`nvidia-smi` 있으면 GPU) 요약 블록 | 채널 |
-| `공지 <내용>` / `notice` | 지정 공지 채널에 브로드캐스트(멘션 가능) | 채널 |
+| `상태` / `status` | **사용자용 '정상/주의' 한 줄 판정**(health 기반, 내부 수치 숨김) | 채널 |
+| `공지` / `notice` | **관리자(role=admin)만.** DB 최신 활성 공지(웹 콘솔 작성)를 읽어 배포 | 채널 |
 | `요구사항 <내용>` / `req` | `POST /api/requirements` 적재 | 채널(접수번호) |
 | `help` / (빈 멘션) | 사용법 안내 | 채널 |
 
