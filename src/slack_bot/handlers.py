@@ -86,11 +86,12 @@ def handle_status(client) -> str:
     )
 
 
-def handle_notice(slack_client, text: str, channel_id: str, user_id: str) -> str:
-    """공지 브로드캐스트 — **LB Note 관리자(role=admin)만** 배포 가능.
+def handle_notice(slack_client, channel_id: str, user_id: str) -> str:
+    """공지 배포 — **LB Note 관리자(role=admin)만**. DB의 최신 활성 공지를 읽어 게시한다.
 
-    공지는 관리자→사용자 방향이라 다른 셀프서비스 명령과 달리 권한 게이트를 둔다. 요청자 Slack
-    이메일→LB Note 계정 role 을 확인해 admin 이 아니면 거부한다(SLACK_NOTICE_CHANNEL 없으면 명령 채널).
+    공지는 관리자→사용자 방향이라 권한 게이트를 둔다(요청자 Slack 이메일→LB Note role 확인).
+    내용은 웹 관리자 콘솔에서 작성되며(DB), 봇은 최신 공지를 읽어 SLACK_NOTICE_CHANNEL
+    (없으면 명령 채널)에 브로드캐스트한다.
     """
     # 1) 관리자 권한 확인(요청자 이메일 == LB Note username 가정).
     try:
@@ -109,10 +110,20 @@ def handle_notice(slack_client, text: str, channel_id: str, user_id: str) -> str
         return "공지 권한 확인 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
     if role != "admin":
         return "공지는 관리자만 배포할 수 있습니다."
-    # 2) 관리자 확인됨 → 브로드캐스트.
+    # 2) DB 최신 공지 조회.
+    try:
+        notice = lbnote_client.get_latest_notice()
+    except Exception:
+        return "공지 조회 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+    if not notice or not (notice.get("body") or "").strip():
+        return "등록된 공지가 없습니다. 관리자 콘솔에서 공지를 먼저 등록해 주세요."
+    title = (notice.get("title") or "").strip()
+    body = notice["body"].strip()
+    text = "📢 *공지*\n" + (f"*{title}*\n" if title else "") + body
+    # 3) 브로드캐스트.
     target = config.SLACK_NOTICE_CHANNEL or channel_id
     try:
-        slack_client.chat_postMessage(channel=target, text=f"📢 *공지*\n{text}")
+        slack_client.chat_postMessage(channel=target, text=text)
     except Exception:
         return "공지 게시에 실패했습니다. 채널 설정을 확인해 주세요."
     return f"공지를 <#{target}> 채널에 게시했습니다."
@@ -137,7 +148,7 @@ def help_text() -> str:
         "`@LBNoteBot <서브명령>` 또는 `/lbnote <서브명령>`\n"
         "- `상태` / `status` — 지금 LB Note 를 이용할 수 있는지 확인\n"
         "- `비번초기화` / `reset` — 본인 LB Note 비밀번호 초기화(임시비번 DM 전송)\n"
-        "- `공지 <내용>` / `notice <내용>` — 공지 배포(관리자 전용)\n"
+        "- `공지` / `notice` — 최근 공지를 배포(관리자 전용, 내용은 관리자 콘솔에서 작성)\n"
         "- `요구사항 <내용>` / `req <내용>` — 요구사항/건의 접수\n"
         "- `help` — 이 도움말"
     )

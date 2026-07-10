@@ -95,6 +95,11 @@ def get_user_role(username: str) -> str | None:
     return None
 
 
+def get_latest_notice() -> dict | None:
+    """가장 최근 활성 공지 조회(admin). 없으면 None. 봇 `공지` 가 읽어 배포한다."""
+    return _request("GET", "/api/notices/latest", admin=True).get("notice")
+
+
 def create_requirement(text: str, reporter: str | None) -> dict:
     """요구사항 적재(source='slack'). 생성 행(id 포함) 반환."""
     return _request(

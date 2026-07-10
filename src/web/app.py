@@ -56,7 +56,12 @@ from src.web.service import (
     process_audio_to_contract,
     summarize_meeting,
 )
-from src.web.store import MeetingStore, PreconditionFailedError, RequirementStore
+from src.web.store import (
+    MeetingStore,
+    NoticeStore,
+    PreconditionFailedError,
+    RequirementStore,
+)
 # service import 가 config(load_dotenv)를 끌어와 .env 가 로드된 뒤 auth 를 가져온다(순서 주의).
 from src.web import auth
 
@@ -180,6 +185,7 @@ app.add_middleware(
 
 store = MeetingStore()
 req_store = RequirementStore()  # Slack 봇 요구사항 적재(같은 DB, 독립 연결)
+notice_store = NoticeStore()  # 공지사항(웹 콘솔 작성 → Slack 봇 배포, 같은 DB)
 users = auth.init()  # users 테이블 준비 + WEB_AUTH_USERS 시드/동기화
 
 
@@ -332,6 +338,19 @@ class RequirementCreateRequest(BaseModel):
     text: str
     source: str | None = None
     reporter: str | None = None
+
+
+class NoticeCreateRequest(BaseModel):
+    """공지 작성(관리자 콘솔). body 필수, title 선택."""
+    body: str
+    title: str | None = None
+
+
+class NoticeUpdateRequest(BaseModel):
+    """공지 수정 — 지정 필드만 갱신(모두 선택). active 로 노출/숨김 토글."""
+    body: str | None = None
+    title: str | None = None
+    active: bool | None = None
 
 
 class GoogleOAuthConfigRequest(BaseModel):
@@ -1893,6 +1912,59 @@ def list_requirements(
 ) -> dict:
     """요구사항 목록(관리자·웹 조회용). status 지정 시 그 상태만 필터."""
     return {"requirements": req_store.list(status)}
+
+
+# ---------- 공지사항(웹 콘솔 작성 → Slack 봇 배포) ----------
+# 라우트 순서 주의: 정적 경로 /api/notices/latest 를 동적 /{notice_id} 보다 먼저 정의한다.
+@app.post("/api/notices", status_code=201)
+def create_notice(
+    req: NoticeCreateRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """공지 작성(관리자). body 필수. 생성 행(id 포함) 반환."""
+    body = (req.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=422, detail="공지 내용이 비어 있습니다.")
+    title = (req.title or "").strip() or None
+    created = notice_store.add(body, title=title, created_by=user["username"])
+    observability.audit("notice.create", user=user["username"], notice_id=created["id"])
+    return created
+
+
+@app.get("/api/notices")
+def list_notices(user: dict = Depends(require_admin)) -> dict:
+    """전체 공지 목록(관리자 콘솔용, 최신 우선)."""
+    return {"notices": notice_store.list()}
+
+
+@app.get("/api/notices/latest")
+def latest_notice(user: dict = Depends(require_admin)) -> dict:
+    """가장 최근 활성 공지(Slack 봇 `공지` 가 읽음). 없으면 {"notice": null}."""
+    return {"notice": notice_store.latest()}
+
+
+@app.patch("/api/notices/{notice_id}")
+def update_notice(
+    notice_id: int, req: NoticeUpdateRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """공지 수정(관리자). 지정 필드만 갱신. body 를 빈 문자열로 지우는 것은 거부(422)."""
+    body = req.body.strip() if req.body is not None else None
+    if body is not None and not body:
+        raise HTTPException(status_code=422, detail="공지 내용은 비울 수 없습니다.")
+    title = req.title.strip() or None if req.title is not None else None
+    updated = notice_store.update(notice_id, body=body, title=title, active=req.active)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="공지를 찾을 수 없습니다.")
+    observability.audit("notice.update", user=user["username"], notice_id=notice_id)
+    return updated
+
+
+@app.delete("/api/notices/{notice_id}")
+def delete_notice(notice_id: int, user: dict = Depends(require_admin)) -> dict:
+    """공지 삭제(관리자)."""
+    if not notice_store.delete(notice_id):
+        raise HTTPException(status_code=404, detail="공지를 찾을 수 없습니다.")
+    observability.audit("notice.delete", user=user["username"], notice_id=notice_id)
+    return {"ok": True}
 
 
 @app.post("/api/admin/users", status_code=201)

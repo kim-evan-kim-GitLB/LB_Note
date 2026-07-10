@@ -62,10 +62,8 @@ def dispatch(text: str, user_id: str, channel_id: str, say, slack_client) -> Non
         elif cmd == "status":
             say(handlers.handle_status(lbnote_client))
         elif cmd == "notice":
-            if not rest:
-                say("공지 내용을 입력해 주세요. 예) `공지 오늘 18시 서버 점검`")
-            else:
-                say(handlers.handle_notice(slack_client, rest, channel_id, user_id))
+            # 공지는 웹 콘솔에서 작성된 최신 공지를 DB 에서 읽어 배포(관리자 전용).
+            say(handlers.handle_notice(slack_client, channel_id, user_id))
         elif cmd == "requirement":
             if not rest:
                 say("요구사항 내용을 입력해 주세요. 예) `요구사항 화자분리 기능`")
