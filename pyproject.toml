@@ -37,6 +37,8 @@ dependencies = [
 [project.optional-dependencies]
 cu121 = ["torch>=2.4,<2.6", "torchaudio>=2.5,<2.6"]
 cu128 = ["torch>=2.7", "torchaudio>=2.7"]
+# Slack 컨트롤 봇(독립 프로세스, Socket Mode). slack-bolt 가 slack_sdk 를 함께 끌어온다.
+slack = ["slack-bolt>=1.18"]
 
 [tool.uv]
 conflicts = [[{ extra = "cu121" }, { extra = "cu128" }]]
