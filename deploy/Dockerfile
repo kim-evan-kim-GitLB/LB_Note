@@ -45,7 +45,9 @@ WORKDIR /app
 # 아래 코드/프롬프트만 바뀐 재빌드는 무거운 uv sync 레이어를 캐시로 건너뛰어 수 초에 끝난다.
 # 앱은 `python -m src.web`(src 네임스페이스 실행)이라 프로젝트 자체 설치는 불필요 → --no-install-project.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project --no-dev --extra cu128
+# --extra slack: Slack 컨트롤 봇(slack-bolt)을 동일 이미지에 포함 → compose 의 slackbot
+# 서비스가 같은 이미지로 `python -m src.slack_bot` 을 실행한다(별도 이미지 불필요).
+RUN uv sync --frozen --no-install-project --no-dev --extra cu128 --extra slack
 
 # 런타임에 필요한 코드 + 데이터. 추출/요약/정제 프롬프트(prompts/)와 glossary(config/)가
 # 빠지면 추출 단계에서 FileNotFoundError 로 죽으므로 반드시 함께 복사한다.

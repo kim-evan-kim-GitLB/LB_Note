@@ -1,0 +1,37 @@
+# LB Note Slack 컨트롤 봇 — 앱 매니페스트 (붙여넣기용)
+#
+# 사용 절차(사용자 수동 1회):
+#   1. https://api.slack.com/apps → "Create New App" → "From an app manifest"
+#      → 워크스페이스 선택 → 아래 YAML 을 붙여넣어 앱 생성.
+#   2. Settings → Socket Mode 를 켠다(Enable Socket Mode).
+#   3. Basic Information → App-Level Tokens 에서 `connections:write` 스코프로
+#      App-Level Token 을 생성한다(값이 `xapp-...`).
+#   4. Install App → 워크스페이스에 설치(값이 `xoxb-...` Bot User OAuth Token).
+#   5. `/app/.env` 에 SLACK_BOT_TOKEN=xoxb-...  SLACK_APP_TOKEN=xapp-... 를 넣는다.
+#      (선택) SLACK_ALLOWED_CHANNELS, SLACK_NOTICE_CHANNEL 도 설정.
+#   6. 봇 기동: sudo /app/.venv/bin/python -m src.slack_bot
+display_information:
+  name: LB Note Bot
+settings:
+  socket_mode_enabled: true
+  event_subscriptions:
+    bot_events:
+      - app_mention
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - commands
+      - users:read
+      - users:read.email
+      - im:write
+features:
+  bot_user:
+    display_name: LBNoteBot
+    always_online: true
+  slash_commands:
+    - command: /lbnote
+      description: LB Note 컨트롤 봇 명령
+      usage_hint: 상태 | 비번초기화 | 공지 <내용> | 요구사항 <내용> | help
+      should_escape: false

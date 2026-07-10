@@ -56,7 +56,7 @@ from src.web.service import (
     process_audio_to_contract,
     summarize_meeting,
 )
-from src.web.store import MeetingStore, PreconditionFailedError
+from src.web.store import MeetingStore, PreconditionFailedError, RequirementStore
 # service import 가 config(load_dotenv)를 끌어와 .env 가 로드된 뒤 auth 를 가져온다(순서 주의).
 from src.web import auth
 
@@ -179,6 +179,7 @@ app.add_middleware(
 )
 
 store = MeetingStore()
+req_store = RequirementStore()  # Slack 봇 요구사항 적재(같은 DB, 독립 연결)
 users = auth.init()  # users 테이블 준비 + WEB_AUTH_USERS 시드/동기화
 
 
@@ -324,6 +325,13 @@ class AdminUserCreateRequest(BaseModel):
     username: str
     displayName: str | None = None
     role: str = "user"
+
+
+class RequirementCreateRequest(BaseModel):
+    """Slack 봇/웹 요구사항 적재. text 필수, source/reporter 선택."""
+    text: str
+    source: str | None = None
+    reporter: str | None = None
 
 
 class GoogleOAuthConfigRequest(BaseModel):
@@ -1858,6 +1866,33 @@ def admin_reset_password(
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
     observability.audit("admin.user.reset_password", user=user["username"], target=username)
     return {"ok": True}
+
+
+@app.post("/api/requirements", status_code=201)
+def create_requirement(
+    req: RequirementCreateRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """요구사항/건의 적재(Slack 봇·웹). text 필수, source 기본 'slack'. 생성 행(id 포함) 반환."""
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="요구사항 내용이 비어 있습니다.")
+    source = req.source or "slack"
+    created = req_store.add(text, source=source, reporter=req.reporter)
+    observability.audit(
+        "requirement.create",
+        user=user["username"],
+        reporter=(req.reporter or ""),
+        source=source,
+    )
+    return created
+
+
+@app.get("/api/requirements")
+def list_requirements(
+    status: str | None = Query(default=None), user: dict = Depends(require_admin)
+) -> dict:
+    """요구사항 목록(관리자·웹 조회용). status 지정 시 그 상태만 필터."""
+    return {"requirements": req_store.list(status)}
 
 
 @app.post("/api/admin/users", status_code=201)

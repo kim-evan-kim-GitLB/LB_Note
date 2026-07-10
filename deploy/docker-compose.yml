@@ -63,6 +63,33 @@ services:
       retries: 5
       start_period: 120s                 # 첫 요청 시 모델 로드 시간 고려
 
+  # ----- Slack 컨트롤 봇 (docs/2026-07-09-slack-control-bot.md) -----
+  # 웹 API 와 동일 이미지(meetscript-ai:171)를 재사용하되 엔트리포인트를 봇 모듈로 교체한다.
+  # 웹서버(:8088)는 호스트에 노출되지 않으므로(meetscript 는 expose 만), 봇은 compose 내부
+  # 네트워크에서 서비스명으로 호출한다: LBNOTE_API_BASE=http://meetscript:8088.
+  # Socket Mode(아웃바운드 WebSocket)라 인바운드 포트/공인 URL 개방은 없다. admin JWT 서명에
+  # 쓰는 JWT_SECRET 은 웹과 동일 .env.deploy 를 공유해야 토큰이 호환된다.
+  slackbot:
+    image: meetscript-ai:171            # meetscript 서비스가 빌드한 이미지를 그대로 사용(재빌드 없음)
+    container_name: meetscript-slackbot-171
+    restart: unless-stopped             # 좀비/크래시 시 자동 재시작(봇 프로세스 감시 정책)
+    depends_on:
+      - meetscript                      # 웹 이미지 빌드/기동 이후에 봇을 띄운다
+    entrypoint: ["python", "-m", "src.slack_bot"]  # /entrypoint.sh(웹) 대신 봇 모듈 실행
+    env_file:
+      - ./.env.deploy                   # SLACK_BOT_TOKEN·SLACK_APP_TOKEN·JWT_SECRET 공유
+    environment:
+      # 호스트 loopback 이 아니라 compose 서비스 DNS 로 웹 API 호출(웹은 8088 을 호스트에 안 엶).
+      LBNOTE_API_BASE: "http://meetscript:8088"
+    # `상태` 명령의 GPU 라인(nvidia-smi)용. GPU 미할당이어도 봇은 동작(해당 라인만 생략).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   # ----- TLS 리버스 프록시 -----
   # meetscript 앞단에서 HTTPS 를 종단한다(자체 CA). 사용자는 https://<LAN-IP>:HOST_PORT 로
   # 접속. 부수효과로 브라우저 보안 컨텍스트가 충족돼 마이크 녹음이 LAN 에서도 동작한다.

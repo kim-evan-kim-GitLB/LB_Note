@@ -66,6 +66,17 @@ CREATE TABLE IF NOT EXISTS meeting_backup (
     data       TEXT NOT NULL   -- {"summary":..., "actionItems":...} JSON 스냅샷
 );
 CREATE INDEX IF NOT EXISTS idx_backup_meeting ON meeting_backup(meeting_id, id DESC);
+
+-- Slack 봇 요구사항/건의 적재(help·요구사항 저장). source='slack'|'web', status=open|done|dropped.
+CREATE TABLE IF NOT EXISTS requirements (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    source     TEXT NOT NULL DEFAULT 'slack',
+    reporter   TEXT,                          -- slack 이메일/표시명(있으면)
+    text       TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_requirements_status ON requirements(status, id DESC);
 """
 
 
@@ -368,3 +379,60 @@ class MeetingStore:
         with contextlib.suppress(OSError):
             dest.chmod(0o600)  # 비번 해시 포함 사본 — 소유자만 접근
         return dest
+
+
+class RequirementStore:
+    """Slack 봇 요구사항/건의 적재(스레드 안전). MeetingStore 와 동일 패턴의 경량 스토어.
+
+    같은 DB 파일을 공유하지만 자체 연결을 연다(MeetingStore 와 독립 락). 스키마는 _SCHEMA 를
+    실행해 idempotent 하게 보장한다(CREATE ... IF NOT EXISTS 라 재실행 무해).
+    """
+
+    def __init__(self, db_path: Path | str | None = None) -> None:
+        self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+        _guard_default_db(self.db_path.resolve())
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        with self._lock:
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
+
+    def add(
+        self, text: str, *, source: str = "slack", reporter: str | None = None
+    ) -> dict:
+        """요구사항 1건 적재 → 생성된 행 dict(id 포함). created_at 은 UTC ISO·마이크로초."""
+        created_at = _now_iso_micro()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO requirements (source, reporter, text, status, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (source, reporter, text, "open", created_at),
+            )
+            self._conn.commit()
+            rowid = cur.lastrowid
+        return {
+            "id": rowid,
+            "text": text,
+            "source": source,
+            "reporter": reporter,
+            "status": "open",
+            "created_at": created_at,
+        }
+
+    def list(self, status: str | None = None) -> list[dict]:
+        """요구사항 목록(최신 id 우선). status 지정 시 그 상태만 필터."""
+        with self._lock:
+            if status is not None:
+                rows = self._conn.execute(
+                    "SELECT id, source, reporter, text, status, created_at "
+                    "FROM requirements WHERE status=? ORDER BY id DESC",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT id, source, reporter, text, status, created_at "
+                    "FROM requirements ORDER BY id DESC"
+                ).fetchall()
+        return [dict(r) for r in rows]
