@@ -849,6 +849,45 @@ def regenerate_undo(
     return updated
 
 
+@app.post("/api/meetings/{meeting_id}/revert")
+def revert_meeting(
+    meeting_id: str,
+    response: Response,
+    user: dict = Depends(require_user_active),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> dict:
+    """회의 내용을 최초 생성본(원본)으로 원복. 원본은 소비하지 않아 반복 원복 가능. If-Match 412.
+
+    title/participants/summary/actionItems/transcript 를 원본으로 되돌리고 status(확정 여부)·
+    createdAt 등은 보존한다. 원본 스냅샷이 없는(이 기능 이전 생성) 회의는 409.
+    """
+    _owned_or_404(meeting_id, user)
+    parsed = _parse_if_match(if_match)
+    expected = None if parsed is _IF_MATCH_ANY else parsed
+    try:
+        updated, restored = store.restore_original(meeting_id, expected)
+    except PreconditionFailedError as e:
+        if e.current_updated_at:
+            response.headers["ETag"] = f'"{e.current_updated_at}"'
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "error": "precondition_failed",
+                "message": "저장본이 변경되었습니다. 최신 회의를 재조회한 뒤 다시 시도하세요.",
+                "currentUpdatedAt": e.current_updated_at,
+            },
+        )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="meeting 없음")
+    if not restored:
+        raise HTTPException(
+            status_code=409, detail="원본 스냅샷이 없습니다(이 기능 이전에 생성된 회의)."
+        )
+    observability.audit("meeting.revert", meeting_id=meeting_id, owner=user["username"])
+    response.headers["ETag"] = f'"{updated["updatedAt"]}"'
+    return updated
+
+
 @app.post("/api/ai/extract-actions")
 def ai_extract_actions(req: ExtractRequest, user: dict = Depends(require_user_active)) -> list[str]:
     """텍스트 붙여넣기 → 액션아이템 string[](프론트 계약: Promise<string[]>).
@@ -922,6 +961,8 @@ def create_meeting(meeting: dict, user: dict = Depends(require_user_active)) -> 
                 "audio.bind", meeting_id=meeting["id"], bytes=audio_ref.get("sizeBytes")
             )
     created = store.create(meeting)
+    # 최초 생성본(AI 생성 결과)을 원복용 스냅샷으로 1회 보관(idempotent — 재저장해도 원본 불변).
+    store.save_original_snapshot(created)
     observability.audit(
         "meeting.create",
         meeting_id=meeting["id"],
