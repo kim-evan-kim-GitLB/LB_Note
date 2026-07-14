@@ -76,11 +76,39 @@ def _render_participants(meeting: dict) -> list[str]:
     return ["<p><strong>참석자:</strong> " + ", ".join(names) + "</p>"]
 
 
+def _render_agenda_index(meeting: dict) -> list[str]:
+    """안건 개요(agenda_index) — 번호·제목·한줄요약의 목차형 짤막 요약.
+
+    시간대별 상세(agenda) 위에 얹어 '짤막한 요약 + 상세 요약' 두 층을 모두 문서에 담는다
+    (앱 화면과 동일 구성 — 기존엔 상세만 렌더되고 이 목차가 누락됐었다).
+    """
+    index = ((meeting.get("summary") or {}).get("agenda_index")) or []
+    rows: list[str] = []
+    for e in index:
+        if not isinstance(e, dict):
+            continue
+        title = str(e.get("title") or "").strip()
+        if not title:
+            continue
+        no = e.get("no")
+        head = f"{no}. {title}" if no is not None else title
+        line = f"<strong>{_esc(head)}</strong>"
+        summ = str(e.get("summary") or "").strip()
+        if summ:
+            line += f"<br>{_esc(summ)}"
+        rows.append(f"<li>{line}</li>")
+    if not rows:
+        return []
+    return ["<h3>안건 개요</h3>", "<ul>", *rows, "</ul>"]
+
+
 def _render_summary(meeting: dict) -> list[str]:
     agenda = ((meeting.get("summary") or {}).get("agenda")) or []
-    if not agenda:
+    index_rows = _render_agenda_index(meeting)
+    if not agenda and not index_rows:
         return []
     out = ["<h2>요약</h2>"]
+    out.extend(index_rows)  # 목차형 짤막 요약(안건 개요) 먼저
     for block in agenda:
         if not isinstance(block, dict):
             continue
@@ -168,7 +196,7 @@ def render_email_body(meeting: dict) -> str:
     body: list[str] = [f"<h2>{_esc(title)}</h2>"]
     created = str(meeting.get("createdAt") or "").strip()
     if created:
-        body.append(f"<p><strong>일시:</strong> {_esc(created)}</p>")
+        body.append(f"<p><strong>일시:</strong> {_esc(_title_stamp(created) or created)}</p>")
     body.extend(_render_participants(meeting))
     summary = _render_summary(meeting)
     actions = _render_action_items(meeting)
@@ -186,21 +214,30 @@ def render_email_body(meeting: dict) -> str:
     )
 
 
-def render_meeting_html(meeting: dict, *, max_transcript_segments: int | None = None) -> str:
-    """회의록(요약+액션+transcript)을 단일 self-contained HTML 문서로 렌더.
+def render_meeting_html(
+    meeting: dict,
+    *,
+    max_transcript_segments: int | None = None,
+    include_transcript: bool = True,
+) -> str:
+    """회의록을 단일 self-contained HTML 문서로 렌더.
 
     Google Docs 변환 소스로 쓴다. max_transcript_segments 지정 시 transcript 를 그 개수로 잘라
     Docs import 한도(~10MB)를 방어한다(원문은 DB/오디오에 보존되므로 손실 우려 낮음).
+
+    include_transcript=False 면 '전체 대화(transcript)' 섹션을 통째로 생략하고 요약+액션 중심으로
+    렌더한다(Drive 저장 문서 정책 — 전체 대화 로그는 앱/DB 에 보존되므로 문서엔 요약만 담는다).
     """
     title = doc_title(meeting)
     body: list[str] = [f"<h1>{_esc(title)}</h1>"]
     created = str(meeting.get("createdAt") or "").strip()
     if created:
-        body.append(f"<p><strong>일시:</strong> {_esc(created)}</p>")
+        body.append(f"<p><strong>일시:</strong> {_esc(_title_stamp(created) or created)}</p>")
     body.extend(_render_participants(meeting))
     body.extend(_render_summary(meeting))
     body.extend(_render_action_items(meeting))
-    body.extend(_render_transcript(meeting, max_transcript_segments))
+    if include_transcript:
+        body.extend(_render_transcript(meeting, max_transcript_segments))
     inner = "\n".join(body)
     return (
         "<!DOCTYPE html>\n"
