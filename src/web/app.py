@@ -1424,9 +1424,8 @@ def _run_drive_sync_job(
             subfolder_id = google_drive.ensure_subfolder(
                 access_token, folder_id, _drive_subfolder_name(m), gref.get("folderId")
             )
-            html = meeting_doc.render_meeting_html(
-                m, max_transcript_segments=DRIVE_MAX_TRANSCRIPT_SEGMENTS
-            )
+            # Drive 저장 문서는 요약+액션 중심 — 전체 대화 로그(transcript)는 제외(앱/DB 에 보존).
+            html = meeting_doc.render_meeting_html(m, include_transcript=False)
             doc_id = google_drive.upsert_doc(
                 access_token, subfolder_id, html, "회의록", gref.get("docId")
             )
@@ -1533,7 +1532,8 @@ def _ensure_drive_doc(access_token: str, m: dict, google_cred: dict, username: s
     subfolder_id = google_drive.ensure_subfolder(
         access_token, folder_id, _drive_subfolder_name(m), gref.get("folderId")
     )
-    html = meeting_doc.render_meeting_html(m, max_transcript_segments=DRIVE_MAX_TRANSCRIPT_SEGMENTS)
+    # Drive 저장 문서는 요약+액션 중심 — 전체 대화 로그(transcript)는 제외(앱/DB 에 보존).
+    html = meeting_doc.render_meeting_html(m, include_transcript=False)
     doc_id = google_drive.upsert_doc(access_token, subfolder_id, html, "회의록", None)
     new_ref = {
         **gref,

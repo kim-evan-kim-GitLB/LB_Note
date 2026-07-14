@@ -78,6 +78,39 @@ def test_empty_summary_and_transcript_graceful():
     assert "요약" not in html and "액션 아이템" not in html
 
 
+def test_agenda_index_rendered_above_detail():
+    # 목차형 짤막 요약(agenda_index)이 시간대별 상세(agenda) 위에 렌더된다(앱 화면과 동일 구성).
+    m = {
+        "title": "지표 회의",
+        "summary": {
+            "agenda_index": [
+                {"no": 1, "title": "지표 검토", "summary": "이탈률 급증 구간 확인"},
+            ],
+            "agenda": [
+                {"no": 1, "title": "지표 검토", "time_range": "10:00 ~ 10:30",
+                 "points": [{"text": "3단계 이탈 급증", "anchor": "10:05"}]},
+            ],
+        },
+        "actionItems": [], "transcript": [],
+    }
+    html = meeting_doc.render_meeting_html(m, include_transcript=False)
+    assert "안건 개요" in html  # 목차 섹션 헤더
+    assert "이탈률 급증 구간 확인" in html  # index 한줄요약 본문
+    # 목차(안건 개요)가 상세 블록(time_range) 보다 먼저 나온다
+    assert html.index("안건 개요") < html.index("10:00 ~ 10:30")
+
+
+def test_include_transcript_false_drops_transcript_keeps_summary():
+    # Drive 저장 문서 정책: 전체 대화(transcript) 섹션은 통째로 생략, 요약+액션은 유지.
+    html = meeting_doc.render_meeting_html(_MEETING, include_transcript=False)
+    assert "전체 대화" not in html  # transcript 섹션 헤더 없음
+    assert "안녕하세요" not in html  # 발화 본문도 없음
+    # 요약·액션·참석자는 그대로 남는다
+    assert "출시 일정" in html and "베타 피드백 반영 후 배포 일정을 확정했다" in html
+    assert "액션 아이템" in html and "도메인 신청" in html
+    assert "김윤희" in html and "박대표" in html
+
+
 def test_max_transcript_segments_truncates():
     m = {
         "title": "긴 회의",
