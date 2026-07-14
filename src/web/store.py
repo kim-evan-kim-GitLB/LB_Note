@@ -107,6 +107,12 @@ def _now_iso_micro() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="microseconds")
 
 
+# 원복(revert) 용 원본 스냅샷 — meeting_backup 에 이 reason 으로 1회 보관하고 재요약 undo/만료
+# 정리에서 제외해 영구 보존한다. 원복 시 되돌리는 편집 대상 필드 목록(status/createdAt 등은 제외).
+ORIGINAL_REASON = "original"
+_ORIGINAL_FIELDS = ("title", "participants", "summary", "actionItems", "transcript")
+
+
 def _next_etag(prev: str | None) -> str:
     """단조 증가하는 새 ETag(updatedAt) 생성.
 
@@ -307,9 +313,11 @@ class MeetingStore:
             cur = json.loads(row["data"])
             if expected_updated_at is not None and cur.get("updatedAt") != expected_updated_at:
                 raise PreconditionFailedError(cur.get("updatedAt"))
+            # reason='original'(원복용 영구 스냅샷)은 재요약 undo 대상에서 제외 — 소비/삭제 금지.
             brow = self._conn.execute(
-                "SELECT id, data FROM meeting_backup WHERE meeting_id=? ORDER BY id DESC LIMIT 1",
-                (meeting_id,),
+                "SELECT id, data FROM meeting_backup "
+                "WHERE meeting_id=? AND reason != ? ORDER BY id DESC LIMIT 1",
+                (meeting_id, ORIGINAL_REASON),
             ).fetchone()
             if brow is None:
                 return cur, False
@@ -319,6 +327,74 @@ class MeetingStore:
             cur["updatedAt"] = _next_etag(cur.get("updatedAt"))
             self._persist_locked(cur)
             self._conn.execute("DELETE FROM meeting_backup WHERE id=?", (brow["id"],))
+            self._conn.commit()
+        return cur, True
+
+    # ── 원본 스냅샷(원복) — 최초 생성본을 reason='original' 로 1회 보관, 소비하지 않음 ──
+    def save_original_snapshot(self, meeting: dict) -> None:
+        """회의 최초 생성 시 원본(AI 생성본) 스냅샷을 1회 보관(원복용). 이미 있으면 무시(idempotent).
+
+        편집 대상 필드(title/participants/summary/actionItems/transcript)만 저장한다. reason='original'
+        은 재요약 undo(restore_latest_backup)·만료 정리(prune_expired_backups)에서 제외되어 소비되지
+        않는다(영구 보존, 회의 삭제 시에만 동반 삭제). status 는 스냅샷에 넣지 않는다(원복이 확정
+        상태를 되돌리지 않도록 — 내용만 원복).
+        """
+        meeting_id = meeting.get("id")
+        if not meeting_id:
+            return
+        snap = {k: meeting.get(k) for k in _ORIGINAL_FIELDS}
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM meeting_backup WHERE meeting_id=? AND reason=? LIMIT 1",
+                (meeting_id, ORIGINAL_REASON),
+            ).fetchone()
+            if exists:
+                return
+            self._conn.execute(
+                "INSERT INTO meeting_backup (meeting_id, created_at, reason, data) VALUES (?,?,?,?)",
+                (meeting_id, _now_iso_micro(), ORIGINAL_REASON, json.dumps(snap, ensure_ascii=False)),
+            )
+            self._conn.commit()
+
+    def has_original(self, meeting_id: str) -> bool:
+        """이 회의에 원복 가능한 원본 스냅샷이 있는가(프론트 원복 버튼 활성 판단용)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM meeting_backup WHERE meeting_id=? AND reason=? LIMIT 1",
+                (meeting_id, ORIGINAL_REASON),
+            ).fetchone()
+        return row is not None
+
+    def restore_original(
+        self, meeting_id: str, expected_updated_at: str | None
+    ) -> tuple[dict | None, bool]:
+        """최초 생성본(reason='original')으로 내용 원복. 원본은 소비하지 않는다(반복 원복 가능).
+
+        반환: (갱신 meeting | None, restored). meeting 없으면 (None, False), 원본 없으면 (현행, False).
+        compare(If-Match)+복원을 _lock 구간에서 원자 수행한다. title/participants/summary/
+        actionItems/transcript 를 원본으로 되돌리고 status/createdAt/ownerId 등은 보존한다.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM meetings WHERE id=?", (meeting_id,)
+            ).fetchone()
+            if row is None:
+                return None, False
+            cur = json.loads(row["data"])
+            if expected_updated_at is not None and cur.get("updatedAt") != expected_updated_at:
+                raise PreconditionFailedError(cur.get("updatedAt"))
+            brow = self._conn.execute(
+                "SELECT data FROM meeting_backup WHERE meeting_id=? AND reason=? ORDER BY id ASC LIMIT 1",
+                (meeting_id, ORIGINAL_REASON),
+            ).fetchone()
+            if brow is None:
+                return cur, False
+            snap = json.loads(brow["data"])
+            for k in _ORIGINAL_FIELDS:
+                if k in snap:
+                    cur[k] = snap[k]
+            cur["updatedAt"] = _next_etag(cur.get("updatedAt"))
+            self._persist_locked(cur)
             self._conn.commit()
         return cur, True
 
@@ -345,7 +421,8 @@ class MeetingStore:
         ).isoformat(timespec="microseconds")
         with self._lock:
             cur = self._conn.execute(
-                "DELETE FROM meeting_backup WHERE created_at < ?", (cutoff,)
+                "DELETE FROM meeting_backup WHERE created_at < ? AND reason != ?",
+                (cutoff, ORIGINAL_REASON),
             )
             self._conn.commit()
         return cur.rowcount
