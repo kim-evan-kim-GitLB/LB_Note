@@ -187,13 +187,17 @@ def _render_transcript(meeting: dict, max_segments: int | None) -> list[str]:
     return out
 
 
-def render_email_body(meeting: dict) -> str:
+def render_email_body(meeting: dict, note: str | None = None) -> str:
     """회의록 발송 이메일 본문(HTML) — 요약 + 액션아이템만(전사 제외). 전문은 첨부 PDF 로 보낸다.
 
     Gmail 본문으로 쓰는 self-contained HTML. 요약/액션이 모두 비면 안내 문구만 담는다.
+    note: 발송자가 입력한 머리말(인사말) — 제목 바로 아래 삽입(이스케이프·줄바꿈 보존).
     """
     title = doc_title(meeting)
     body: list[str] = [f"<h2>{_esc(title)}</h2>"]
+    if note:
+        note_html = "<br>".join(_esc(ln) for ln in note.splitlines())
+        body.append(f"<p>{note_html}</p>")
     created = str(meeting.get("createdAt") or "").strip()
     if created:
         body.append(f"<p><strong>일시:</strong> {_esc(_title_stamp(created) or created)}</p>")
