@@ -39,7 +39,9 @@ from src.web import (
 
 from src.postprocess.backends.agent_cli import (
     AgentCLIAuthError,
+    AgentCLICancelled,
     claude_auth_status,
+    use_cancel_event,
     use_credential,
 )
 from src.postprocess.web_contract import (
@@ -52,9 +54,10 @@ from src.postprocess.web_contract import (
 )
 from src.web.service import (
     _summary_action_hints,
+    enrich_to_contract,
     extract_action_items,
-    process_audio_to_contract,
     summarize_meeting,
+    transcribe_to_segments,
 )
 from src.web.store import (
     MeetingStore,
@@ -566,57 +569,98 @@ _jobs_lock = threading.Lock()
 # 기본 1(직렬). WEB_STT_CONCURRENCY 로 조정(예: VRAM 여유 시 2). (모델 상주/유휴 언로드는 v2.)
 _stt_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_STT_CONCURRENCY", "1"))))
 
+# LLM(요약·추출) 동시성 제한 — GPU 와 무관한 agent_cli/클라우드 호출이라 _stt_semaphore 와
+# 분리한다: A 가 요약(수 분) 중이어도 B 의 STT 가 시작될 수 있다. 기본 2(사용자별 자격증명이라
+# rate limit 도 사용자별). WEB_LLM_CONCURRENCY 로 조정.
+_llm_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_LLM_CONCURRENCY", "2"))))
+
 # Drive 동기화 동시성 제한(네트워크 I/O — GPU 와 무관해 _stt_semaphore 와 분리). 기본 2.
 _drive_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_DRIVE_CONCURRENCY", "2"))))
 
+# 잡별 취소 신호("분석 취소"). 취소 엔드포인트가 set → 잡 스레드가 단계 경계에서 확인해 이탈,
+# agent_cli 는 진행 중 claude 서브프로세스를 kill(use_cancel_event 채널). 잡 종료 시 정리.
+_job_cancels: dict[str, threading.Event] = {}
+
+
+def _mark_job(job_id: str, payload: dict) -> None:
+    with _jobs_lock:
+        _jobs[job_id] = payload
+
+
+def _job_cancelled(job_id: str, cancel: threading.Event) -> bool:
+    """취소 여부 확인 — set 이면 status='cancelled' 로 마감하고 True."""
+    if not cancel.is_set():
+        return False
+    _mark_job(job_id, {"status": "cancelled"})
+    return True
+
 
 def _run_ai_job(
-    job_id: str, audio_bytes: bytes, mime_type: str | None, credential: dict | None
+    job_id: str,
+    audio_bytes: bytes,
+    mime_type: str | None,
+    credential: dict | None,
+    cancel: threading.Event,
 ) -> None:
-    """STT+정제 → 잡 결과(contract) 저장. 실패해도 멈추지 않고 status=error(설계 폴백 원칙).
+    """STT+정제(GPU 슬롯) → 요약·추출(LLM 슬롯) → 잡 결과 저장. 실패해도 status=error(폴백 원칙).
 
     credential(현재 사용자 자격증명, secret 포함)은 use_credential 로 이 스레드 컨텍스트에만
     심어 agent_cli 백엔드가 사용자별 인증으로 호출하게 한다(스레드별 ContextVar 격리). None 이면
     전역 폴백. 새 Thread 는 부모 ContextVar 를 자동 상속하지 않으므로 여기서 명시 설정한다.
+
+    취소: cancel(Event)를 세마포어 획득 직후/단계 경계에서 확인해 이탈하고, agent_cli 진행 중에는
+    use_cancel_event 채널로 서브프로세스를 kill(AgentCLICancelled) — 슬롯을 빨리 반납해
+    뒤 사용자의 대기를 끊는다. STT 추론 자체는 비중단(짧음, RTFx≈232).
     """
-    # 동시성 슬롯 확보까지 대기(잡 status 는 'queued' 유지). 확보하면 'processing' 으로 전환.
-    # 한 번에 _stt_semaphore 한도(기본 1)만 실제 추론, 나머지는 여기서 블록되어 큐처럼 동작한다.
-    # 락 순서 규약: 이 잡 스레드는 _stt_semaphore 보유 중 store._lock(update_if_match)을 잡지
-    # 않는다 — STT 추론은 store 비접촉이고 _jobs(인메모리)만 갱신한다(데드락/장시간 점유 방지).
-    with _stt_semaphore:
-        with _jobs_lock:
-            _jobs[job_id] = {"status": "processing"}
-        try:
-            with use_credential(credential):
-                contract = process_audio_to_contract(
-                    audio_bytes,
-                    mime_type=mime_type,
-                    backend_name=CLEAN_BACKEND,
+    try:
+        # [1단계: GPU] 슬롯 확보까지 대기(status='queued' 유지). 확보하면 'processing' 전환.
+        # 락 순서 규약: 세마포어 보유 중 store._lock(update_if_match)을 잡지 않는다 —
+        # 추론은 store 비접촉이고 _jobs(인메모리)만 갱신한다(데드락/장시간 점유 방지).
+        with _stt_semaphore:
+            if _job_cancelled(job_id, cancel):  # 대기 중 취소된 잡 — 슬롯 즉시 반납
+                return
+            _mark_job(job_id, {"status": "processing"})
+            with use_credential(credential), use_cancel_event(cancel):
+                seg_dicts, duration = transcribe_to_segments(
+                    audio_bytes, mime_type=mime_type, backend_name=CLEAN_BACKEND
+                )
+        if _job_cancelled(job_id, cancel):
+            return
+        # [2단계: LLM] GPU 슬롯은 반납한 상태 — 다음 사용자의 STT 가 여기서 시작될 수 있다.
+        with _llm_semaphore:
+            if _job_cancelled(job_id, cancel):
+                return
+            with use_credential(credential), use_cancel_event(cancel):
+                contract = enrich_to_contract(
+                    seg_dicts,
+                    duration,
                     extract_backend_name=EXTRACT_BACKEND,
                     summarize_backend_name=SUMMARIZE_BACKEND or None,
+                    clean_backend_name=CLEAN_BACKEND,
                 )
-            result = {
-                "summary": contract.get("summary", {}),  # 구조체(dict) 계약 — 빈 기본값도 객체
-                "actionItems": contract.get("actionItems", []),
-                "transcript": contract.get("transcript", []),
-                "duration": _fmt_duration(contract.get("_duration_seconds")),
-            }
-            with _jobs_lock:
-                _jobs[job_id] = {"status": "done", "result": result}
-        except AgentCLIAuthError as e:
-            # 인증 만료/미로그인: 일반 실패와 구분해 error_code 를 실어 프론트가 "재인증" 흐름을
-            # 안내하게 한다(STT 는 됐어도 요약/추출 백엔드 claude 인증이 끊긴 상태).
-            traceback.print_exc()
-            with _jobs_lock:
-                _jobs[job_id] = {
-                    "status": "error",
-                    "error": str(e),
-                    "error_code": "claude_auth_expired",
-                }
-        except Exception as e:  # noqa: BLE001
-            traceback.print_exc()
-            with _jobs_lock:
-                _jobs[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        result = {
+            "summary": contract.get("summary", {}),  # 구조체(dict) 계약 — 빈 기본값도 객체
+            "actionItems": contract.get("actionItems", []),
+            "transcript": contract.get("transcript", []),
+            "duration": _fmt_duration(contract.get("_duration_seconds")),
+        }
+        _mark_job(job_id, {"status": "done", "result": result})
+    except AgentCLICancelled:
+        _mark_job(job_id, {"status": "cancelled"})
+    except AgentCLIAuthError as e:
+        # 인증 만료/미로그인: 일반 실패와 구분해 error_code 를 실어 프론트가 "재인증" 흐름을
+        # 안내하게 한다(STT 는 됐어도 요약/추출 백엔드 claude 인증이 끊긴 상태).
+        traceback.print_exc()
+        _mark_job(
+            job_id,
+            {"status": "error", "error": str(e), "error_code": "claude_auth_expired"},
+        )
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        _mark_job(job_id, {"status": "error", "error": f"{type(e).__name__}: {e}"})
+    finally:
+        with _jobs_lock:
+            _job_cancels.pop(job_id, None)
 
 
 @app.post("/api/ai/process")
@@ -635,12 +679,14 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
     job_id = uuid.uuid4().hex
     # 'queued' 로 시작: 스레드가 동시성 슬롯을 확보하면 _run_ai_job 이 'processing' 으로 전환한다.
     # (슬롯이 비어 있으면 거의 즉시 processing, 혼잡하면 대기 → 프론트가 "처리 대기 중…" 표시.)
+    cancel = threading.Event()
     with _jobs_lock:
         _jobs[job_id] = {"status": "queued"}
         _job_owner[job_id] = user["id"]
+        _job_cancels[job_id] = cancel
     threading.Thread(
         target=_run_ai_job,
-        args=(job_id, audio_bytes, req.mimeType, credential),
+        args=(job_id, audio_bytes, req.mimeType, credential, cancel),
         daemon=True,
     ).start()
     return {"jobId": job_id, "status": "queued"}
@@ -657,6 +703,31 @@ def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
     if j is None or (owner is not None and owner != user["id"]):
         raise HTTPException(status_code=404, detail="job 없음")
     return {"jobId": job_id, **j}
+
+
+@app.post("/api/ai/jobs/{job_id}/cancel")
+def ai_job_cancel(job_id: str, user: dict = Depends(require_user_active)) -> dict:
+    """잡 취소 요청 — "분석 취소"가 서버 파이프라인까지 실제로 멈추게 한다(소유자만, 존재 은닉 404).
+
+    동작: 취소 이벤트 set → 대기(queued) 잡은 즉시 cancelled 로 마감(슬롯 미점유),
+    실행 중 잡은 단계 경계/claude 서브프로세스 kill 로 이탈해 슬롯을 조기 반납한다.
+    이미 끝난 잡(done/error/cancelled)은 그대로 현재 상태를 돌려준다(멱등).
+    """
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        owner = _job_owner.get(job_id)
+        if j is None or (owner is not None and owner != user["id"]):
+            raise HTTPException(status_code=404, detail="job 없음")
+        cancel = _job_cancels.get(job_id)
+        if cancel is not None and j.get("status") in ("queued", "processing"):
+            cancel.set()
+            if j.get("status") == "queued":
+                # 스레드는 아직 슬롯 대기 중 — 상태를 먼저 마감해 프론트가 즉시 복귀하게 한다.
+                # (스레드가 슬롯을 얻으면 _job_cancelled 가 재확인 후 조용히 이탈.)
+                _jobs[job_id] = {"status": "cancelled"}
+        status = _jobs[job_id].get("status", "unknown")
+    observability.audit("ai_job.cancel", owner=user["username"], job_id=job_id, status=status)
+    return {"jobId": job_id, "status": status}
 
 
 # ---------- 재요약 regenerate (트랙 C·P8, prompt 모드: 미리보기→확정→백업/undo) ----------
@@ -700,37 +771,42 @@ def _segments_from_transcript(transcript: list) -> list[dict]:
     return segs
 
 
-def _run_regenerate_job(job_id: str, segments: list[dict], credential: dict | None) -> None:
+def _run_regenerate_job(
+    job_id: str, segments: list[dict], credential: dict | None, cancel: threading.Event
+) -> None:
     """재구성 segment → 재요약(summary+actionItems) 미리보기를 잡 결과로 저장(DB 미접촉).
 
-    기존 _run_ai_job 과 동일한 동시성/자격증명/폴백 규약. STT 없이 LLM(summarize+extract)만 돈다.
+    _run_ai_job 과 동일한 자격증명/취소/폴백 규약. STT 없이 LLM 만 돌므로 GPU 슬롯이 아닌
+    _llm_semaphore 를 쥔다(재요약이 다른 사용자의 STT 를 막지 않음).
     DB 는 건드리지 않는다 — 확정(apply)에서만 백업+교체한다(prompt 모드, 무파괴).
     """
-    with _stt_semaphore:
-        with _jobs_lock:
-            _jobs[job_id] = {"status": "processing"}
-        try:
-            with use_credential(credential):
+    try:
+        with _llm_semaphore:
+            if _job_cancelled(job_id, cancel):
+                return
+            _mark_job(job_id, {"status": "processing"})
+            with use_credential(credential), use_cancel_event(cancel):
                 summary = summarize_meeting(segments, backend_name=SUMMARIZE_BACKEND or "passthrough")
                 hints = _summary_action_hints(summary)
                 action_items = extract_action_items(
                     segments, backend_name=EXTRACT_BACKEND, summary_hints=hints
                 )
-            result = {"summary": summary, "actionItems": action_items}
-            with _jobs_lock:
-                _jobs[job_id] = {"status": "done", "result": result}
-        except AgentCLIAuthError as e:
-            traceback.print_exc()
-            with _jobs_lock:
-                _jobs[job_id] = {
-                    "status": "error",
-                    "error": str(e),
-                    "error_code": "claude_auth_expired",
-                }
-        except Exception as e:  # noqa: BLE001
-            traceback.print_exc()
-            with _jobs_lock:
-                _jobs[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        result = {"summary": summary, "actionItems": action_items}
+        _mark_job(job_id, {"status": "done", "result": result})
+    except AgentCLICancelled:
+        _mark_job(job_id, {"status": "cancelled"})
+    except AgentCLIAuthError as e:
+        traceback.print_exc()
+        _mark_job(
+            job_id,
+            {"status": "error", "error": str(e), "error_code": "claude_auth_expired"},
+        )
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        _mark_job(job_id, {"status": "error", "error": f"{type(e).__name__}: {e}"})
+    finally:
+        with _jobs_lock:
+            _job_cancels.pop(job_id, None)
 
 
 @app.post("/api/meetings/{meeting_id}/regenerate")
@@ -746,11 +822,13 @@ def regenerate_meeting(meeting_id: str, user: dict = Depends(require_user_active
         raise HTTPException(status_code=400, detail="재요약할 transcript 가 없습니다.")
     credential = auth.get_credential(user["username"])
     job_id = uuid.uuid4().hex
+    cancel = threading.Event()
     with _jobs_lock:
         _jobs[job_id] = {"status": "queued"}
         _job_owner[job_id] = user["id"]
+        _job_cancels[job_id] = cancel
     threading.Thread(
-        target=_run_regenerate_job, args=(job_id, segments, credential), daemon=True
+        target=_run_regenerate_job, args=(job_id, segments, credential, cancel), daemon=True
     ).start()
     observability.audit("regenerate.request", meeting_id=meeting_id, owner=user["username"])
     return {"jobId": job_id, "status": "queued"}

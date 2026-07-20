@@ -38,8 +38,11 @@ import json
 import os
 import pwd
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 
 from src.postprocess.backends.base import LLMBackend, LLMCapabilities
 
@@ -95,6 +98,37 @@ class AgentCLIAuthError(RuntimeError):
 
     일반 호출 실패(RuntimeError)와 구분해 호출부가 "인증부터 다시" 흐름으로 분기하게 한다.
     """
+
+
+class AgentCLICancelled(RuntimeError):
+    """사용자 취소로 CLI 호출이 중단됨. 실패가 아니므로 재시도하지 않고 즉시 전파한다.
+
+    호출부(웹 잡 스레드)가 이 예외를 status='cancelled' 로 매핑한다.
+    """
+
+
+# 취소 신호 채널(웹 "분석 취소"). 잡 스레드가 use_cancel_event 로 threading.Event 를 심으면
+# generate() 가 CLI 서브프로세스 대기 중 1초 간격으로 이를 확인, set 이면 프로세스를 kill 하고
+# AgentCLICancelled 를 던진다. 자격증명과 같은 이유로 ContextVar(스레드별 격리) 사용.
+_active_cancel: contextvars.ContextVar["threading.Event | None"] = contextvars.ContextVar(
+    "agent_cli_active_cancel", default=None
+)
+
+
+@contextlib.contextmanager
+def use_cancel_event(event: "threading.Event | None"):
+    """with 블록 동안만 취소 이벤트를 활성화하고, 빠져나오면 원복(누수 방지)."""
+    token = _active_cancel.set(event)
+    try:
+        yield
+    finally:
+        _active_cancel.reset(token)
+
+
+def _raise_if_cancelled() -> None:
+    ev = _active_cancel.get()
+    if ev is not None and ev.is_set():
+        raise AgentCLICancelled("사용자 취소로 중단되었습니다.")
 
 
 def _resolved_home() -> str:
@@ -270,19 +304,9 @@ class AgentCLIBackend(LLMBackend):
         # 통째로 죽지 않게 한다(설계 §: backend 재요청 훅). 소진하면 RuntimeError 로 드러냄.
         last_err = ""
         for attempt in range(retries + 1):
+            _raise_if_cancelled()  # 시작 전 취소 확인(배치 중 취소 시 다음 콜부터 즉시 중단)
             try:
-                proc = subprocess.run(
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                    env=sub_env,
-                    cwd=tempfile.gettempdir(),
-                    # claude -p 는 stdin 을 읽으려 대기한다(positional prompt 가 있어도).
-                    # EOF 를 즉시 줘서 "no stdin data received in 3s" 지연/실패 차단.
-                    stdin=subprocess.DEVNULL,
-                )
+                proc = self._run_cancellable(argv, sub_env, timeout)
             except subprocess.TimeoutExpired:
                 last_err = f"타임아웃({timeout}s)"
                 continue
@@ -307,6 +331,57 @@ class AgentCLIBackend(LLMBackend):
         raise RuntimeError(
             f"agent_cli 호출 실패(program={program}, {retries + 1}회 시도): {last_err}"
         )
+
+    @staticmethod
+    def _run_cancellable(
+        argv: list[str], sub_env: dict, timeout: int
+    ) -> subprocess.CompletedProcess:
+        """CLI 실행 — 1초 간격으로 취소 이벤트를 확인하며 대기한다.
+
+        subprocess.run(timeout=...)은 완료까지 블록되어 취소가 콜 종료 후에야 반영된다
+        (claude 콜은 수십초~수분) → Popen + 짧은 communicate 루프로 바꿔 취소 시 프로세스
+        그룹째 kill 하고 AgentCLICancelled 를 던진다. 반환/타임아웃 계약은 run 과 동일
+        (CompletedProcess / TimeoutExpired). claude 는 node 자식을 더 띄우므로
+        start_new_session + killpg 로 트리 전체를 종료한다(고아 API 호출 잔류 방지).
+        """
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=sub_env,
+            cwd=tempfile.gettempdir(),
+            # claude -p 는 stdin 을 읽으려 대기한다(positional prompt 가 있어도).
+            # EOF 를 즉시 줘서 "no stdin data received in 3s" 지연/실패 차단.
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        def _kill_tree() -> None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=5)
+
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    out, err = proc.communicate(timeout=1.0)
+                    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+                except subprocess.TimeoutExpired:
+                    ev = _active_cancel.get()
+                    if ev is not None and ev.is_set():
+                        _kill_tree()
+                        raise AgentCLICancelled("사용자 취소로 중단되었습니다.") from None
+                    if time.monotonic() >= deadline:
+                        _kill_tree()
+                        raise subprocess.TimeoutExpired(argv, timeout) from None
+        finally:
+            if proc.poll() is None:  # 예기치 못한 예외 이탈 시 자식 잔류 방지
+                _kill_tree()
 
     def capabilities(self) -> LLMCapabilities:
         """claude CLI 기준 능력.

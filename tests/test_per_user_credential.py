@@ -7,7 +7,7 @@
   - credential_status 는 secret 을 절대 반환하지 않는다.
   - claude_auth_status 가 ContextVar 자격증명을 반영(secret 미노출).
 
-subprocess.run 을 모킹해 argv/env 를 캡처(실제 claude 미호출). 임시 DB.
+CLI 실행부(_run_cancellable)를 모킹해 argv/env 를 캡처(실제 claude 미호출). 임시 DB.
 실행: sudo PYTHONPATH=/app .venv/bin/python tests/test_per_user_credential.py
 """
 from __future__ import annotations
@@ -29,15 +29,15 @@ def _gen_capture(cred):
         stdout = "ok"
         stderr = ""
 
-    def _fake_run(argv, **kw):
+    def _fake_run(argv, sub_env, timeout):
         captured["argv"] = argv
-        captured["env"] = kw.get("env", {})
+        captured["env"] = sub_env
         return _Proc()
 
     backend = ac.AgentCLIBackend()
     msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
     with mock.patch.object(ac.shutil, "which", return_value="/usr/bin/claude"), \
-         mock.patch.object(ac.subprocess, "run", _fake_run):
+         mock.patch.object(ac.AgentCLIBackend, "_run_cancellable", staticmethod(_fake_run)):
         with ac.use_credential(cred):
             backend.generate(msgs)
     return captured["argv"], captured["env"]
