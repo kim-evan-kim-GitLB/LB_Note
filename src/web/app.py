@@ -885,7 +885,7 @@ def revert_meeting(
         )
     observability.audit("meeting.revert", meeting_id=meeting_id, owner=user["username"])
     response.headers["ETag"] = f'"{updated["updatedAt"]}"'
-    return updated
+    return _fill_display_date(updated)
 
 
 @app.post("/api/ai/extract-actions")
@@ -913,6 +913,18 @@ def ai_extract_actions(req: ExtractRequest, user: dict = Depends(require_user_ac
 
 
 # ---------- 영속 엔드포인트 (meetingService 대체) ----------
+def _fill_display_date(m: dict) -> dict:
+    """응답용 `date` 폴백 — 없거나 비면 createdAt 을 채워 내려준다(영속 아님).
+
+    date 필드 부재 시 프론트가 `new Date(undefined)` 로 전 화면 Invalid Date ·
+    통계 0 · 정렬 무동작을 일으켰다(2026-07-16 UX 리뷰 §2). 저장 문서는 불변,
+    store 가 매 호출 json.loads 사본을 반환하므로 응답 딕셔너리 변형은 안전하다.
+    """
+    if not m.get("date") and m.get("createdAt"):
+        m["date"] = m["createdAt"]
+    return m
+
+
 def _owned_or_404(meeting_id: str, user: dict) -> dict:
     """meeting 조회 + 소유자 확인. 없거나 남의 것이면 404(존재 자체를 숨김)."""
     m = store.get(meeting_id)
@@ -923,12 +935,12 @@ def _owned_or_404(meeting_id: str, user: dict) -> dict:
 
 @app.get("/api/meetings")
 def list_meetings(user: dict = Depends(require_user_active)) -> list[dict]:
-    return store.list(owner_id=user["id"])
+    return [_fill_display_date(m) for m in store.list(owner_id=user["id"])]
 
 
 @app.get("/api/meetings/{meeting_id}")
 def get_meeting(meeting_id: str, user: dict = Depends(require_user_active)) -> dict:
-    return _owned_or_404(meeting_id, user)
+    return _fill_display_date(_owned_or_404(meeting_id, user))
 
 
 @app.post("/api/meetings")
@@ -969,7 +981,7 @@ def create_meeting(meeting: dict, user: dict = Depends(require_user_active)) -> 
         owner=user["username"],
         audio=bool(meeting.get("audioRef")),
     )
-    return created
+    return _fill_display_date(created)
 
 
 @app.patch("/api/meetings/{meeting_id}")
@@ -1054,7 +1066,7 @@ def patch_meeting(
         raise HTTPException(status_code=404, detail="meeting 없음")
     observability.incr("meeting.patch")
     response.headers["ETag"] = f'"{updated["updatedAt"]}"'
-    return updated
+    return _fill_display_date(updated)
 
 
 @app.delete("/api/meetings/{meeting_id}")
@@ -1601,14 +1613,29 @@ def _clean_email_list(raw: object) -> list[str]:
     return out
 
 
+@app.get("/api/meetings/{meeting_id}/email-preview")
+def preview_meeting_email(
+    meeting_id: str, user: dict = Depends(require_user_active)
+) -> dict:
+    """발송 이메일 본문 미리보기(HTML) — send-email 과 동일 렌더러(2026-07-16 UX 리뷰 T3).
+
+    Google 연동 없이도 동작(렌더만). 머리말(note)은 프론트가 입력란으로 따로 보여주므로
+    여기선 본문 원형만 반환한다. 프론트는 sandbox iframe(srcDoc)으로 표시할 것.
+    """
+    _require_hex32(meeting_id, what="meetingId")
+    m = _owned_or_404(meeting_id, user)
+    return {"html": meeting_doc.render_email_body(m)}
+
+
 @app.post("/api/meetings/{meeting_id}/send-email")
 def send_meeting_email(
     meeting_id: str, payload: dict, user: dict = Depends(require_user_active)
 ) -> dict:
     """회의록을 참석자에게 이메일 발송(본인 Gmail). 본문=요약+액션, 첨부=회의록 PDF.
 
-    body: {to:[...], cc:[...], subject?}. 소유자만. 미연동 400(google_not_connected),
+    body: {to:[...], cc:[...], subject?, note?}. 소유자만. 미연동 400(google_not_connected),
     gmail.send 미동의 400(google_scope_missing → 재연동), 만료 400(google_auth_expired).
+    note = 발송자 머리말(인사말) — 본문 최상단 삽입(2026-07-16 UX 리뷰 T3, 2000자 상한).
     발송 성공 시 회의록/오디오 Drive 영속(백그라운드) 도 함께 트리거한다.
     """
     _require_hex32(meeting_id, what="meetingId")
@@ -1624,11 +1651,12 @@ def send_meeting_email(
     if not to:
         raise HTTPException(status_code=422, detail="받는사람(수신자) 이메일이 최소 1명 필요합니다.")
     subject = str(payload.get("subject") or "").strip() or meeting_doc.doc_title(m)
+    note = str(payload.get("note") or "").strip()[:2000] or None
     try:
         access = google_oauth.refresh_access_token(google_cred["refresh_token"])
         doc_id = _ensure_drive_doc(access, m, google_cred, user["username"])
         pdf = google_drive.export_doc(access, doc_id, "application/pdf")
-        html = meeting_doc.render_email_body(m)
+        html = meeting_doc.render_email_body(m, note=note)
         sender = google_cred.get("email") or user["username"]
         pdf_name = f"{_sanitize_drive_name(meeting_doc.doc_title(m))}.pdf"
         msg_id = google_gmail.send_message(
@@ -1973,8 +2001,16 @@ def create_notice(
 
 @app.get("/api/notices")
 def list_notices(user: dict = Depends(require_admin)) -> dict:
-    """전체 공지 목록(관리자 콘솔용, 최신 우선)."""
-    return {"notices": notice_store.list()}
+    """전체 공지 목록(관리자 콘솔용, 최신 우선).
+
+    noticeChannel: 봇이 공지를 쏘는 대상 채널(SLACK_NOTICE_CHANNEL). 웹·슬랙봇이
+    같은 .env.deploy 를 공유하므로 웹 env 로 판별 가능. 미설정(None)이면 봇은
+    명령을 실행한 채널로 전송한다(slack_bot/handlers.py) — 프론트가 경고 배지 노출.
+    """
+    return {
+        "notices": notice_store.list(),
+        "noticeChannel": os.environ.get("SLACK_NOTICE_CHANNEL") or None,
+    }
 
 
 @app.get("/api/notices/latest")
