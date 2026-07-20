@@ -173,21 +173,17 @@ def _summary_action_hints(summary: dict | None) -> list[str]:
     return hints
 
 
-def process_audio_to_contract(
+def transcribe_to_segments(
     audio_bytes: bytes,
     *,
     mime_type: str | None = None,
     filename: str | None = None,
     backend_name: str = "passthrough",
-    extract_backend_name: str | None = None,
-    summarize_backend_name: str | None = None,
-) -> dict:
-    """오디오 bytes → 웹 Meeting 계약 {summary, actionItems, transcript} (+ _duration_seconds).
+) -> tuple[list[dict], float | None]:
+    """[1단계: GPU] 오디오 bytes → STT + 정제 → (seg_dicts, duration).
 
-    backend_name 은 정제(CleanStage) 백엔드. extract_backend_name(추출)·summarize_backend_name(요약)은
-    정제와 **독립 설정**할 수 있다(미지정 시: 추출=정제 백엔드, 요약=off). 분리 이유: 정제는 segment당
-    1콜이라 클라우드면 비싸지만(≈$4~5/회의), 추출·요약은 회의당 1콜이라 클라우드도 ≈$0.06 →
-    "정제=passthrough, 추출/요약=agent_cli" 같은 저비용 구성이 가능. 백엔드는 backend-agnostic.
+    process_audio_to_contract 의 전반부. 호출부(웹 잡)가 GPU 세마포어 아래에서 이 함수만 돌리고,
+    LLM 단계(enrich_to_contract)는 별도 세마포어로 돌려 "A 요약 중 B STT 시작"을 가능하게 한다.
     """
     raw_segments, duration = transcribe_bytes(
         audio_bytes, mime_type=mime_type, filename=filename
@@ -197,6 +193,22 @@ def process_audio_to_contract(
         {"id": s.id, "start": s.start, "end": s.end, "cleaned": s.cleaned, "text": s.original}
         for s in final.segments
     ]
+    return seg_dicts, duration
+
+
+def enrich_to_contract(
+    seg_dicts: list[dict],
+    duration: float | None,
+    *,
+    extract_backend_name: str | None = None,
+    summarize_backend_name: str | None = None,
+    clean_backend_name: str = "passthrough",
+) -> dict:
+    """[2단계: LLM] seg_dicts → 요약·액션 추출 → Meeting 계약 dict.
+
+    process_audio_to_contract 의 후반부(GPU 비접촉). clean_backend_name 은 추출 백엔드 미지정 시
+    폴백 결정용(기존 규약: 추출=정제 백엔드 폴백).
+    """
     # 요약 먼저(방법2): 요약의 결정/이슈를 추출 힌트로 쓰기 위해 추출보다 앞에 둔다.
     # 미지정 시 off(passthrough). 명시 백엔드일 때만 SummarizeStage 가동(설계 §6 폴백 정책).
     sum_backend = summarize_backend_name
@@ -215,7 +227,7 @@ def process_audio_to_contract(
             summary = None
     # 액션아이템 추출: passthrough 는 추출 불가(빈 값) 이므로 건너뛰고, 실 백엔드면 ExtractStage 가동.
     # 요약이 있으면 그 결정/이슈를 힌트로 넘겨 누락을 보강(transcript 근거 없는 힌트는 프롬프트가 버림).
-    ex_backend = extract_backend_name or backend_name
+    ex_backend = extract_backend_name or clean_backend_name
     action_items: list[dict] = []
     if ex_backend != "passthrough":
         action_items = extract_action_items(
@@ -226,3 +238,34 @@ def process_audio_to_contract(
     )
     contract["_duration_seconds"] = duration
     return contract
+
+
+def process_audio_to_contract(
+    audio_bytes: bytes,
+    *,
+    mime_type: str | None = None,
+    filename: str | None = None,
+    backend_name: str = "passthrough",
+    extract_backend_name: str | None = None,
+    summarize_backend_name: str | None = None,
+) -> dict:
+    """오디오 bytes → 웹 Meeting 계약 {summary, actionItems, transcript} (+ _duration_seconds).
+
+    backend_name 은 정제(CleanStage) 백엔드. extract_backend_name(추출)·summarize_backend_name(요약)은
+    정제와 **독립 설정**할 수 있다(미지정 시: 추출=정제 백엔드, 요약=off). 분리 이유: 정제는 segment당
+    1콜이라 클라우드면 비싸지만(≈$4~5/회의), 추출·요약은 회의당 1콜이라 클라우드도 ≈$0.06 →
+    "정제=passthrough, 추출/요약=agent_cli" 같은 저비용 구성이 가능. 백엔드는 backend-agnostic.
+
+    내부적으로 transcribe_to_segments(GPU) → enrich_to_contract(LLM) 2단계 합성이다 — 웹 잡은
+    세마포어를 단계별로 달리 쥐기 위해 두 함수를 직접 쓰고, 도구/테스트는 이 합성 진입점을 쓴다.
+    """
+    seg_dicts, duration = transcribe_to_segments(
+        audio_bytes, mime_type=mime_type, filename=filename, backend_name=backend_name
+    )
+    return enrich_to_contract(
+        seg_dicts,
+        duration,
+        extract_backend_name=extract_backend_name,
+        summarize_backend_name=summarize_backend_name,
+        clean_backend_name=backend_name,
+    )
