@@ -24,6 +24,9 @@ services:
     image: meetscript-ai:171
     container_name: meetscript-171
     restart: unless-stopped
+    # PID1 을 tini 로 — python(uvicorn)이 PID1 이면 agent_cli(claude) 고아 자식을 회수하지
+    # 못해 좀비가 무한 누적된다(개발 컨테이너에서 실측 1.7만+).
+    init: true
     # 호스트 포트 직접 노출 안 함 — 앞단 caddy(TLS 종단)만 호스트에 열린다. 평문 8088 이
     # LAN 에 직접 뜨지 않게 한다. caddy 는 compose 내부 네트워크에서 'meetscript:8088' 로 접근.
     expose:
@@ -73,6 +76,7 @@ services:
     image: meetscript-ai:171            # meetscript 서비스가 빌드한 이미지를 그대로 사용(재빌드 없음)
     container_name: meetscript-slackbot-171
     restart: unless-stopped             # 좀비/크래시 시 자동 재시작(봇 프로세스 감시 정책)
+    init: true                          # PID1=tini (웹 서비스와 동일한 좀비 방지)
     depends_on:
       - meetscript                      # 웹 이미지 빌드/기동 이후에 봇을 띄운다
     entrypoint: ["python", "-m", "src.slack_bot"]  # /entrypoint.sh(웹) 대신 봇 모듈 실행
