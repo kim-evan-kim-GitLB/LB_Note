@@ -218,6 +218,103 @@ def render_email_body(meeting: dict, note: str | None = None) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# 템플릿(구글 docs 양식) 치환용 평문 값 — google_docs.apply_template 이 사용.
+# HTML 렌더와 별개로, 관리자 지정 템플릿의 {{key}} 플레이스홀더에 넣을 순수 텍스트를 만든다.
+# 한 값 안의 개행(\n)은 Docs replaceAllText 시 새 문단이 된다(템플릿 문단 스타일 상속).
+# ---------------------------------------------------------------------------
+def _plain_summary(meeting: dict) -> str:
+    lines: list[str] = []
+    index = ((meeting.get("summary") or {}).get("agenda_index")) or []
+    for e in index:
+        if not isinstance(e, dict):
+            continue
+        title = str(e.get("title") or "").strip()
+        if not title:
+            continue
+        no = e.get("no")
+        head = f"{no}. {title}" if no is not None else title
+        summ = str(e.get("summary") or "").strip()
+        lines.append(f"{head} — {summ}" if summ else head)
+    agenda = ((meeting.get("summary") or {}).get("agenda")) or []
+    for block in agenda:
+        if not isinstance(block, dict):
+            continue
+        no = block.get("no")
+        title = _item_text(block) or "안건"
+        heading = f"{no}. {title}" if no is not None else title
+        time_range = str(block.get("time_range") or "").strip()
+        if time_range:
+            heading = f"{heading} ({time_range})"
+        lines.append(heading)
+        for p in (block.get("points") or []):
+            t = _item_text(p).strip()
+            if t:
+                lines.append(f"  - {t}")
+        decisions = [d for d in (block.get("decisions") or []) if _item_text(d).strip()]
+        if decisions:
+            lines.append("  [결정사항]")
+            lines.extend(f"  - {_item_text(d).strip()}" for d in decisions)
+        issues = [i for i in (block.get("issues") or []) if _item_text(i).strip()]
+        if issues:
+            lines.append("  [이슈]")
+            lines.extend(f"  - {_item_text(i).strip()}" for i in issues)
+    return "\n".join(lines)
+
+
+def _plain_action_items(meeting: dict) -> str:
+    items = meeting.get("actionItems") or []
+    rows = [it for it in items if isinstance(it, dict) and str(it.get("text") or "").strip()]
+    out: list[str] = []
+    for it in rows:
+        meta: list[str] = []
+        if str(it.get("owner") or "").strip():
+            meta.append("담당: " + str(it.get("owner")).strip())
+        if str(it.get("due") or "").strip():
+            meta.append("기한: " + str(it.get("due")).strip())
+        if str(it.get("anchor") or "").strip():
+            meta.append("시각: " + str(it.get("anchor")).strip())
+        suffix = f" ({' · '.join(meta)})" if meta else ""
+        out.append(f"- {str(it.get('text')).strip()}{suffix}")
+    return "\n".join(out)
+
+
+def _plain_transcript(meeting: dict) -> str:
+    transcript = meeting.get("transcript") or []
+    segs = [s for s in transcript if isinstance(s, dict) and str(s.get("text") or "").strip()]
+    out: list[str] = []
+    for s in segs:
+        ts = str(s.get("timestamp") or "").strip()
+        speaker = str(s.get("speakerId") or "").strip()
+        label_parts = [p for p in (ts, speaker) if p]
+        label = f"[{' '.join(label_parts)}] " if label_parts else ""
+        out.append(f"{label}{str(s.get('text')).strip()}")
+    return "\n".join(out)
+
+
+def render_template_values(meeting: dict) -> dict[str, str]:
+    """관리자 지정 Docs 템플릿의 플레이스홀더 → 실제 값(평문) 매핑.
+
+    지원 플레이스홀더(템플릿에 `{{key}}` 형태로 넣으면 치환됨):
+      title, date, attendees, department, author, summary, action_items, transcript
+    값이 없으면 빈 문자열로 치환(잔여 `{{...}}` 텍스트가 문서에 남지 않도록).
+    """
+    parts = meeting.get("participants") or []
+    names = [_item_text(p).strip() for p in parts if _item_text(p).strip()]
+    meta = ((meeting.get("summary") or {}).get("meta")) or {}
+    created = str(meeting.get("createdAt") or "").strip()
+    return {
+        "title": str(meeting.get("title") or "").strip() or doc_title(meeting),
+        "date": _title_stamp(created) or created,
+        "attendees": ", ".join(names),
+        "department": str((meta or {}).get("department") or "").strip(),
+        "author": str((meta or {}).get("author") or "").strip(),
+        "summary": _plain_summary(meeting),
+        "action_items": _plain_action_items(meeting),
+        "transcript": _plain_transcript(meeting),
+    }
+
+
 def render_meeting_html(
     meeting: dict,
     *,

@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from src.web import (
     audio_store,
     google_calendar,
+    google_docs,
     google_drive,
     google_gmail,
     google_oauth,
@@ -361,6 +362,11 @@ class GoogleOAuthConfigRequest(BaseModel):
     clientId: str
     clientSecret: str
     redirectUri: str
+
+
+class DocTemplateRequest(BaseModel):
+    """관리자 전역 Docs 양식(템플릿) 설정 — 구글 문서 URL 또는 문서 id."""
+    templateUrl: str
 
 
 # 셀프 비번 변경 시 새 비밀번호 최소 길이.
@@ -1529,6 +1535,44 @@ def google_disconnect(user: dict = Depends(require_user_active)) -> dict:
     return {"ok": True, "cleared": cleared, "status": auth.google_status(user["username"])}
 
 
+def _build_meeting_doc(
+    access_token: str,
+    m: dict,
+    folder_id: str,
+    prev_doc_id: str | None,
+    username: str,
+    meeting_id: str,
+) -> str:
+    """회의록 Docs 생성/갱신 → docId. 전역 템플릿이 설정돼 있으면 템플릿 복사+치환, 아니면 기본 HTML.
+
+    템플릿 적용 실패(스코프 부족·미공유·삭제 등)는 기본 HTML 회의록으로 폴백해 저장을 무중단으로
+    보장한다(관리자 재동의/공유 누락이 사용자 저장을 막지 않도록). 폴백은 audit 로 남긴다.
+    """
+    tmpl = auth.get_doc_template()
+    if tmpl and tmpl.get("template_id"):
+        try:
+            values = meeting_doc.render_template_values(m)
+            doc_id = google_docs.apply_template(
+                access_token,
+                tmpl["template_id"],
+                folder_id,
+                meeting_doc.doc_title(m),
+                values,
+                prev_doc_id,
+            )
+            observability.audit("drive.template_applied", meeting_id=meeting_id, owner=username)
+            return doc_id
+        except google_docs.GoogleDocsTemplateError as e:  # noqa: BLE001 — 폴백 원칙(저장 무중단)
+            traceback.print_exc()
+            observability.audit(
+                "drive.template_fallback", meeting_id=meeting_id, owner=username, error=str(e)
+            )
+            # 폴백: 기본 HTML 회의록으로 저장(무중단).
+    # 요약+액션 중심(전체 대화 로그 transcript 제외 — 앱/DB 에 보존).
+    html = meeting_doc.render_meeting_html(m, include_transcript=False)
+    return google_drive.upsert_doc(access_token, folder_id, html, "회의록", prev_doc_id)
+
+
 def _run_drive_sync_job(
     job_id: str, meeting_id: str, owner_id: str, username: str, google_cred: dict
 ) -> None:
@@ -1555,10 +1599,9 @@ def _run_drive_sync_job(
             subfolder_id = google_drive.ensure_subfolder(
                 access_token, folder_id, _drive_subfolder_name(m), gref.get("folderId")
             )
-            # Drive 저장 문서는 요약+액션 중심 — 전체 대화 로그(transcript)는 제외(앱/DB 에 보존).
-            html = meeting_doc.render_meeting_html(m, include_transcript=False)
-            doc_id = google_drive.upsert_doc(
-                access_token, subfolder_id, html, "회의록", gref.get("docId")
+            # 전역 Docs 템플릿(설정 시) 복사+치환, 아니면 기본 HTML. 템플릿 실패는 HTML 폴백.
+            doc_id = _build_meeting_doc(
+                access_token, m, subfolder_id, gref.get("docId"), username, meeting_id
             )
             audio_id = gref.get("audioId")
             audio_ref = m.get("audioRef")
@@ -1663,9 +1706,8 @@ def _ensure_drive_doc(access_token: str, m: dict, google_cred: dict, username: s
     subfolder_id = google_drive.ensure_subfolder(
         access_token, folder_id, _drive_subfolder_name(m), gref.get("folderId")
     )
-    # Drive 저장 문서는 요약+액션 중심 — 전체 대화 로그(transcript)는 제외(앱/DB 에 보존).
-    html = meeting_doc.render_meeting_html(m, include_transcript=False)
-    doc_id = google_drive.upsert_doc(access_token, subfolder_id, html, "회의록", None)
+    # 전역 Docs 템플릿(설정 시) 복사+치환, 아니면 기본 HTML. 템플릿 실패는 HTML 폴백.
+    doc_id = _build_meeting_doc(access_token, m, subfolder_id, None, username, m["id"])
     new_ref = {
         **gref,
         "docId": doc_id,
@@ -1967,6 +2009,51 @@ def delete_google_oauth_config(user: dict = Depends(require_admin)) -> dict:
     cleared = auth.clear_google_oauth_config()
     observability.audit("google.oauth_config_clear", by=user["username"], cleared=cleared)
     return {"ok": True, "cleared": cleared, "status": google_oauth.config_status()}
+
+
+# ---------- 관리자: 전역 Docs 양식(템플릿) ----------
+def _doc_template_status() -> dict:
+    """전역 Docs 템플릿 공개 상태."""
+    tmpl = auth.get_doc_template()
+    if not tmpl:
+        return {"configured": False, "templateUrl": None, "templateId": None, "updatedAt": None}
+    return {
+        "configured": True,
+        "templateUrl": tmpl.get("template_url"),
+        "templateId": tmpl.get("template_id"),
+        "updatedAt": tmpl.get("updated_at"),
+    }
+
+
+@app.get("/api/admin/doc-template")
+def get_doc_template(user: dict = Depends(require_admin)) -> dict:
+    """전역 Docs 양식(템플릿) 상태(관리자): {configured, templateUrl, templateId, updatedAt}."""
+    return _doc_template_status()
+
+
+@app.put("/api/admin/doc-template")
+def put_doc_template(req: DocTemplateRequest, user: dict = Depends(require_admin)) -> dict:
+    """전역 Docs 템플릿 지정 — 구글 문서 URL/ID 에서 문서 id 추출해 저장. 즉시 반영(재시작 불필요).
+
+    템플릿을 쓰려면 (a) 사용자 연동 계정에 drive.readonly 재동의, (b) 템플릿 문서를 사용자들이
+    읽을 수 있게 공유해야 한다(관리 UI 안내). 미충족 시 저장은 기본 HTML 회의록으로 폴백한다.
+    """
+    template_id = google_docs.extract_doc_id(req.templateUrl)
+    if not template_id:
+        raise HTTPException(
+            status_code=400, detail="유효한 Google 문서 URL 또는 문서 ID 가 아닙니다."
+        )
+    auth.set_doc_template(template_id, req.templateUrl.strip())
+    observability.audit("doc_template.set", by=user["username"], template_id=template_id)
+    return _doc_template_status()
+
+
+@app.delete("/api/admin/doc-template")
+def delete_doc_template(user: dict = Depends(require_admin)) -> dict:
+    """전역 Docs 템플릿 해제(→ 기본 HTML 회의록으로 복귀)."""
+    cleared = auth.clear_doc_template()
+    observability.audit("doc_template.clear", by=user["username"], cleared=cleared)
+    return {"ok": True, "cleared": cleared, "status": _doc_template_status()}
 
 
 # ---------- 관리자: 사용자 명부 관리 + 참석자 피커 디렉터리 ----------

@@ -29,10 +29,14 @@ import time
 #     둘 다 커버. sensitive 스코프이나 동의화면 Internal(Workspace)이라 구글 검증 불필요.
 #   - gmail.send: 회의록 발송(사용자 본인 Gmail 로 전송, 읽기 없음). restricted 스코프이나 동의화면
 #     Internal(Workspace) 이라 구글 검증 불필요. 부여 스코프가 늘어 기존 연동 사용자는 재동의 필요.
+#   - drive.readonly: 관리자 지정 '구글 docs 양식(템플릿)' 문서를 복사하기 위해 필요(drive.file 로는
+#     앱이 만든 파일만 보여 관리자 템플릿을 읽지 못한다). 템플릿 미설정이면 실제로 쓰이지 않지만
+#     스코프는 전역이라 부여된다 → 부여 스코프가 늘어 기존 연동 사용자는 재동의 필요.
 GOOGLE_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/gmail.send",
 ]
