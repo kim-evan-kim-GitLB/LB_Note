@@ -133,6 +133,14 @@ CREATE TABLE IF NOT EXISTS app_oauth_config (
     redirect_uri  TEXT,
     updated_at    TEXT
 );
+-- 전역(관리자) 구글 docs 양식(템플릿) 문서. 배포당 1행(id=1). 관리자가 지정한 Google 문서를
+-- 회의록 Drive 저장 시 복사+플레이스홀더 치환한다. 비밀값 아님(문서 id/url)이라 평문 저장.
+CREATE TABLE IF NOT EXISTS app_doc_template (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    template_id  TEXT,               -- 구글 문서 id(복사 대상)
+    template_url TEXT,               -- 관리자가 입력한 원본 URL(표시용)
+    updated_at   TEXT
+);
 """
 
 # 사용자별 claude 자격증명 종류. oauth_token=CLAUDE_CODE_OAUTH_TOKEN(Claude Code CLI 토큰,
@@ -730,6 +738,45 @@ class UserStore:
             self._conn.commit()
         return cur.rowcount > 0
 
+    # ---- 전역 구글 docs 양식(템플릿) 설정(app_doc_template, 단일 행 id=1) ----
+    def set_doc_template(self, template_id: str, template_url: str) -> None:
+        """관리자가 전역 Docs 템플릿(문서 id + 원본 url) 지정. template_id 비면 ValueError."""
+        template_id = (template_id or "").strip()
+        template_url = (template_url or "").strip()
+        if not template_id:
+            raise ValueError("template_id 가 필요합니다(유효한 Google 문서 URL/ID).")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO app_doc_template (id, template_id, template_url, updated_at) "
+                "VALUES (1,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "template_id=excluded.template_id, template_url=excluded.template_url, "
+                "updated_at=excluded.updated_at",
+                (template_id, template_url, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            self._conn.commit()
+
+    def get_doc_template(self) -> dict | None:
+        """전역 Docs 템플릿 설정. 없으면 None. 반환: {template_id, template_url, updated_at}."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT template_id, template_url, updated_at FROM app_doc_template WHERE id=1"
+            ).fetchone()
+        if not row or not (row["template_id"] or "").strip():
+            return None
+        return {
+            "template_id": row["template_id"],
+            "template_url": row["template_url"],
+            "updated_at": row["updated_at"],
+        }
+
+    def clear_doc_template(self) -> bool:
+        """전역 Docs 템플릿 해제(→ 기본 HTML 회의록으로 복귀). 삭제 행 있으면 True."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM app_doc_template WHERE id=1")
+            self._conn.commit()
+        return cur.rowcount > 0
+
 
 def public_user(u: dict) -> dict:
     """프론트 계약 user 객체(id/username/displayName/role). 비번 해시는 절대 노출 안 함."""
@@ -906,6 +953,19 @@ def get_google_oauth_config() -> dict | None:
 
 def clear_google_oauth_config() -> bool:
     return store().clear_google_oauth_config()
+
+
+# ---- 모듈 레벨 전역 Docs 템플릿 헬퍼(싱글턴 store 위임) ----
+def set_doc_template(template_id: str, template_url: str) -> None:
+    store().set_doc_template(template_id, template_url)
+
+
+def get_doc_template() -> dict | None:
+    return store().get_doc_template()
+
+
+def clear_doc_template() -> bool:
+    return store().clear_doc_template()
 
 
 def update_profile(username: str, **fields) -> dict | None:
