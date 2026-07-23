@@ -74,16 +74,27 @@ def _seed(appmod, job_id: str, owner: str, status: str, kind: str, phase: str, *
 # ---------- 큐 스냅샷 / phase ----------
 def test_queue_snapshot_counts_by_phase():
     with _tmp() as (_auth, appmod, _client):
-        _seed(appmod, "a", "dev", "processing", "stt", "transcribing")
+        # active(점유)는 실제 슬롯 카운터(_inflight)로, 대기(queued)는 phase 로 집계.
+        appmod._inflight["stt"] = 1
+        appmod._inflight["llm"] = 1
         _seed(appmod, "b", "dev", "queued", "stt", "waiting_stt")
-        _seed(appmod, "c", "dev", "processing", "llm", "summarizing")
         _seed(appmod, "d", "dev", "queued", "stt", "waiting_llm")
-        _seed(appmod, "done", "dev", "done", "stt", "transcribing")  # 종료 → 집계 제외
         with appmod._jobs_lock:
             snap = appmod._queue_snapshot_locked()
         assert snap["sttActive"] == 1 and snap["sttQueued"] == 1
         assert snap["llmActive"] == 1 and snap["llmQueued"] == 1
         assert snap["sttSlots"] == appmod.STT_CONCURRENCY
+
+
+def test_stalled_error_job_still_counts_slot():
+    """CR#4: 스톨로 error 마감돼도 워커가 슬롯을 쥐고 있으면 sttActive 에 그대로 잡힌다."""
+    with _tmp() as (_auth, appmod, _client):
+        appmod._inflight["stt"] = 1  # 워커가 STT 임계구역 점유 중(아직 transcribe 반환 전)
+        _seed(appmod, "stuck", "dev", "error", "stt", "transcribing")  # 스톨 error 마감된 잡
+        appmod._job_meta["stuck"]["warning"] = "stt_stalled"
+        with appmod._jobs_lock:
+            snap = appmod._queue_snapshot_locked()
+        assert snap["sttActive"] == 1  # 상태가 error 여도 점유 슬롯이 누락되지 않음
 
 
 # ---------- 스톨 스캔 ----------
@@ -130,6 +141,7 @@ def test_ai_job_endpoint_exposes_phase_and_queue():
     with _tmp() as (auth, appmod, client):
         hd = _headers(auth, appmod, "dev")
         dev_id = "dev"  # user["id"] == username
+        appmod._inflight["stt"] = 1  # 워커가 STT 슬롯 점유 중
         _seed(appmod, "j1", dev_id, "processing", "stt", "transcribing")
         r = client.get("/api/ai/jobs/j1", headers=hd)
         assert r.status_code == 200, r.text
@@ -145,6 +157,7 @@ def test_ai_job_endpoint_exposes_phase_and_queue():
 def test_ai_job_endpoint_ahead_position():
     with _tmp() as (auth, appmod, client):
         hd = _headers(auth, appmod, "dev")
+        appmod._inflight["stt"] = 1  # 활성 STT 슬롯 1 점유 중
         _seed(appmod, "active", "dev", "processing", "stt", "transcribing")
         # dev 의 대기 잡 앞에 더 먼저 생성된 대기 잡 하나
         _seed(appmod, "earlier", "admin", "queued", "stt", "waiting_stt", age=50.0)
@@ -161,6 +174,7 @@ def test_admin_ai_jobs_gate_and_snapshot():
         hd = _headers(auth, appmod, "dev")
         assert client.get("/api/admin/ai-jobs", headers=hd).status_code == 403
         assert client.get("/api/admin/ai-jobs").status_code == 401
+        appmod._inflight["stt"] = 1  # 활성 STT 슬롯 점유 중
         _seed(appmod, "x", "dev", "processing", "stt", "transcribing")
         r = client.get("/api/admin/ai-jobs", headers=ha)
         assert r.status_code == 200, r.text

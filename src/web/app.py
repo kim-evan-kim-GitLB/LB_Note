@@ -833,6 +833,15 @@ _job_owner: dict[str, str] = {}
 # 걸릴 때 중복 잡(→ 하위폴더/Doc 중복 생성 레이스)을 막는다. 잡 종료 시 해제. _jobs_lock 로 보호.
 _drive_sync_inflight: dict[str, str] = {}
 _jobs_lock = threading.Lock()
+# 실제 슬롯 점유 카운터 — 워커가 세마포어 임계구역 진입/이탈 시 증감한다. 잡 상태(processing 등)에서
+# 추론하지 않으므로, 스톨로 error 마감된 잡이 워커에서 아직 슬롯을 쥐고 있으면 그 점유가 그대로
+# 집계된다(상태 기반 집계가 놓치던 CR#4). _jobs_lock 로 보호.
+_inflight = {"stt": 0, "llm": 0}
+
+
+def _inflight_delta(kind: str, delta: int) -> None:
+    with _jobs_lock:
+        _inflight[kind] += delta
 
 # 동시 STT 추론 제한(백프레셔). GPU 1장에 요청마다 모델을 load 하므로, 동시에 N개만 돌리고
 # 나머지는 대기시킨다 → OOM/연산 경합 방지. 대기 중 잡 status='queued'(프론트가 "처리 대기 중…" 표시).
@@ -866,9 +875,13 @@ _job_cancels: dict[str, threading.Event] = {}
 # 남아 프로세스 수명 동안 누적된다 → 정리 루프가 '종료 상태를 처음 관측한 시각'부터 TTL 초과 시
 # 제거한다(모든 종료 경로가 시각을 남길 필요 없이 관측 기준 GC — 종료 경로가 여러 곳이라 견고).
 # TTL 은 폴링 창(수 초)보다 충분히 길어 진행 중이던 클라이언트가 결과를 못 받는 일이 없다.
+# 잡 결과(done 의 summary/transcript)는 스토어가 아닌 인메모리에만 있으므로, 클라이언트가 완료
+# 직후 폴링을 멈췄다(모바일 탭 서스펜드·노트북 절전) 나중에 복귀하는 경우까지 결과를 살리려 기본
+# TTL 을 2시간으로 둔다(CR#5 완화). 근본적으로는 완료 결과를 스토어에 영속화하는 것이 정답이며,
+# 그건 잡-GC 설계와 함께 별도로 다룬다.
 _JOB_TERMINAL_STATUSES = ("done", "error", "cancelled")
 _job_finished_at: dict[str, float] = {}
-JOB_RETENTION_SEC = float(os.environ.get("WEB_JOB_RETENTION_SEC", "1800"))
+JOB_RETENTION_SEC = float(os.environ.get("WEB_JOB_RETENTION_SEC", "7200"))
 
 
 def _purge_finished_jobs(ttl: float = JOB_RETENTION_SEC) -> int:
@@ -944,23 +957,23 @@ def _job_phase(job_id: str) -> str | None:
 
 
 def _queue_snapshot_locked() -> dict:
-    """현재 STT/LLM 슬롯 점유·대기 집계(_jobs_lock 보유 상태에서 호출). 진행 중 잡만 집계."""
-    stt_active = stt_wait = llm_active = llm_wait = 0
+    """현재 STT/LLM 슬롯 점유·대기 집계(_jobs_lock 보유 상태에서 호출).
+
+    active(점유)는 실제 세마포어 점유 카운터(_inflight)로 — 스톨로 error 마감돼도 워커가 슬롯을
+    쥐고 있으면 그대로 집계된다(상태 추론이 놓치던 CR#4). 대기(queued)는 phase 로 집계한다.
+    """
+    stt_wait = llm_wait = 0
     for jid, m in _job_meta.items():
         if _jobs.get(jid, {}).get("status") not in ("queued", "processing"):
             continue
         ph = m.get("phase")
-        if ph == "transcribing":
-            stt_active += 1
-        elif ph == "waiting_stt":
+        if ph == "waiting_stt":
             stt_wait += 1
-        elif ph == "summarizing":
-            llm_active += 1
         elif ph == "waiting_llm":
             llm_wait += 1
     return {
-        "sttSlots": STT_CONCURRENCY, "sttActive": stt_active, "sttQueued": stt_wait,
-        "llmSlots": LLM_CONCURRENCY, "llmActive": llm_active, "llmQueued": llm_wait,
+        "sttSlots": STT_CONCURRENCY, "sttActive": _inflight["stt"], "sttQueued": stt_wait,
+        "llmSlots": LLM_CONCURRENCY, "llmActive": _inflight["llm"], "llmQueued": llm_wait,
     }
 
 
@@ -1051,10 +1064,14 @@ def _run_ai_job(
                 return
             _mark_job(job_id, {"status": "processing"})
             _set_phase(job_id, "transcribing")  # STT 슬롯 확보 → 실제 전사 시작(스톨 탐지 기준)
-            with use_credential(credential), use_cancel_event(cancel):
-                seg_dicts, duration = transcribe_to_segments(
-                    audio_bytes, mime_type=mime_type, backend_name=CLEAN_BACKEND
-                )
+            _inflight_delta("stt", 1)  # 실제 슬롯 점유 시작(스톨 error 마감돼도 여기 반환까지 점유)
+            try:
+                with use_credential(credential), use_cancel_event(cancel):
+                    seg_dicts, duration = transcribe_to_segments(
+                        audio_bytes, mime_type=mime_type, backend_name=CLEAN_BACKEND
+                    )
+            finally:
+                _inflight_delta("stt", -1)  # 슬롯 반납(세마포어 해제 직전)
         if _job_cancelled(job_id, cancel):
             return
         # [2단계: LLM] GPU 슬롯은 반납한 상태 — 다음 사용자의 STT 가 여기서 시작될 수 있다.
@@ -1063,14 +1080,18 @@ def _run_ai_job(
             if _job_cancelled(job_id, cancel):
                 return
             _set_phase(job_id, "summarizing")  # LLM 슬롯 확보 → 요약/추출 진행
-            with use_credential(credential), use_cancel_event(cancel):
-                contract = enrich_to_contract(
-                    seg_dicts,
-                    duration,
-                    extract_backend_name=EXTRACT_BACKEND,
-                    summarize_backend_name=SUMMARIZE_BACKEND or None,
-                    clean_backend_name=CLEAN_BACKEND,
-                )
+            _inflight_delta("llm", 1)
+            try:
+                with use_credential(credential), use_cancel_event(cancel):
+                    contract = enrich_to_contract(
+                        seg_dicts,
+                        duration,
+                        extract_backend_name=EXTRACT_BACKEND,
+                        summarize_backend_name=SUMMARIZE_BACKEND or None,
+                        clean_backend_name=CLEAN_BACKEND,
+                    )
+            finally:
+                _inflight_delta("llm", -1)
         result = {
             "summary": contract.get("summary", {}),  # 구조체(dict) 계약 — 빈 기본값도 객체
             "actionItems": contract.get("actionItems", []),
@@ -1327,12 +1348,16 @@ def _run_regenerate_job(
                 return
             _mark_job(job_id, {"status": "processing"})
             _set_phase(job_id, "summarizing")  # LLM 슬롯 확보 → 재요약 진행
-            with use_credential(credential), use_cancel_event(cancel):
-                summary = summarize_meeting(segments, backend_name=SUMMARIZE_BACKEND or "passthrough")
-                hints = _summary_action_hints(summary)
-                action_items = extract_action_items(
-                    segments, backend_name=EXTRACT_BACKEND, summary_hints=hints
-                )
+            _inflight_delta("llm", 1)
+            try:
+                with use_credential(credential), use_cancel_event(cancel):
+                    summary = summarize_meeting(segments, backend_name=SUMMARIZE_BACKEND or "passthrough")
+                    hints = _summary_action_hints(summary)
+                    action_items = extract_action_items(
+                        segments, backend_name=EXTRACT_BACKEND, summary_hints=hints
+                    )
+            finally:
+                _inflight_delta("llm", -1)
         result = {"summary": summary, "actionItems": action_items}
         _mark_job(job_id, {"status": "done", "result": result})
     except AgentCLICancelled:
