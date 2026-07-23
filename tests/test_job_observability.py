@@ -169,6 +169,39 @@ def test_admin_ai_jobs_gate_and_snapshot():
         assert body["active"][0]["jobId"] == "x" and "sttStallSec" in body
 
 
+def test_reason_hint_no_false_stall_on_terminal():
+    """CR#1: 스톨 후 회복돼 완료/취소된 잡엔 스톨 힌트가 붙지 않는다(오경보 방지)."""
+    with _tmp() as (_auth, appmod, _client):
+        h = appmod._job_reason_hint
+        assert h({"status": "done", "phase": "transcribing", "warning": "stt_stalled"}) is None
+        assert h({"status": "cancelled", "warning": "stt_stalled"}) is None
+        # 진행 중이면 여전히 스톨 힌트 노출
+        assert "스톨" in h({"status": "processing", "phase": "transcribing", "warning": "stt_stalled"})
+
+
+def test_ai_job_done_drops_warning():
+    """CR#1: done 잡 응답은 warning=None·reasonHint=None(성공 회의에 거짓 경보 없음)."""
+    with _tmp() as (auth, appmod, client):
+        hd = _headers(auth, appmod, "dev")
+        _seed(appmod, "d1", "dev", "done", "stt", "transcribing")
+        appmod._job_meta["d1"]["warning"] = "stt_stalled"  # 스톨 후 회복·완료된 잡
+        body = client.get("/api/ai/jobs/d1", headers=hd).json()
+        assert body["warning"] is None and body["reasonHint"] is None
+
+
+def test_scan_stt_stall_mark_error_sets_cancel():
+    """CR#3: MARK_ERROR 스톨 마감 시 cancel 이벤트도 set → 워커의 done 덮어쓰기 차단."""
+    with _tmp() as (_auth, appmod, _client):
+        appmod.STT_STALL_MARK_ERROR = True
+        appmod.STT_STALL_SEC = 100.0
+        ev = appmod.threading.Event()
+        _seed(appmod, "stuck", "dev", "processing", "stt", "transcribing", age=999.0)
+        appmod._job_cancels["stuck"] = ev
+        appmod._scan_stt_stalls()
+        assert appmod._jobs["stuck"]["error_code"] == "stt_stalled"
+        assert ev.is_set()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

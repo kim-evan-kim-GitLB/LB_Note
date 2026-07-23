@@ -554,10 +554,12 @@ def _verify_credential(credential: dict) -> dict:
     try:
         with use_credential(credential):
             out = backend.generate(messages, max_tokens=16)
-    except AgentCLIAuthError as e:
-        return {"ok": False, "detail": f"인증 실패: {e}"}
+    except AgentCLIAuthError:
+        # 예외 메시지(stderr 조각 등)에 토큰이 반사될 여지를 원천 차단 — 고정 사유만 노출.
+        return {"ok": False, "detail": "인증 실패 — 토큰이 만료되었거나 무효합니다."}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "detail": f"검증 호출 실패: {type(e).__name__}: {e}"}
+        # 메시지 본문({e})은 싣지 않는다(secret 반사 방지). 유형명만 진단용으로 남긴다.
+        return {"ok": False, "detail": f"검증 호출 실패: {type(e).__name__}"}
     if not (out or "").strip():
         return {"ok": False, "detail": "빈 응답(인증/모델 응답 확인 필요)"}
     return {"ok": True, "detail": "검증 호출 성공"}
@@ -569,6 +571,10 @@ def _verify_credential(credential: dict) -> dict:
 _claude_cred_health: dict[str, dict] = {}
 _cred_health_lock = threading.Lock()
 _cred_health_meta: dict[str, str | None] = {"last_sweep_at": None}
+# 온디맨드 verify 남용 방지 — 사용자별 최근 실제 검증(ping) 시각(monotonic). 쿨다운 내 재호출은
+# 캐시를 돌려주고 실제 ping 은 _llm_semaphore 하에서만 수행(무제한 서브프로세스 생성 차단).
+_cred_verify_last: dict[str, float] = {}
+CRED_VERIFY_COOLDOWN_SEC = float(os.environ.get("WEB_CRED_VERIFY_COOLDOWN_SEC", "15"))
 
 
 def _credential_owner_type(username: str) -> str | None:
@@ -600,6 +606,15 @@ def _evaluate_credential_health(username: str) -> dict:
         }
     cred = auth.get_credential(username)
     if cred is None:
+        # 복호 실패 vs 동시 삭제(TOCTOU) 구분: owner_type 관측 직후 사용자가 clear 했다면 행이
+        # 사라져 None 이 된다 → 행이 실제로 없으면 '미설정'으로, 여전히 있으면 진짜 '복호 실패'로.
+        if _credential_owner_type(username) is None:
+            with _cred_health_lock:
+                _claude_cred_health.pop(username, None)
+            return {
+                "type": None, "valid": None, "reason": "not_configured",
+                "detail": "자격증명 미설정", "checked_at": now_iso,
+            }
         health = {
             "type": owner_type, "valid": False, "reason": "decrypt_failed",
             "detail": "저장된 자격증명을 복호화하지 못했습니다(CRED_ENC_KEY 불일치 가능) — 재등록이 필요합니다.",
@@ -620,6 +635,35 @@ def _evaluate_credential_health(username: str) -> dict:
     with _cred_health_lock:
         _claude_cred_health[username] = health
     return health
+
+
+def _cache_cred_health_from_verification(username: str, cred_type: str, verification: dict) -> None:
+    """PUT(재등록) 직후의 verification 결과로 헬스 캐시를 즉시 갱신 — 재인증 후에도 옛 헬스가
+    남아 '만료'로 오표시되는 문제를 막는다. verification 은 이미 실제 ping 한 결과라 재-ping 없음."""
+    ok = bool(verification.get("ok"))
+    reason = "api_key" if (cred_type == "api_key" and ok) else ("ok" if ok else "verify_failed")
+    with _cred_health_lock:
+        _claude_cred_health[username] = {
+            "type": cred_type, "valid": ok, "reason": reason,
+            "detail": str(verification.get("detail", "")),
+            "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+        }
+
+
+def _mark_cred_health_invalid(username: str | None) -> None:
+    """요약/추출 잡이 claude 인증 실패로 종료됐을 때, 해당 사용자 헬스 캐시를 즉시 만료로 내린다.
+    배경 스윕(최대 CRED_HEALTH_INTERVAL_SEC) 전이라도 잡 실패라는 실시간 신호로 설정 배지가
+    '재인증 필요'를 반영하게 한다(폐기된 자격증명이 valid 로 계속 표시되는 창을 닫는다)."""
+    if not username:
+        return
+    with _cred_health_lock:
+        cur = _claude_cred_health.get(username)
+        _claude_cred_health[username] = {
+            "type": cur.get("type") if cur else None,
+            "valid": False, "reason": "verify_failed",
+            "detail": "요약/추출 잡이 claude 인증 실패로 종료되었습니다 — 재인증이 필요합니다.",
+            "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+        }
 
 
 def _sweep_credential_health() -> dict:
@@ -675,10 +719,27 @@ def verify_claude_credential_now(user: dict = Depends(require_user_active)) -> d
     """현재 사용자 자격증명을 실제 claude 호출로 즉시 재검증 → 캐시 갱신 후 상태 반환.
 
     반환: {configured, type, updated_at, health:{valid,reason,detail,checked_at}}.
-    oauth_token 만료·폐기를 사용자가 설정 화면에서 능동적으로 확인할 때 쓴다(호출 1회 발생).
+    oauth_token 만료·폐기를 사용자가 설정 화면에서 능동적으로 확인할 때 쓴다.
+
+    남용 방지: 쿨다운(WEB_CRED_VERIFY_COOLDOWN_SEC) 내 재호출은 캐시를 돌려주고, 실제 claude ping
+    은 _llm_semaphore 하에서만 수행한다 → 반복 호출로 서브프로세스가 무제한 생성돼 스레드풀을
+    고갈시키는 자원고갈(DoS) 표면을 닫는다.
     """
-    status = auth.credential_status(user["username"])
-    status["health"] = _evaluate_credential_health(user["username"])
+    username = user["username"]
+    now = time.monotonic()
+    with _cred_health_lock:
+        last = _cred_verify_last.get(username, 0.0)
+        cached = _claude_cred_health.get(username)
+    if cached is not None and (now - last) < CRED_VERIFY_COOLDOWN_SEC:
+        status = auth.credential_status(username)
+        status["health"] = cached  # 쿨다운 내 — 재-ping 없이 최근 캐시 반환
+        return status
+    with _llm_semaphore:  # 실제 ping 은 LLM 슬롯 하에서만(동시 폭주 시 무제한 스폰 차단)
+        health = _evaluate_credential_health(username)
+    with _cred_health_lock:
+        _cred_verify_last[username] = time.monotonic()
+    status = auth.credential_status(username)
+    status["health"] = health
     return status
 
 
@@ -742,6 +803,12 @@ def put_claude_credential(
     # 저장 직후 그 자격증명으로 검증(실패해도 저장 유지).
     credential = auth.get_credential(user["username"])
     verification = _verify_credential(credential) if credential else {"ok": False, "detail": "저장 실패"}
+    # 재등록 결과를 헬스 캐시에 즉시 반영 — 옛 캐시(만료 등)가 재인증 후에도 남지 않게 한다.
+    if credential:
+        _cache_cred_health_from_verification(user["username"], credential["type"], verification)
+    else:
+        with _cred_health_lock:
+            _claude_cred_health.pop(user["username"], None)
     return {"status": auth.credential_status(user["username"]), "verification": verification}
 
 
@@ -749,6 +816,9 @@ def put_claude_credential(
 def delete_claude_credential(user: dict = Depends(require_user_active)) -> dict:
     """현재 사용자 자격증명 삭제 → 전역 폴백으로 복귀."""
     cleared = auth.clear_credential(user["username"])
+    with _cred_health_lock:
+        _claude_cred_health.pop(user["username"], None)  # 삭제 시 옛 헬스 캐시도 함께 제거
+        _cred_verify_last.pop(user["username"], None)
     return {"ok": True, "cleared": cleared, "status": auth.credential_status(user["username"])}
 
 
@@ -920,6 +990,11 @@ def _scan_stt_stalls() -> list[dict]:
                     "error": f"STT 엔진이 응답하지 않습니다(경과 {elapsed:.0f}s). 잠시 후 다시 시도하세요.",
                     "error_code": "stt_stalled",
                 }
+                # 취소 이벤트도 set — 멈췄던 워커가 나중에 STT 를 반환하면 단계 경계에서 이탈해,
+                # 이미 사용자에게 통보한 error 를 done 으로 되덮는 것을 막는다(잘못된 실패 판정 유지).
+                ev = _job_cancels.get(jid)
+                if ev is not None:
+                    ev.set()
             if not already:  # 최초 탐지만 보고(중복 로그 억제)
                 newly.append({"job": jid, "owner": _job_owner.get(jid), "elapsed_sec": elapsed})
     for s in newly:
@@ -1013,6 +1088,7 @@ def _run_ai_job(
             job_id,
             {"status": "error", "error": str(e), "error_code": "claude_auth_expired"},
         )
+        _mark_cred_health_invalid(_job_owner.get(job_id))  # 실시간 신호로 헬스 배지 즉시 만료 반영
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         # STT 단계(전사/슬롯 대기) 실패는 엔진 이상으로 구분 태깅 → 프론트가 "자격증명/경합"과
@@ -1075,7 +1151,9 @@ def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
         ahead = None
         if m is not None:
             out["phase"] = m["phase"]
-            out["warning"] = m.get("warning")
+            # 스톨 경고는 '진행 중'일 때만 의미가 있다 — 스톨 후 엔진이 회복돼 done 으로 끝난
+            # 잡에까지 warning 을 실어 보내면 성공한 회의에 거짓 '엔진 무응답' 경보가 뜬다.
+            out["warning"] = m.get("warning") if j.get("status") in ("queued", "processing") else None
             if j.get("status") in ("queued", "processing"):
                 out["elapsedSec"] = round(now - m["created_at"], 1)  # 접수 후 총 경과
                 out["phaseElapsedSec"] = round(now - m["phase_at"], 1)  # 현 단계 경과
@@ -1102,8 +1180,8 @@ def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
 def _job_reason_hint(out: dict) -> str | None:
     """폴링 응답 → 한 줄 원인 힌트(경합/전사중/요약중/스톨/엔진오류/인증). 없으면 None."""
     status, phase = out.get("status"), out.get("phase")
-    if out.get("warning") == "stt_stalled":
-        return "STT 엔진이 응답하지 않습니다(스톨 의심) — 관리자 확인이 필요합니다."
+    # 종료 상태부터 판정 — done/cancelled 는 힌트 없음, error 는 코드별. 스톨 경고는 그 뒤(진행 중만)라
+    # 회복돼 완료된 잡에 거짓 스톨 힌트가 붙지 않는다.
     if status == "error":
         code = out.get("error_code")
         if code == "claude_auth_expired":
@@ -1113,6 +1191,10 @@ def _job_reason_hint(out: dict) -> str | None:
         if code == "stt_stalled":
             return "STT 엔진 무응답으로 마감되었습니다 — 백엔드 엔진 점검이 필요합니다."
         return None
+    if status in ("done", "cancelled"):
+        return None
+    if out.get("warning") == "stt_stalled":  # 여기부터 진행 중(queued/processing)만
+        return "STT 엔진이 응답하지 않습니다(스톨 의심) — 관리자 확인이 필요합니다."
     if status == "queued":
         if phase == "waiting_stt":
             ahead = out.get("ahead")
@@ -1261,6 +1343,7 @@ def _run_regenerate_job(
             job_id,
             {"status": "error", "error": str(e), "error_code": "claude_auth_expired"},
         )
+        _mark_cred_health_invalid(_job_owner.get(job_id))  # 실시간 신호로 헬스 배지 즉시 만료 반영
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         _mark_job(job_id, {"status": "error", "error": f"{type(e).__name__}: {e}"})
@@ -2751,6 +2834,8 @@ def admin_metrics(user: dict = Depends(require_admin)) -> dict:
 def health() -> dict:
     # claude 구독 인증 상태(요약/추출 백엔드가 agent_cli 일 때만 의미 있음). 만료/미로그인
     # 이면 프론트·운영자가 미리 재인증할 수 있게 노출(토큰 값은 절대 포함하지 않음).
+    # agent_cli 사용 여부는 호출 시점에 재계산 — 백엔드를 런타임에 재지정해도 실제 값과 일치.
+    uses_agent_cli = "agent_cli" in (CLEAN_BACKEND, EXTRACT_BACKEND, SUMMARIZE_BACKEND)
     return {
         "ok": True,
         "clean_backend": CLEAN_BACKEND,
@@ -2758,7 +2843,7 @@ def health() -> dict:
         "summarize_backend": SUMMARIZE_BACKEND or "off",
         "stt_model": "Cohere transcribe-03-2026",
         "auth_users": users.count(),
-        "claude_auth": claude_auth_status() if USES_AGENT_CLI else {"ok": True, "reason": "not_used"},
+        "claude_auth": claude_auth_status() if uses_agent_cli else {"ok": True, "reason": "not_used"},
     }
 
 
