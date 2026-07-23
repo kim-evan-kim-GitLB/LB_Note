@@ -168,6 +168,70 @@ def test_admin_health_endpoint_counts_and_gate():
         assert "tok-d" not in client.get("/api/admin/claude-credential-health", headers=ha).text
 
 
+def test_put_refreshes_health_cache():
+    """CR#2: 재인증(PUT) 직후 헬스 캐시가 즉시 갱신돼 옛 '만료'가 남지 않는다."""
+    with _tmp() as (auth, appmod, client):
+        appmod.auth.set_credential("dev", "oauth_token", "old")
+        hd = _headers(auth, appmod, "dev")
+        with mock.patch.object(appmod, "_verify_credential", return_value={"ok": False, "detail": "인증 실패"}):
+            appmod._evaluate_credential_health("dev")  # 배경 스윕이 만료 캐시
+        assert appmod._claude_cred_health["dev"]["valid"] is False
+        with mock.patch.object(appmod, "_verify_credential", return_value={"ok": True, "detail": "ok"}):
+            r = client.put(
+                "/api/settings/claude-credential",
+                json={"cred_type": "oauth_token", "secret": "new"}, headers=hd,
+            )
+        assert r.status_code == 200
+        assert appmod._claude_cred_health["dev"]["valid"] is True
+        assert client.get("/api/settings/claude-credential", headers=hd).json()["health"]["valid"] is True
+
+
+def test_delete_pops_health_cache():
+    """CR#2: 삭제 시 옛 헬스 캐시도 함께 제거."""
+    with _tmp() as (auth, appmod, client):
+        appmod.auth.set_credential("dev", "oauth_token", "tok")
+        hd = _headers(auth, appmod, "dev")
+        with mock.patch.object(appmod, "_verify_credential", return_value={"ok": True, "detail": "ok"}):
+            appmod._evaluate_credential_health("dev")
+        assert "dev" in appmod._claude_cred_health
+        client.delete("/api/settings/claude-credential", headers=hd)
+        assert "dev" not in appmod._claude_cred_health
+
+
+def test_evaluate_toctou_row_gone_is_not_configured():
+    """CR#8: owner_type 관측 직후 동시 삭제로 get_credential=None → decrypt_failed 아닌 not_configured."""
+    with _tmp() as (_auth, appmod, _client):
+        with mock.patch.object(appmod, "_credential_owner_type", side_effect=["oauth_token", None]), \
+             mock.patch.object(appmod.auth, "get_credential", return_value=None):
+            h = appmod._evaluate_credential_health("dev")
+        assert h["reason"] == "not_configured" and h["valid"] is None
+
+
+def test_job_auth_failure_marks_health_invalid():
+    """CR#6: 잡이 claude 인증 실패로 죽으면 헬스 캐시가 즉시 만료로 내려간다."""
+    with _tmp() as (_auth, appmod, _client):
+        appmod._claude_cred_health["dev"] = {
+            "type": "oauth_token", "valid": True, "reason": "ok", "detail": "", "checked_at": "x",
+        }
+        appmod._mark_cred_health_invalid("dev")
+        assert appmod._claude_cred_health["dev"]["valid"] is False
+        assert appmod._claude_cred_health["dev"]["reason"] == "verify_failed"
+        appmod._mark_cred_health_invalid(None)  # None 안전(예외 없음)
+
+
+def test_verify_cooldown_skips_reping():
+    """CR#10: 쿨다운 내 verify 재호출은 캐시 반환 — 실제 ping(서브프로세스) 재발생 안 함."""
+    with _tmp() as (auth, appmod, client):
+        appmod.auth.set_credential("dev", "oauth_token", "tok")
+        hd = _headers(auth, appmod, "dev")
+        with mock.patch.object(appmod, "_verify_credential", return_value={"ok": True, "detail": "ok"}) as m:
+            r1 = client.get("/api/settings/claude-credential/verify", headers=hd)
+            r2 = client.get("/api/settings/claude-credential/verify", headers=hd)
+        assert r1.status_code == 200 and r2.status_code == 200
+        assert m.call_count == 1  # 2회 호출이지만 실제 ping 은 1회
+        assert r2.json()["health"]["valid"] is True
+
+
 if __name__ == "__main__":
     import sys
 
