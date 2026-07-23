@@ -604,6 +604,22 @@ class UserStore:
             return {"configured": False, "type": None, "updated_at": None}
         return {"configured": True, "type": cred["type"], "updated_at": cred["updated_at"]}
 
+    def list_credential_owners(self) -> list[dict]:
+        """자격증명 **행이 존재하는** 사용자 목록(복호 없이 행 메타만). secret 미노출.
+
+        반환: [{"username", "type", "updated_at"}]. 복호를 하지 않으므로 CRED_ENC_KEY
+        불일치로 복호 불가한 행도 그대로 나온다 — 배경 헬스체크가 get_credential(복호)과
+        대조해 '만료'와 '복호 실패(키 손상)'를 구분하는 근거가 된다.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT username, cred_type, updated_at FROM claude_credentials"
+            ).fetchall()
+        return [
+            {"username": r["username"], "type": r["cred_type"], "updated_at": r["updated_at"]}
+            for r in rows
+        ]
+
     # ---- 사용자별 Google Drive 자격증명(google_credentials 테이블) ----
     def set_google_credential(
         self, username: str, refresh_token: str, *, email: str | None = None
@@ -916,6 +932,11 @@ def clear_credential(username: str) -> bool:
 def credential_status(username: str) -> dict:
     """secret 비노출 공개 상태."""
     return store().credential_status(username)
+
+
+def list_credential_owners() -> list[dict]:
+    """자격증명 행이 있는 사용자 목록(복호 없이 행 메타만). secret 미노출."""
+    return store().list_credential_owners()
 
 
 # ---- 모듈 레벨 Google 자격증명 헬퍼(싱글턴 store 위임) ----

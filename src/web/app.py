@@ -16,6 +16,7 @@ import datetime as dt
 import os
 import re
 import threading
+import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
@@ -77,6 +78,8 @@ EXTRACT_BACKEND = os.environ.get("WEB_EXTRACT_BACKEND", CLEAN_BACKEND)
 # 요약 백엔드. 미지정 시 off(passthrough → 빈 요약). 회의당 1콜이라 클라우드도 저비용 →
 # "정제=passthrough, 요약=agent_cli"만 켜기 가능(WEB_SUMMARIZE_BACKEND=agent_cli). 설계 §6 폴백.
 SUMMARIZE_BACKEND = os.environ.get("WEB_SUMMARIZE_BACKEND", "")
+# 정제·추출·요약 중 하나라도 agent_cli(=claude 서브프로세스 인증)면 자격증명 헬스체크가 의미 있다.
+USES_AGENT_CLI = "agent_cli" in (CLEAN_BACKEND, EXTRACT_BACKEND, SUMMARIZE_BACKEND)
 # 빌드된 프론트 정적 경로(컨테이너). 없으면 정적 서빙 비활성(dev=Vite).
 FRONTEND_DIST = os.environ.get("WEB_FRONTEND_DIST", "")
 
@@ -100,6 +103,18 @@ DB_BACKUP_INTERVAL_SEC = float(
 )
 DB_BACKUP_KEEP = int(os.environ.get("WEB_DB_BACKUP_KEEP", str(maintenance.DEFAULT_DB_BACKUP_KEEP)))
 
+# ---------- claude 자격증명 헬스체크(요약/추출 백엔드 인증 만료 사전 감지) ----------
+# 요약/추출이 agent_cli 일 때만 의미가 있다. oauth_token(구독 토큰)은 비번 변경·폐기로
+# 조용히 만료되므로, 주기적으로 사용자별 자격증명을 실제 ping 해 유효성을 캐시한다. api_key 는
+# 만료 개념이 없어 호출 없이 valid 처리, 복호 실패(CRED_ENC_KEY 손상) 행은 별도로 표시한다.
+CRED_HEALTH_CHECK_ENABLED = os.environ.get("WEB_CRED_HEALTH_CHECK_ENABLED", "1") != "0"
+# 기본 6시간. 구독 토큰 만료 감지 목적이라 촘촘할 필요가 없다(비용/부하 절약).
+CRED_HEALTH_INTERVAL_SEC = float(os.environ.get("WEB_CRED_HEALTH_INTERVAL_SEC", "21600"))
+# 부팅 직후 즉시 훑지 않고 잠깐 늦춘다(기동 트래픽·모델 로드와 겹치지 않게). 기본 60초.
+CRED_HEALTH_INITIAL_DELAY_SEC = float(os.environ.get("WEB_CRED_HEALTH_INITIAL_DELAY_SEC", "60"))
+# 사용자 간 ping 간 최소 간격(초) — 순차 실행이지만 폭주 방지용 소량 텀. 기본 0.5초.
+CRED_HEALTH_PER_USER_DELAY_SEC = float(os.environ.get("WEB_CRED_HEALTH_PER_USER_DELAY_SEC", "0.5"))
+
 # ---------- Google Drive 회의록 동기화(사용자별 OAuth) ----------
 # 콜백 state(신원+CSRF) 토큰 TTL(초, 기본 10분) — 동의 왕복은 짧다.
 GOOGLE_STATE_TTL = int(os.environ.get("WEB_GOOGLE_STATE_TTL", "600"))
@@ -122,19 +137,28 @@ CALENDAR_DELETE_ON_MEETING_DELETE = os.environ.get("WEB_CALENDAR_DELETE_ON_MEETI
 async def _cleanup_loop() -> None:
     """부팅 직후 1회 + 이후 CLEANUP_INTERVAL_SEC 주기로 정리 배치 실행.
 
-    블로킹 디스크 IO(run_cleanup_once)는 asyncio.to_thread 로 워커스레드에 위임해 이벤트 루프를
-    막지 않는다(store 는 _lock·check_same_thread=False 라 별도 스레드 접근 안전). 개별 사이클의
-    예외는 로깅 후 삼켜 루프가 죽지 않게 한다.
+    두 가지를 돈다: (1) 디스크 정리(staging/backup) — CLEANUP_ENABLED 일 때만. (2) 종료된 AI 잡의
+    인메모리 GC — 디스크 정리 스위치와 무관하게 항상 실행한다(WEB_CLEANUP_ENABLED=0 로 디스크 정리만
+    꺼도 잡 누적은 계속 방지). 블로킹 작업(디스크 IO·락 보유 스캔)은 asyncio.to_thread 로 워커스레드에
+    위임해 이벤트 루프를 막지 않는다. 개별 사이클 예외는 로깅 후 삼켜 루프를 지킨다.
     """
     while True:
+        if CLEANUP_ENABLED:
+            try:
+                await asyncio.to_thread(
+                    maintenance.run_cleanup_once,
+                    store,
+                    staging_max_age=STAGING_MAX_AGE_SEC,
+                    backup_max_age=BACKUP_MAX_AGE_SEC,
+                )
+            except Exception:  # noqa: BLE001 — 한 사이클 실패가 스케줄러를 죽이지 않게 격리
+                traceback.print_exc()
         try:
-            await asyncio.to_thread(
-                maintenance.run_cleanup_once,
-                store,
-                staging_max_age=STAGING_MAX_AGE_SEC,
-                backup_max_age=BACKUP_MAX_AGE_SEC,
-            )
-        except Exception:  # noqa: BLE001 — 한 사이클 실패가 스케줄러를 죽이지 않게 격리
+            # 종료된 AI 잡 인메모리 항목 GC — _jobs_lock 보유 스캔이라 to_thread 로 이벤트 루프 비점유.
+            purged = await asyncio.to_thread(_purge_finished_jobs)
+            if purged:
+                observability.audit("ai_job.purge", removed=purged)
+        except Exception:  # noqa: BLE001 — 정리 실패가 스케줄러를 죽이지 않게 격리
             traceback.print_exc()
         await asyncio.sleep(CLEANUP_INTERVAL_SEC)
 
@@ -163,12 +187,24 @@ async def lifespan(app: FastAPI):
     """
     in_test = os.environ.get("MEETSCRIPT_BLOCK_DEFAULT_DB") == "1"
     tasks: list[asyncio.Task] = []
-    if not in_test and CLEANUP_ENABLED:
+    # _cleanup_loop 은 (CLEANUP_ENABLED 시)디스크 정리 + (항상)종료 잡 인메모리 GC 를 돈다 →
+    # 디스크 정리를 꺼도(WEB_CLEANUP_ENABLED=0) 잡 GC 를 위해 루프는 띄운다(테스트 제외).
+    if not in_test:
         tasks.append(asyncio.create_task(_cleanup_loop()))
-        observability.audit("scheduler.start", kind="cleanup", interval=CLEANUP_INTERVAL_SEC)
+        observability.audit(
+            "scheduler.start", kind="cleanup", interval=CLEANUP_INTERVAL_SEC, disk_cleanup=CLEANUP_ENABLED
+        )
     if not in_test and DB_BACKUP_ENABLED:
         tasks.append(asyncio.create_task(_db_backup_loop()))
         observability.audit("scheduler.start", kind="db_backup", interval=DB_BACKUP_INTERVAL_SEC)
+    # 자격증명 헬스 스윕 — 요약/추출이 agent_cli 일 때만(그 외엔 인증 자체가 무의미).
+    if not in_test and CRED_HEALTH_CHECK_ENABLED and USES_AGENT_CLI:
+        tasks.append(asyncio.create_task(_claude_cred_health_loop()))
+        observability.audit("scheduler.start", kind="cred_health", interval=CRED_HEALTH_INTERVAL_SEC)
+    # STT 스톨 워치독 — 멈춘 전사 잡을 탐지해 프론트/관리자에 보고(슬롯 무한 점유 조기 관측).
+    if not in_test:
+        tasks.append(asyncio.create_task(_stt_stall_watchdog_loop()))
+        observability.audit("scheduler.start", kind="stt_stall", interval=STT_STALL_SCAN_SEC)
     try:
         yield
     finally:
@@ -527,10 +563,168 @@ def _verify_credential(credential: dict) -> dict:
     return {"ok": True, "detail": "검증 호출 성공"}
 
 
+# ---------- claude 자격증명 헬스(만료/폐기 사전 감지) 캐시 ----------
+# username → {type, valid(bool|None), reason, detail(secret 없음), checked_at(iso)}.
+# 배경 스윕과 온디맨드 verify 가 갱신한다. 프로세스 재기동 시 비고, 다음 스윕이 복원.
+_claude_cred_health: dict[str, dict] = {}
+_cred_health_lock = threading.Lock()
+_cred_health_meta: dict[str, str | None] = {"last_sweep_at": None}
+
+
+def _credential_owner_type(username: str) -> str | None:
+    """자격증명 행이 있으면 종류(api_key|oauth_token), 없으면 None. 복호 미수행(행 존재만)."""
+    for o in auth.list_credential_owners():
+        if o["username"] == username:
+            return o["type"]
+    return None
+
+
+def _evaluate_credential_health(username: str) -> dict:
+    """사용자 자격증명의 실제 유효성을 판정하고 캐시를 갱신 → health dict 반환.
+
+    상태 구분(운영자가 '만료'와 '키 손상'과 '미설정'을 구별할 수 있게):
+      - not_configured : 자격증명 행 없음(valid=None).
+      - decrypt_failed : 행은 있으나 복호 실패(CRED_ENC_KEY 불일치 → 재등록 필요, valid=False).
+      - api_key        : 만료 개념 없음 → 호출 없이 valid=True.
+      - oauth_token    : 실제 claude ping 1콜로 판정(valid=ok, reason=ok|verify_failed).
+    secret 은 어떤 필드/로그에도 싣지 않는다.
+    """
+    now_iso = dt.datetime.now().isoformat(timespec="seconds")
+    owner_type = _credential_owner_type(username)
+    if owner_type is None:
+        with _cred_health_lock:
+            _claude_cred_health.pop(username, None)  # 미설정은 캐시에 남기지 않음
+        return {
+            "type": None, "valid": None, "reason": "not_configured",
+            "detail": "자격증명 미설정", "checked_at": now_iso,
+        }
+    cred = auth.get_credential(username)
+    if cred is None:
+        health = {
+            "type": owner_type, "valid": False, "reason": "decrypt_failed",
+            "detail": "저장된 자격증명을 복호화하지 못했습니다(CRED_ENC_KEY 불일치 가능) — 재등록이 필요합니다.",
+            "checked_at": now_iso,
+        }
+    elif cred["type"] == "api_key":
+        health = {
+            "type": "api_key", "valid": True, "reason": "api_key",
+            "detail": "API 키는 만료 개념이 없습니다.", "checked_at": now_iso,
+        }
+    else:  # oauth_token — 실제 호출로만 만료/폐기를 알 수 있다
+        v = _verify_credential(cred)
+        health = {
+            "type": "oauth_token", "valid": bool(v.get("ok")),
+            "reason": "ok" if v.get("ok") else "verify_failed",
+            "detail": str(v.get("detail", "")), "checked_at": now_iso,
+        }
+    with _cred_health_lock:
+        _claude_cred_health[username] = health
+    return health
+
+
+def _sweep_credential_health() -> dict:
+    """자격증명 보유 사용자 전체를 순차 판정(블로킹). to_thread 로 워커스레드에서 실행.
+
+    api_key 는 호출 없이 통과, oauth_token 만 실제 ping 한다. 사용자 간 소량 텀으로 폭주 방지.
+    """
+    owners = auth.list_credential_owners()
+    checked = 0
+    for o in owners:
+        try:
+            _evaluate_credential_health(o["username"])
+            checked += 1
+        except Exception:  # noqa: BLE001 — 한 사용자 실패가 스윕 전체를 죽이지 않게 격리
+            traceback.print_exc()
+        if CRED_HEALTH_PER_USER_DELAY_SEC > 0:
+            time.sleep(CRED_HEALTH_PER_USER_DELAY_SEC)
+    _cred_health_meta["last_sweep_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    return {"owners": len(owners), "checked": checked}
+
+
+async def _claude_cred_health_loop() -> None:
+    """부팅 후 INITIAL_DELAY → 이후 INTERVAL 주기로 자격증명 헬스 스윕.
+
+    블로킹 ping(_sweep_credential_health)은 asyncio.to_thread 로 이벤트 루프 비점유. 개별 사이클
+    예외는 로깅 후 삼켜 루프를 지킨다. agent_cli 미사용이면 lifespan 에서 애초에 띄우지 않는다.
+    """
+    await asyncio.sleep(CRED_HEALTH_INITIAL_DELAY_SEC)
+    while True:
+        try:
+            summary = await asyncio.to_thread(_sweep_credential_health)
+            observability.audit("cred_health.sweep", **summary)
+        except Exception:  # noqa: BLE001 — 스윕 실패가 스케줄러를 죽이지 않게 격리
+            traceback.print_exc()
+        await asyncio.sleep(CRED_HEALTH_INTERVAL_SEC)
+
+
 @app.get("/api/settings/claude-credential")
 def get_claude_credential(user: dict = Depends(require_user_active)) -> dict:
-    """현재 사용자 자격증명 상태(secret 비노출): {configured, type, updated_at}."""
-    return auth.credential_status(user["username"])
+    """현재 사용자 자격증명 상태(secret 비노출) + 최근 캐시 헬스.
+
+    반환: {configured, type, updated_at, health}. health 는 마지막 스윕/verify 의 캐시값
+    (없으면 None) — 실시간 재검증은 GET .../claude-credential/verify.
+    """
+    status = auth.credential_status(user["username"])
+    with _cred_health_lock:
+        status["health"] = _claude_cred_health.get(user["username"])
+    return status
+
+
+@app.get("/api/settings/claude-credential/verify")
+def verify_claude_credential_now(user: dict = Depends(require_user_active)) -> dict:
+    """현재 사용자 자격증명을 실제 claude 호출로 즉시 재검증 → 캐시 갱신 후 상태 반환.
+
+    반환: {configured, type, updated_at, health:{valid,reason,detail,checked_at}}.
+    oauth_token 만료·폐기를 사용자가 설정 화면에서 능동적으로 확인할 때 쓴다(호출 1회 발생).
+    """
+    status = auth.credential_status(user["username"])
+    status["health"] = _evaluate_credential_health(user["username"])
+    return status
+
+
+@app.get("/api/admin/claude-credential-health")
+def admin_claude_credential_health(user: dict = Depends(require_admin)) -> dict:
+    """관리자용 자격증명 헬스 집계(secret 없음) — '1명 vs 전체' 영향 범위 판단용.
+
+    counts: configured/valid/invalid/decrypt_failed/unchecked + 종류별(api_key/oauth_token).
+    users: 문제 우선 정렬(invalid/decrypt_failed 상단). 최근 스윕 시각 포함.
+    """
+    owners = auth.list_credential_owners()
+    with _cred_health_lock:
+        cache = dict(_claude_cred_health)
+    counts = {
+        "configured": len(owners), "valid": 0, "invalid": 0,
+        "decrypt_failed": 0, "unchecked": 0, "api_key": 0, "oauth_token": 0,
+    }
+    rows: list[dict] = []
+    for o in owners:
+        counts[o["type"]] = counts.get(o["type"], 0) + 1
+        h = cache.get(o["username"])
+        if h is None:
+            counts["unchecked"] += 1
+            valid, reason, checked_at = None, "unchecked", None
+        else:
+            valid, reason, checked_at = h.get("valid"), h.get("reason"), h.get("checked_at")
+            if reason == "decrypt_failed":
+                counts["decrypt_failed"] += 1
+            elif valid is True:
+                counts["valid"] += 1
+            elif valid is False:
+                counts["invalid"] += 1
+        rows.append({
+            "username": o["username"], "type": o["type"], "updated_at": o["updated_at"],
+            "valid": valid, "reason": reason, "checked_at": checked_at,
+        })
+    # 문제(valid=False/None)를 상단으로 — 운영자가 먼저 보게.
+    rows.sort(key=lambda r: (r["valid"] is True, r["username"]))
+    return {
+        "usesAgentCli": USES_AGENT_CLI,
+        "checkEnabled": CRED_HEALTH_CHECK_ENABLED,
+        "intervalSec": CRED_HEALTH_INTERVAL_SEC,
+        "lastSweepAt": _cred_health_meta.get("last_sweep_at"),
+        "counts": counts,
+        "users": rows,
+    }
 
 
 @app.put("/api/settings/claude-credential")
@@ -573,12 +767,23 @@ _jobs_lock = threading.Lock()
 # 동시 STT 추론 제한(백프레셔). GPU 1장에 요청마다 모델을 load 하므로, 동시에 N개만 돌리고
 # 나머지는 대기시킨다 → OOM/연산 경합 방지. 대기 중 잡 status='queued'(프론트가 "처리 대기 중…" 표시).
 # 기본 1(직렬). WEB_STT_CONCURRENCY 로 조정(예: VRAM 여유 시 2). (모델 상주/유휴 언로드는 v2.)
-_stt_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_STT_CONCURRENCY", "1"))))
+STT_CONCURRENCY = max(1, int(os.environ.get("WEB_STT_CONCURRENCY", "1")))
+_stt_semaphore = threading.Semaphore(STT_CONCURRENCY)
 
 # LLM(요약·추출) 동시성 제한 — GPU 와 무관한 agent_cli/클라우드 호출이라 _stt_semaphore 와
 # 분리한다: A 가 요약(수 분) 중이어도 B 의 STT 가 시작될 수 있다. 기본 2(사용자별 자격증명이라
 # rate limit 도 사용자별). WEB_LLM_CONCURRENCY 로 조정.
-_llm_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_LLM_CONCURRENCY", "2"))))
+LLM_CONCURRENCY = max(1, int(os.environ.get("WEB_LLM_CONCURRENCY", "2")))
+_llm_semaphore = threading.Semaphore(LLM_CONCURRENCY)
+
+# STT 스톨(무한루프) 탐지 — STT 추론엔 내부 취소지점이 없어, 한 잡이 엔진에서 멈추면 슬롯 1개가
+# 영영 안 풀려 뒤 사용자가 무한 대기한다. phase='transcribing' 이 STT_STALL_SEC 를 넘으면 스톨로
+# 보고(warning=stt_stalled, audit·로그, 관리자 진단 노출). 소프트: 슬롯 자체는 재기동으로만 회수.
+# STT_STALL_MARK_ERROR=1 이면 대기 사용자에게 error(stt_stalled)로 마감까지 한다(정품 장시간 STT
+# 오탐 위험 있어 기본 OFF). 임계값은 넉넉히(기본 900s=15분; RTFx≈232라 정상은 분 단위 이하).
+STT_STALL_SEC = float(os.environ.get("WEB_STT_STALL_SEC", "900"))
+STT_STALL_SCAN_SEC = float(os.environ.get("WEB_STT_STALL_SCAN_SEC", "30"))
+STT_STALL_MARK_ERROR = os.environ.get("WEB_STT_STALL_MARK_ERROR", "0") != "0"
 
 # Drive 동기화 동시성 제한(네트워크 I/O — GPU 와 무관해 _stt_semaphore 와 분리). 기본 2.
 _drive_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_DRIVE_CONCURRENCY", "2"))))
@@ -587,10 +792,154 @@ _drive_semaphore = threading.Semaphore(max(1, int(os.environ.get("WEB_DRIVE_CONC
 # agent_cli 는 진행 중 claude 서브프로세스를 kill(use_cancel_event 채널). 잡 종료 시 정리.
 _job_cancels: dict[str, threading.Event] = {}
 
+# 종료(done/error/cancelled) 잡의 인메모리 항목 정리(TTL). 잡은 종료 후에도 _jobs/_job_owner 에
+# 남아 프로세스 수명 동안 누적된다 → 정리 루프가 '종료 상태를 처음 관측한 시각'부터 TTL 초과 시
+# 제거한다(모든 종료 경로가 시각을 남길 필요 없이 관측 기준 GC — 종료 경로가 여러 곳이라 견고).
+# TTL 은 폴링 창(수 초)보다 충분히 길어 진행 중이던 클라이언트가 결과를 못 받는 일이 없다.
+_JOB_TERMINAL_STATUSES = ("done", "error", "cancelled")
+_job_finished_at: dict[str, float] = {}
+JOB_RETENTION_SEC = float(os.environ.get("WEB_JOB_RETENTION_SEC", "1800"))
+
+
+def _purge_finished_jobs(ttl: float = JOB_RETENTION_SEC) -> int:
+    """종료 후 TTL 초과한 잡의 인메모리 항목(_jobs/_job_owner/_job_finished_at) 제거 → 제거 개수.
+
+    진행 중(queued/processing) 잡은 절대 건드리지 않는다. 종료 잡은 최초 관측 시각을 기록하고,
+    now - 관측시각 > ttl 이면 제거한다. _jobs_lock 하에 원자적으로 수행.
+    """
+    now = time.monotonic()
+    removed = 0
+    with _jobs_lock:
+        for jid, j in list(_jobs.items()):
+            if j.get("status") in _JOB_TERMINAL_STATUSES:
+                _job_finished_at.setdefault(jid, now)  # 종료 최초 관측 시각
+            else:
+                _job_finished_at.pop(jid, None)  # 진행 중은 대상 아님(방어)
+        for jid, ts in list(_job_finished_at.items()):
+            if jid not in _jobs or now - ts > ttl:
+                if _jobs.pop(jid, None) is not None:
+                    removed += 1  # 실제 잡 항목 제거만 카운트(고아 시각 정리는 제외)
+                _job_owner.pop(jid, None)
+                _job_finished_at.pop(jid, None)
+                _job_meta.pop(jid, None)  # 관측 메타도 함께 회수(잡 수명과 동일)
+    return removed
+
 
 def _mark_job(job_id: str, payload: dict) -> None:
     with _jobs_lock:
         _jobs[job_id] = payload
+
+
+# ---- 잡 진행/큐 관측(무한루프 원인 구분: 대기 경합 vs 엔진 스톨 vs 인증) ----
+# job_id → {kind, created_at(mono), started_at(mono|None), phase, phase_at(mono), warning}.
+# phase: waiting_stt → transcribing → waiting_llm → summarizing (STT 잡 기준). 이 phase 로
+# "무엇을 기다리는지/무엇을 처리 중인지"를 프론트가 구분 표시하고, 스톨 스캔이 엔진 무응답을 잡는다.
+_job_meta: dict[str, dict] = {}
+
+
+def _init_job_meta(job_id: str, kind: str) -> None:
+    """잡 생성 시 메타 초기화. kind='stt'(STT+요약) | 'llm'(재요약 등 LLM 전용)."""
+    now = time.monotonic()
+    with _jobs_lock:
+        _job_meta[job_id] = {
+            "kind": kind,
+            "created_at": now,
+            "started_at": None,
+            "phase": "waiting_stt" if kind == "stt" else "waiting_llm",
+            "phase_at": now,
+            "warning": None,
+        }
+
+
+def _set_phase(job_id: str, phase: str) -> None:
+    """잡 단계 전환 기록(전환 시각 갱신). 첫 실제 처리(transcribing/summarizing)에서 started_at 확정."""
+    now = time.monotonic()
+    with _jobs_lock:
+        m = _job_meta.get(job_id)
+        if m is None:  # 메타 미초기화 잡 방어(관측만; 없으면 만들어 둔다)
+            m = _job_meta[job_id] = {
+                "kind": "stt", "created_at": now, "started_at": None,
+                "phase": phase, "phase_at": now, "warning": None,
+            }
+        m["phase"] = phase
+        m["phase_at"] = now
+        if phase in ("transcribing", "summarizing") and m["started_at"] is None:
+            m["started_at"] = now
+
+
+def _job_phase(job_id: str) -> str | None:
+    with _jobs_lock:
+        m = _job_meta.get(job_id)
+        return m["phase"] if m else None
+
+
+def _queue_snapshot_locked() -> dict:
+    """현재 STT/LLM 슬롯 점유·대기 집계(_jobs_lock 보유 상태에서 호출). 진행 중 잡만 집계."""
+    stt_active = stt_wait = llm_active = llm_wait = 0
+    for jid, m in _job_meta.items():
+        if _jobs.get(jid, {}).get("status") not in ("queued", "processing"):
+            continue
+        ph = m.get("phase")
+        if ph == "transcribing":
+            stt_active += 1
+        elif ph == "waiting_stt":
+            stt_wait += 1
+        elif ph == "summarizing":
+            llm_active += 1
+        elif ph == "waiting_llm":
+            llm_wait += 1
+    return {
+        "sttSlots": STT_CONCURRENCY, "sttActive": stt_active, "sttQueued": stt_wait,
+        "llmSlots": LLM_CONCURRENCY, "llmActive": llm_active, "llmQueued": llm_wait,
+    }
+
+
+def _scan_stt_stalls() -> list[dict]:
+    """phase='transcribing' 이 STT_STALL_SEC 초과한 잡을 스톨로 표시 → 표시한 목록 반환.
+
+    소프트: 워커 스레드/토치 추론을 강제 종료하지 않는다(안전). warning 을 달아 프론트·관리자
+    진단에 노출하고, STT_STALL_MARK_ERROR 면 대기 사용자에게 error(stt_stalled)로 마감한다.
+    슬롯 자체의 회수는 프로세스 재기동으로만 가능(로그로 운영자에게 알린다).
+    """
+    now = time.monotonic()
+    newly: list[dict] = []
+    with _jobs_lock:
+        for jid, m in list(_job_meta.items()):
+            if m.get("phase") != "transcribing":
+                continue
+            if _jobs.get(jid, {}).get("status") != "processing":
+                continue
+            if now - m["phase_at"] <= STT_STALL_SEC:
+                continue
+            already = m.get("warning") == "stt_stalled"
+            m["warning"] = "stt_stalled"
+            elapsed = round(now - m["phase_at"], 1)
+            if STT_STALL_MARK_ERROR:
+                _jobs[jid] = {
+                    "status": "error",
+                    "error": f"STT 엔진이 응답하지 않습니다(경과 {elapsed:.0f}s). 잠시 후 다시 시도하세요.",
+                    "error_code": "stt_stalled",
+                }
+            if not already:  # 최초 탐지만 보고(중복 로그 억제)
+                newly.append({"job": jid, "owner": _job_owner.get(jid), "elapsed_sec": elapsed})
+    for s in newly:
+        observability.audit("stt.stall", marked_error=STT_STALL_MARK_ERROR, **s)
+        print(
+            f"[stt-stall] job={s['job']} owner={s['owner']} elapsed={s['elapsed_sec']}s "
+            "— STT 슬롯이 장시간 점유됨(엔진 스톨 의심). 지속되면 서버 재기동으로 슬롯 회수 필요.",
+            flush=True,
+        )
+    return newly
+
+
+async def _stt_stall_watchdog_loop() -> None:
+    """STT_STALL_SCAN_SEC 주기로 스톨 스캔(블로킹 없음 — 짧은 인메모리 스캔). 예외는 삼켜 루프 유지."""
+    while True:
+        await asyncio.sleep(STT_STALL_SCAN_SEC)
+        try:
+            _scan_stt_stalls()
+        except Exception:  # noqa: BLE001 — 스캔 실패가 워치독을 죽이지 않게 격리
+            traceback.print_exc()
 
 
 def _job_cancelled(job_id: str, cancel: threading.Event) -> bool:
@@ -626,6 +975,7 @@ def _run_ai_job(
             if _job_cancelled(job_id, cancel):  # 대기 중 취소된 잡 — 슬롯 즉시 반납
                 return
             _mark_job(job_id, {"status": "processing"})
+            _set_phase(job_id, "transcribing")  # STT 슬롯 확보 → 실제 전사 시작(스톨 탐지 기준)
             with use_credential(credential), use_cancel_event(cancel):
                 seg_dicts, duration = transcribe_to_segments(
                     audio_bytes, mime_type=mime_type, backend_name=CLEAN_BACKEND
@@ -633,9 +983,11 @@ def _run_ai_job(
         if _job_cancelled(job_id, cancel):
             return
         # [2단계: LLM] GPU 슬롯은 반납한 상태 — 다음 사용자의 STT 가 여기서 시작될 수 있다.
+        _set_phase(job_id, "waiting_llm")  # STT 슬롯 반납 → LLM 슬롯 대기(요약/추출)
         with _llm_semaphore:
             if _job_cancelled(job_id, cancel):
                 return
+            _set_phase(job_id, "summarizing")  # LLM 슬롯 확보 → 요약/추출 진행
             with use_credential(credential), use_cancel_event(cancel):
                 contract = enrich_to_contract(
                     seg_dicts,
@@ -663,7 +1015,12 @@ def _run_ai_job(
         )
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
-        _mark_job(job_id, {"status": "error", "error": f"{type(e).__name__}: {e}"})
+        # STT 단계(전사/슬롯 대기) 실패는 엔진 이상으로 구분 태깅 → 프론트가 "자격증명/경합"과
+        # 다른 원인(백엔드 엔진)임을 안내할 수 있게 한다. LLM 단계 실패는 일반 오류로 둔다.
+        payload = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        if _job_phase(job_id) in ("waiting_stt", "transcribing"):
+            payload["error_code"] = "stt_engine_error"
+        _mark_job(job_id, payload)
     finally:
         with _jobs_lock:
             _job_cancels.pop(job_id, None)
@@ -690,6 +1047,7 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
         _jobs[job_id] = {"status": "queued"}
         _job_owner[job_id] = user["id"]
         _job_cancels[job_id] = cancel
+    _init_job_meta(job_id, "stt")  # 관측 메타(phase/타이밍) 초기화 — 스레드 시작 전에
     threading.Thread(
         target=_run_ai_job,
         args=(job_id, audio_bytes, req.mimeType, credential, cancel),
@@ -703,12 +1061,74 @@ def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
     """잡 상태/결과 폴링. status: processing | done(result) | error(error).
 
     소유격리: 잡 결과는 회의 파생 데이터이므로 잡 소유자만 조회 가능(타인은 404, 존재 은닉)."""
+    now = time.monotonic()
     with _jobs_lock:
         j = _jobs.get(job_id)
         owner = _job_owner.get(job_id)
-    if j is None or (owner is not None and owner != user["id"]):
-        raise HTTPException(status_code=404, detail="job 없음")
-    return {"jobId": job_id, **j}
+        # owner 는 정상 잡이면 항상 존재 → 불일치·부재(None) 모두 404. 부재 거부는 purge 가 소유자를
+        # 지운 뒤 워커가 상태를 재삽입해 만든 owner 없는 유령 잡이 소유격리를 우회하는 것을 막는다.
+        if j is None or owner != user["id"]:
+            raise HTTPException(status_code=404, detail="job 없음")
+        out = {"jobId": job_id, **j}
+        m = _job_meta.get(job_id)
+        snap = _queue_snapshot_locked()
+        ahead = None
+        if m is not None:
+            out["phase"] = m["phase"]
+            out["warning"] = m.get("warning")
+            if j.get("status") in ("queued", "processing"):
+                out["elapsedSec"] = round(now - m["created_at"], 1)  # 접수 후 총 경과
+                out["phaseElapsedSec"] = round(now - m["phase_at"], 1)  # 현 단계 경과
+            # STT 슬롯 대기 중이면 '내 앞에 몇 건'인지 — 경합(누가 쓰는 중) 여부를 사용자가 알 수 있게.
+            if j.get("status") == "queued" and m["phase"] == "waiting_stt":
+                created = m["created_at"]
+                earlier_wait = sum(
+                    1
+                    for jid2, m2 in _job_meta.items()
+                    if jid2 != job_id
+                    and m2.get("phase") == "waiting_stt"
+                    and m2.get("created_at", now) < created
+                    and _jobs.get(jid2, {}).get("status") in ("queued", "processing")
+                )
+                ahead = snap["sttActive"] + earlier_wait
+    out["queue"] = snap
+    if ahead is not None:
+        out["ahead"] = ahead
+    # 사람이 읽는 원인 힌트(프론트가 그대로 노출 가능) — 무한루프 3원인을 구분해 준다.
+    out["reasonHint"] = _job_reason_hint(out)
+    return out
+
+
+def _job_reason_hint(out: dict) -> str | None:
+    """폴링 응답 → 한 줄 원인 힌트(경합/전사중/요약중/스톨/엔진오류/인증). 없으면 None."""
+    status, phase = out.get("status"), out.get("phase")
+    if out.get("warning") == "stt_stalled":
+        return "STT 엔진이 응답하지 않습니다(스톨 의심) — 관리자 확인이 필요합니다."
+    if status == "error":
+        code = out.get("error_code")
+        if code == "claude_auth_expired":
+            return "claude 인증이 만료되어 요약/추출이 실패했습니다 — 재인증이 필요합니다."
+        if code == "stt_engine_error":
+            return "STT 엔진 오류로 전사에 실패했습니다 — 백엔드 엔진 점검이 필요합니다."
+        if code == "stt_stalled":
+            return "STT 엔진 무응답으로 마감되었습니다 — 백엔드 엔진 점검이 필요합니다."
+        return None
+    if status == "queued":
+        if phase == "waiting_stt":
+            ahead = out.get("ahead")
+            if ahead:
+                return f"다른 STT 처리 {ahead}건이 앞서 진행 중입니다 — 순서 대기 중입니다."
+            return "STT 처리 슬롯을 기다리는 중입니다."
+        if phase == "waiting_llm":
+            return "요약/추출(LLM) 슬롯을 기다리는 중입니다."
+        return "처리 대기 중입니다."
+    if status == "processing":
+        if phase == "transcribing":
+            return "전사(STT) 진행 중입니다."
+        if phase == "summarizing":
+            return "요약/추출 진행 중입니다."
+        return "처리 중입니다."
+    return None
 
 
 @app.post("/api/ai/jobs/{job_id}/cancel")
@@ -722,7 +1142,7 @@ def ai_job_cancel(job_id: str, user: dict = Depends(require_user_active)) -> dic
     with _jobs_lock:
         j = _jobs.get(job_id)
         owner = _job_owner.get(job_id)
-        if j is None or (owner is not None and owner != user["id"]):
+        if j is None or owner != user["id"]:  # owner 부재(None)도 거부(purge 재삽입 유령 잡 방어)
             raise HTTPException(status_code=404, detail="job 없음")
         cancel = _job_cancels.get(job_id)
         if cancel is not None and j.get("status") in ("queued", "processing"):
@@ -734,6 +1154,39 @@ def ai_job_cancel(job_id: str, user: dict = Depends(require_user_active)) -> dic
         status = _jobs[job_id].get("status", "unknown")
     observability.audit("ai_job.cancel", owner=user["username"], job_id=job_id, status=status)
     return {"jobId": job_id, "status": status}
+
+
+@app.get("/api/admin/ai-jobs")
+def admin_ai_jobs(user: dict = Depends(require_admin)) -> dict:
+    """관리자용 진행 중 잡/슬롯 스냅샷 — STT 무한루프 원인 진단(경합 vs 엔진 스톨).
+
+    queue: 슬롯 점유·대기 집계. active: 진행 중(queued/processing) 잡을 경과시간 내림차순으로
+    (오래 걸린 잡·스톨이 상단). 스톨 임계값(sttStallSec)과 마감 여부(markError)도 노출.
+    """
+    now = time.monotonic()
+    with _jobs_lock:
+        snap = _queue_snapshot_locked()
+        active: list[dict] = []
+        for jid, m in _job_meta.items():
+            st = _jobs.get(jid, {}).get("status")
+            if st not in ("queued", "processing"):
+                continue
+            active.append({
+                "jobId": jid, "owner": _job_owner.get(jid), "kind": m.get("kind"),
+                "status": st, "phase": m.get("phase"), "warning": m.get("warning"),
+                "elapsedSec": round(now - m["created_at"], 1),
+                "phaseElapsedSec": round(now - m["phase_at"], 1),
+            })
+    active.sort(key=lambda a: -a["elapsedSec"])
+    stalled = [a for a in active if a.get("warning") == "stt_stalled"]
+    return {
+        "queue": snap,
+        "sttStallSec": STT_STALL_SEC,
+        "markError": STT_STALL_MARK_ERROR,
+        "activeCount": len(active),
+        "stalledCount": len(stalled),
+        "active": active,
+    }
 
 
 # ---------- 재요약 regenerate (트랙 C·P8, prompt 모드: 미리보기→확정→백업/undo) ----------
@@ -791,6 +1244,7 @@ def _run_regenerate_job(
             if _job_cancelled(job_id, cancel):
                 return
             _mark_job(job_id, {"status": "processing"})
+            _set_phase(job_id, "summarizing")  # LLM 슬롯 확보 → 재요약 진행
             with use_credential(credential), use_cancel_event(cancel):
                 summary = summarize_meeting(segments, backend_name=SUMMARIZE_BACKEND or "passthrough")
                 hints = _summary_action_hints(summary)
@@ -833,6 +1287,7 @@ def regenerate_meeting(meeting_id: str, user: dict = Depends(require_user_active
         _jobs[job_id] = {"status": "queued"}
         _job_owner[job_id] = user["id"]
         _job_cancels[job_id] = cancel
+    _init_job_meta(job_id, "llm")  # 재요약은 LLM 전용 잡 — 관측 메타 초기화
     threading.Thread(
         target=_run_regenerate_job, args=(job_id, segments, credential, cancel), daemon=True
     ).start()
@@ -2296,7 +2751,6 @@ def admin_metrics(user: dict = Depends(require_admin)) -> dict:
 def health() -> dict:
     # claude 구독 인증 상태(요약/추출 백엔드가 agent_cli 일 때만 의미 있음). 만료/미로그인
     # 이면 프론트·운영자가 미리 재인증할 수 있게 노출(토큰 값은 절대 포함하지 않음).
-    uses_agent_cli = "agent_cli" in (CLEAN_BACKEND, EXTRACT_BACKEND, SUMMARIZE_BACKEND)
     return {
         "ok": True,
         "clean_backend": CLEAN_BACKEND,
@@ -2304,7 +2758,7 @@ def health() -> dict:
         "summarize_backend": SUMMARIZE_BACKEND or "off",
         "stt_model": "Cohere transcribe-03-2026",
         "auth_users": users.count(),
-        "claude_auth": claude_auth_status() if uses_agent_cli else {"ok": True, "reason": "not_used"},
+        "claude_auth": claude_auth_status() if USES_AGENT_CLI else {"ok": True, "reason": "not_used"},
     }
 
 
