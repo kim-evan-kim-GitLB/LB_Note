@@ -1039,3 +1039,45 @@ def require_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -
     if cred is None or not cred.credentials:
         raise HTTPException(status_code=401, detail="인증이 필요합니다.")
     return user_from_token(cred.credentials)
+
+
+# 요구사항 적재 전용 스코프 — Slack 봇 같은 합성 주체(실 사용자 아님)가 요구사항만 쓰도록 허용.
+# 이 스코프 토큰은 서명·scope 만 검증하고 사용자 DB 조회를 하지 않는다(admin 위조 불요).
+REQUIREMENT_INTAKE_SCOPE = "requirement_intake"
+
+
+def require_requirement_writer(
+    cred: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> dict:
+    """요구사항 적재 인가 — 두 경로 허용:
+      1) 봇 intake 스코프 토큰(scope='requirement_intake'): 합성 주체, 서명만 검증(DB 조회 없음).
+      2) 일반 세션 토큰(scope 없음) → **관리자만**(웹 콘솔). 비관리자·비번미변경은 거부.
+    조회/관리(list/patch)는 여전히 require_admin 이다 — 쓰기 인테이크만 넓힌다.
+    """
+    if cred is None or not cred.credentials:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    try:
+        payload = _decode(cred.credentials)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="토큰이 만료되었습니다.")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="토큰이 유효하지 않습니다.")
+    # 1) 봇 intake 스코프 — 합성 주체(요구사항 쓰기 전용).
+    if payload.get("scope") == REQUIREMENT_INTAKE_SCOPE:
+        return {"username": payload.get("sub") or "bot", "role": "bot"}
+    # 2) 그 외 스코프 토큰은 세션/쓰기용이 아님 → 거부(제한 토큰 재사용 차단).
+    if payload.get("scope") is not None:
+        raise HTTPException(status_code=401, detail="토큰 범위가 올바르지 않습니다.")
+    # 3) 일반 세션 토큰 → 관리자만(웹 콘솔). 비번 강제변경 대상도 차단.
+    u = store().get(payload.get("sub", ""))
+    if not u:
+        raise HTTPException(status_code=401, detail="사용자를 찾을 수 없습니다.")
+    pub = public_user(u)
+    if pub.get("mustChangePassword"):
+        raise HTTPException(
+            status_code=403,
+            detail={"error_code": "must_change_password", "message": "초기 비밀번호를 먼저 변경해야 합니다."},
+        )
+    if (pub.get("role") or "user") != "admin":
+        raise HTTPException(status_code=403, detail="관리자 권한이 필요합니다.")
+    return pub

@@ -2686,9 +2686,13 @@ def admin_reset_password(
 
 @app.post("/api/requirements", status_code=201)
 def create_requirement(
-    req: RequirementCreateRequest, user: dict = Depends(require_admin)
+    req: RequirementCreateRequest, user: dict = Depends(auth.require_requirement_writer)
 ) -> dict:
-    """요구사항/건의 적재(Slack 봇·웹). text 필수, source 기본 'slack'. 생성 행(id 포함) 반환."""
+    """요구사항/건의 적재(Slack 봇·웹). text 필수, source 기본 'slack'. 생성 행(id 포함) 반환.
+
+    인가는 require_requirement_writer — 봇 intake 스코프 토큰(합성 주체) 또는 관리자 세션.
+    (기존엔 require_admin 이라 봇이 admin 토큰을 위조해야 했다 → 권한 불일치 제거.)
+    """
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=422, detail="요구사항 내용이 비어 있습니다.")
