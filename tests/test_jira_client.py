@@ -209,6 +209,45 @@ def test_add_watchers_posts_each_account():
     ]
 
 
+def test_search_issues_uses_search_jql_endpoint():
+    captured = {}
+
+    def fake_request(cfg, method, path, *, params=None, json_body=None):
+        captured["path"] = path
+        captured["params"] = params
+        return {"issues": [{"key": "AAA-1"}]}
+
+    with mock.patch.object(jira_client, "_request", side_effect=fake_request):
+        out = jira_client.search_issues(CFG, "project = AAA", fields=["summary", "status"])
+    # 구 /search 는 410 삭제 → 신 /search/jql 만 호출, fields 는 콤마결합.
+    assert captured["path"] == "/rest/api/3/search/jql"
+    assert captured["params"]["fields"] == "summary,status"
+    assert out == [{"key": "AAA-1"}]
+
+
+def test_list_epics_jql_and_shape():
+    captured = {}
+
+    def fake_request(cfg, method, path, *, params=None, json_body=None):
+        captured["jql"] = params["jql"]
+        return {"issues": [
+            {"key": "AAA-9", "fields": {"summary": "에픽 나인"}},
+            {"key": "AAA-8", "fields": {"summary": "에픽 에잇"}},
+        ]}
+
+    with mock.patch.object(jira_client, "_request", side_effect=fake_request):
+        epics = jira_client.list_epics(CFG, 'AAA"; DROP')
+    # 번역명 아닌 정규 'Epic' + 미완료 필터, 따옴표 주입 제거.
+    assert "issuetype = Epic" in captured["jql"]
+    assert "statusCategory != Done" in captured["jql"]
+    # 따옴표 주입 방지: project 를 감싸는 큰따옴표 2개만 존재(내부 " 는 제거됨).
+    assert captured["jql"].count('"') == 2
+    assert epics == [
+        {"key": "AAA-9", "summary": "에픽 나인"},
+        {"key": "AAA-8", "summary": "에픽 에잇"},
+    ]
+
+
 # ---------- _request 저수준(urllib 모킹) ----------
 class _FakeResp:
     def __init__(self, body: bytes):

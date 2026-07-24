@@ -2807,6 +2807,13 @@ def jira_issue_types(project: str = Query(...), user: dict = Depends(require_use
     return {"issueTypes": _jira_call(jira_client.get_issue_types, cfg, project)}
 
 
+@app.get("/api/jira/epics")
+def jira_epics(project: str = Query(...), user: dict = Depends(require_user_active)) -> dict:
+    """프로젝트의 미완료 에픽 목록 → {epics:[{key,summary}]} (기존 에픽에 작업 붙일 때 선택용)."""
+    cfg = _require_jira_cfg()
+    return {"epics": _jira_call(jira_client.list_epics, cfg, project)}
+
+
 @app.get("/api/jira/createmeta")
 def jira_createmeta(
     project: str = Query(...),
