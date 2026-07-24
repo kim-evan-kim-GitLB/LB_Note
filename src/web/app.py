@@ -34,6 +34,7 @@ from src.web import (
     google_drive,
     google_gmail,
     google_oauth,
+    jira_client,
     maintenance,
     meeting_doc,
     observability,
@@ -403,6 +404,14 @@ class GoogleOAuthConfigRequest(BaseModel):
 class DocTemplateRequest(BaseModel):
     """관리자 전역 Docs 양식(템플릿) 설정 — 구글 문서 URL 또는 문서 id."""
     templateUrl: str
+
+
+class JiraConfigRequest(BaseModel):
+    """관리자 Jira 서비스 계정 설정. baseUrl/email/apiToken 필수, defaultProject 선택."""
+    baseUrl: str
+    email: str
+    apiToken: str
+    defaultProject: str | None = None
 
 
 # 셀프 비번 변경 시 새 비밀번호 최소 길이.
@@ -2617,6 +2626,169 @@ def delete_doc_template(user: dict = Depends(require_admin)) -> dict:
     cleared = auth.clear_doc_template()
     observability.audit("doc_template.clear", by=user["username"], cleared=cleared)
     return {"ok": True, "cleared": cleared, "status": _doc_template_status()}
+
+
+# ---------- Jira 연동(앱 레벨 서비스 계정, Phase 1: 설정 + 조회 전용) ----------
+def _jira_effective_cfg() -> dict | None:
+    """유효 Jira 설정(api_token 포함, **내부 전용**) — DB 우선, 없으면 env 폴백. 없으면 None.
+
+    google 의 db-first/env-fallback 패턴. env: JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN
+    (+ 선택 JIRA_DEFAULT_PROJECT). 세 값이 모두 있어야 유효(부분 설정은 미설정 취급).
+    반환 dict 는 jira_client 함수의 cfg 인자로 그대로 넘긴다 — API 응답에 싣지 말 것.
+    """
+    cfg = auth.get_jira_config()
+    if cfg and cfg.get("base_url") and cfg.get("email") and cfg.get("api_token"):
+        return {
+            "base_url": cfg["base_url"],
+            "email": cfg["email"],
+            "api_token": cfg["api_token"],
+        }
+    base_url = os.environ.get("JIRA_BASE_URL", "").strip().rstrip("/")
+    email = os.environ.get("JIRA_EMAIL", "").strip()
+    api_token = os.environ.get("JIRA_API_TOKEN", "").strip()
+    if base_url and email and api_token:
+        return {"base_url": base_url, "email": email, "api_token": api_token}
+    return None
+
+
+def _jira_status() -> dict:
+    """Jira 설정 공개 상태(api_token **비노출**). DB 설정 우선, 없으면 env 여부 반영."""
+    st = auth.jira_config_status()
+    if not st.get("configured"):
+        # env 폴백으로 설정된 경우도 configured=True 로 노출(프론트가 조회 버튼 판단).
+        cfg = _jira_effective_cfg()
+        if cfg:
+            st = {
+                "configured": True,
+                "base_url": cfg["base_url"],
+                "email": cfg["email"],
+                "default_project": os.environ.get("JIRA_DEFAULT_PROJECT", "").strip() or None,
+            }
+    return st
+
+
+def _require_jira_cfg() -> dict:
+    """유효 Jira 설정 반환 또는 400 error_code=jira_not_configured(조회 엔드포인트 게이트)."""
+    cfg = _jira_effective_cfg()
+    if not cfg:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "jira_not_configured",
+                "message": "Jira 연동이 설정되지 않았습니다(관리자 설정 필요).",
+            },
+        )
+    return cfg
+
+
+@app.get("/api/admin/jira-config")
+def get_jira_config(user: dict = Depends(require_admin)) -> dict:
+    """Jira 설정 상태(관리자, **api_token 미노출**): {configured, base_url, email, default_project}."""
+    return _jira_status()
+
+
+@app.put("/api/admin/jira-config")
+def put_jira_config(req: JiraConfigRequest, user: dict = Depends(require_admin)) -> dict:
+    """관리자가 Jira 서비스 계정 저장 → verify(연결·인증 확인) 후 성공 시 계정 요약 반환.
+
+    api_token 은 DB Fernet 암호화 저장(응답 미포함). verify 실패(JiraAuthError)면 400
+    error_code=jira_auth_failed. 저장은 verify 전에 수행하되, 인증 실패면 그대로 400 을 던진다.
+    """
+    try:
+        auth.set_jira_config(req.baseUrl, req.email, req.apiToken, req.defaultProject)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    cfg = {
+        "base_url": req.baseUrl.strip().rstrip("/"),
+        "email": req.email.strip(),
+        "api_token": req.apiToken.strip(),
+    }
+    try:
+        account = jira_client.verify(cfg)
+    except jira_client.JiraAuthError:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "jira_auth_failed",
+                "message": "Jira 인증에 실패했습니다(email/api_token/base_url 확인).",
+            },
+        )
+    except jira_client.JiraError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": "jira_error", "message": str(e)},
+        )
+    observability.audit("jira.config.set", by=user["username"])  # 토큰 제외
+    return {
+        "ok": True,
+        "account": {
+            "displayName": account.get("displayName"),
+            "emailAddress": account.get("emailAddress"),
+        },
+        "status": _jira_status(),
+    }
+
+
+@app.delete("/api/admin/jira-config")
+def delete_jira_config(user: dict = Depends(require_admin)) -> dict:
+    """Jira 설정 삭제(→ env 폴백으로 복귀)."""
+    cleared = auth.clear_jira_config()
+    observability.audit("jira.config.clear", by=user["username"], cleared=cleared)
+    return {"ok": True, "cleared": cleared, "status": _jira_status()}
+
+
+def _jira_call(fn, *args, **kwargs):
+    """jira_client 조회 호출 공통 에러 매핑 → JiraAuthError 401/JiraError 502(error_code 계약)."""
+    try:
+        return fn(*args, **kwargs)
+    except jira_client.JiraAuthError:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error_code": "jira_auth_failed",
+                "message": "Jira 인증에 실패했습니다(관리자 설정 확인).",
+            },
+        )
+    except jira_client.JiraError as e:
+        raise HTTPException(
+            status_code=502,
+            detail={"error_code": "jira_error", "message": str(e)},
+        )
+
+
+@app.get("/api/jira/projects")
+def jira_projects(user: dict = Depends(require_user_active)) -> dict:
+    """접근 가능한 Jira 프로젝트 목록 → {projects:[{key,name,style}]}. 미설정이면 400."""
+    cfg = _require_jira_cfg()
+    return {"projects": _jira_call(jira_client.get_projects, cfg)}
+
+
+@app.get("/api/jira/issue-types")
+def jira_issue_types(project: str = Query(...), user: dict = Depends(require_user_active)) -> dict:
+    """프로젝트 이슈타입 목록 → {issueTypes:[{id,name}]}. 미설정이면 400."""
+    cfg = _require_jira_cfg()
+    return {"issueTypes": _jira_call(jira_client.get_issue_types, cfg, project)}
+
+
+@app.get("/api/jira/createmeta")
+def jira_createmeta(
+    project: str = Query(...),
+    issuetype: str = Query(...),
+    user: dict = Depends(require_user_active),
+) -> dict:
+    """이슈 생성 폼 메타(필수/선택 필드 배열) → {fields:[...]}. 미설정이면 400."""
+    cfg = _require_jira_cfg()
+    return _jira_call(jira_client.get_create_meta, cfg, project, issuetype)
+
+
+@app.get("/api/jira/user-lookup")
+def jira_user_lookup(email: str = Query(...), user: dict = Depends(require_user_active)) -> dict:
+    """이메일 → Jira accountId. 없으면 {accountId:null}. 미설정이면 400."""
+    cfg = _require_jira_cfg()
+    found = _jira_call(jira_client.lookup_account_id, cfg, email)
+    if not found:
+        return {"accountId": None}
+    return found
 
 
 # ---------- 관리자: 사용자 명부 관리 + 참석자 피커 디렉터리 ----------
