@@ -87,46 +87,43 @@ def handle_status(client) -> str:
 
 
 def handle_notice(slack_client, channel_id: str, user_id: str) -> str:
-    """공지 배포 — **LB Note 관리자(role=admin)만**. DB의 최신 활성 공지를 읽어 게시한다.
+    """공지 조회/배포. 내용 작성·게시 결정은 웹 관리자 콘솔에서 이뤄지고, 봇은 최신 활성 공지를 읽어온다.
 
-    공지는 관리자→사용자 방향이라 권한 게이트를 둔다(요청자 Slack 이메일→LB Note role 확인).
-    내용은 웹 관리자 콘솔에서 작성되며(DB), 봇은 최신 공지를 읽어 SLACK_NOTICE_CHANNEL
-    (없으면 명령 채널)에 브로드캐스트한다.
+    - **모든 사용자**: 현재 등록된 공지를 요청한 자리에서 '읽어' 보여준다(가져오기).
+    - **관리자(role=admin)**: 추가로 SLACK_NOTICE_CHANNEL(없으면 명령 채널)에 브로드캐스트한다(밀어주기).
+
+    읽기는 누구에게나 연다(공지는 사용자에게 보이라고 쓴 것). '아무나 공지 채널에 브로드캐스트'만
+    관리자로 막는다.
     """
-    # 1) 관리자 권한 확인(요청자 이메일 == LB Note username 가정).
-    try:
-        info = slack_client.users_info(user=user_id)
-        email = (info["user"]["profile"] or {}).get("email")
-    except Exception:
-        email = None
-    if not email:
-        return (
-            "공지 권한을 확인할 수 없습니다. "
-            "Slack 프로필에 회사 이메일이 설정되어 있는지 확인해 주세요."
-        )
-    try:
-        role = lbnote_client.get_user_role(email)
-    except Exception:
-        return "공지 권한 확인 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
-    if role != "admin":
-        return "공지는 관리자만 배포할 수 있습니다."
-    # 2) DB 최신 공지 조회.
+    # 1) 최신 공지 조회(누구나 읽기 가능).
     try:
         notice = lbnote_client.get_latest_notice()
     except Exception:
         return "공지 조회 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
     if not notice or not (notice.get("body") or "").strip():
-        return "등록된 공지가 없습니다. 관리자 콘솔에서 공지를 먼저 등록해 주세요."
+        return "현재 등록된 공지가 없습니다."
     title = (notice.get("title") or "").strip()
     body = notice["body"].strip()
     text = "📢 *공지*\n" + (f"*{title}*\n" if title else "") + body
-    # 3) 브로드캐스트.
-    target = config.SLACK_NOTICE_CHANNEL or channel_id
+
+    # 2) 요청자 권한 확인 — 관리자면 공지 채널에 브로드캐스트, 아니면 이 자리에서 읽어 보여줌.
+    role = None
     try:
-        slack_client.chat_postMessage(channel=target, text=text)
+        info = slack_client.users_info(user=user_id)
+        email = (info["user"]["profile"] or {}).get("email")
+        if email:
+            role = lbnote_client.get_user_role(email)
     except Exception:
-        return "공지 게시에 실패했습니다. 채널 설정을 확인해 주세요."
-    return f"공지를 <#{target}> 채널에 게시했습니다."
+        role = None  # 확인 실패 시 안전하게 '읽기'로 처리(브로드캐스트 안 함).
+    if role == "admin":
+        target = config.SLACK_NOTICE_CHANNEL or channel_id
+        try:
+            slack_client.chat_postMessage(channel=target, text=text)
+        except Exception:
+            return "공지 게시에 실패했습니다. 채널 설정을 확인해 주세요."
+        return f"공지를 <#{target}> 채널에 게시했습니다."
+    # 일반 사용자(또는 권한 확인 불가): 읽어서 이 자리에 보여준다.
+    return text
 
 
 # ---------- 요구사항: 스레드 되묻기 대화 ----------
@@ -223,7 +220,8 @@ def help_text() -> str:
         "    정확히 `예` 면 계속, 그 외 입력이면 종료\n"
         "  · 한 줄로: `@LBNoteBot 요구사항 화자분리 기능` (바로 저장 후 추가 여부 확인)\n"
         "\n"
-        "*공지* / `notice` — 최신 공지를 채널에 배포(*관리자 전용*, 내용은 웹 콘솔에서 작성)\n"
+        "*공지* / `notice` — 현재 공지를 확인(내용은 웹 콘솔에서 작성)\n"
+        "  · 누구나 확인 가능. 관리자가 부르면 공지 채널에 배포까지 진행\n"
         "  · 예) `@LBNoteBot 공지`\n"
         "\n"
         "*help* — 이 도움말"
