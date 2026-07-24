@@ -150,6 +150,37 @@ def get_issue_types(cfg: dict, project_key: str) -> list[dict]:
     return [{"id": t.get("id"), "name": t.get("name")} for t in types]
 
 
+def search_issues(
+    cfg: dict, jql: str, *, fields: list[str] | None = None, max_results: int = 50
+) -> list[dict]:
+    """JQL 검색(신 API GET /rest/api/3/search/jql) → issues 리스트(raw). 첫 페이지만(max_results).
+
+    구 /rest/api/3/search 는 410(삭제)되어 /search/jql 로만 호출한다. fields 는 반환 필드 이름 목록.
+    """
+    params: dict = {"jql": jql, "maxResults": max_results}
+    if fields:
+        params["fields"] = ",".join(fields)
+    data = _request(cfg, "GET", "/rest/api/3/search/jql", params=params)
+    if not isinstance(data, dict):
+        return []
+    return data.get("issues") or []
+
+
+def list_epics(cfg: dict, project_key: str, *, max_results: int = 50) -> list[dict]:
+    """프로젝트의 미완료 에픽 목록 → [{key, summary}] (최근 갱신순, 기존 에픽에 작업 붙일 때 선택용).
+
+    JQL 의 issuetype 은 **정규(영문) 이름 'Epic'** 을 쓴다(번역명 '에픽' 은 JQL 에서 매칭 안 됨).
+    project_key 는 따옴표를 제거해 JQL 주입을 막는다(키는 영숫자).
+    """
+    safe = (project_key or "").replace('"', "").replace("\\", "")
+    jql = f'project = "{safe}" AND issuetype = Epic AND statusCategory != Done ORDER BY updated DESC'
+    issues = search_issues(cfg, jql, fields=["summary"], max_results=max_results)
+    return [
+        {"key": i.get("key"), "summary": (i.get("fields") or {}).get("summary")}
+        for i in issues
+    ]
+
+
 def _parse_allowed_values(field: dict) -> list[dict] | None:
     """createmeta 필드의 allowedValues → [{id, name}] (상위 _MAX_ALLOWED_VALUES 개). 없으면 None.
 
