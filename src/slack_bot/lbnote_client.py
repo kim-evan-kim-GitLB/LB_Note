@@ -37,15 +37,37 @@ def _admin_token() -> str:
     return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
 
 
+def _intake_token() -> str:
+    """단명(60초) 요구사항 인테이크 스코프 토큰. admin 위조 없이 요구사항만 쓸 수 있다.
+
+    백엔드 require_requirement_writer 가 scope='requirement_intake' 를 서명만 검증(DB 조회 없음)해
+    통과시킨다. 사용자별 role 이나 'admin' 계정 존재 여부에 의존하지 않는다.
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    payload = {
+        "sub": "slack-bot",
+        "iat": now,
+        "exp": now + dt.timedelta(seconds=60),
+        "scope": "requirement_intake",
+    }
+    return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+
+
 def _request(
-    method: str, path: str, *, body: dict | None = None, admin: bool = False
+    method: str, path: str, *, body: dict | None = None, admin: bool = False, intake: bool = False
 ) -> dict:
-    """LB Note API 호출 → JSON dict. 비 2xx 는 LBNoteError(404 는 UserNotFound)."""
+    """LB Note API 호출 → JSON dict. 비 2xx 는 LBNoteError(404 는 UserNotFound).
+
+    admin=True → admin 세션 토큰, intake=True → 요구사항 인테이크 스코프 토큰. 둘 다 지정 시 admin 우선.
+    연결 자체 실패(URLError: 서버 다운·타임아웃)도 LBNoteError 로 감싸 상위 핸들러가 일관 처리한다.
+    """
     url = config.LBNOTE_API_BASE.rstrip("/") + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json"} if data is not None else {}
     if admin:
         headers["Authorization"] = f"Bearer {_admin_token()}"
+    elif intake:
+        headers["Authorization"] = f"Bearer {_intake_token()}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
@@ -60,6 +82,8 @@ def _request(
         if e.code == 404:
             raise UserNotFound(e.code, detail) from e
         raise LBNoteError(e.code, detail) from e
+    except urllib.error.URLError as e:  # 연결 거부·DNS·타임아웃 등(HTTPError 아님)
+        raise LBNoteError(0, str(getattr(e, "reason", e))) from e
 
 
 def reset_password(username: str, new_password: str) -> None:
@@ -101,10 +125,13 @@ def get_latest_notice() -> dict | None:
 
 
 def create_requirement(text: str, reporter: str | None) -> dict:
-    """요구사항 적재(source='slack'). 생성 행(id 포함) 반환."""
+    """요구사항 적재(source='slack'). 생성 행(id 포함) 반환.
+
+    admin 이 아니라 요구사항 인테이크 스코프 토큰으로 쓴다 → 'admin' 계정 존재/권한에 의존하지 않음.
+    """
     return _request(
         "POST",
         "/api/requirements",
         body={"text": text, "source": "slack", "reporter": reporter},
-        admin=True,
+        intake=True,
     )

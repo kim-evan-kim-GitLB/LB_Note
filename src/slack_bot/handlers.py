@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import secrets
 
-from src.slack_bot import config, lbnote_client
+from src.slack_bot import config, conversation, lbnote_client
 
 # 임시 비밀번호 최소 길이(LB Note MIN_PASSWORD_LEN=8 이상 보장). token_urlsafe(12)=약 16자.
 _TEMP_PW_BYTES = 12
@@ -129,16 +129,80 @@ def handle_notice(slack_client, channel_id: str, user_id: str) -> str:
     return f"공지를 <#{target}> 채널에 게시했습니다."
 
 
-def handle_requirement(client, text: str, reporter: str | None) -> str:
-    """요구사항 적재 → 접수번호 반환."""
+# ---------- 요구사항: 스레드 되묻기 대화 ----------
+# 사용자가 `요구사항` 을 치면 그 메시지의 스레드(댓글)에서 '입력받기 → 저장 → 추가?' 를 반복한다.
+# 정확히 '예' 일 때만 추가 입력을 더 받고, 그 외 응답은 대화를 종료한다.
+_MSG_PROMPT = "입력해주시면 제가 저장할게요."
+_MSG_CONFIRM_MORE = "저장이 완료되었어요. 추가적으로 입력하고 싶으신게 있으신가요?"
+_MSG_END = "요구사항 접수를 종료합니다. 감사합니다."
+_MSG_SAVE_ERR = "요구사항 접수 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+_YES = "예"  # '예라고 정확하게 입력할 때만' 추가 진행.
+
+
+def _save_and_ask_more(
+    client, channel: str, thread_ts: str, user: str, content: str, reporter: str | None
+) -> str:
+    """요구사항 1건 저장 → 성공 시 awaiting_more 로 전이하고 '추가?' 안내.
+
+    실패 시 상태를 awaiting_text 로 유지(전이 안 함)해 같은 스레드에서 재입력할 수 있게 한다.
+    """
     try:
-        created = client.create_requirement(text, reporter)
+        client.create_requirement(content, reporter)
     except Exception:
-        return "요구사항 접수 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
-    return (
-        f"요구사항이 접수됐어요. (접수번호 #{created.get('id')})\n"
-        "확인 후 반영하겠습니다. 감사합니다."
-    )
+        return _MSG_SAVE_ERR
+    conversation.set_state(channel, thread_ts, user, conversation.STATE_AWAITING_MORE)
+    return _MSG_CONFIRM_MORE
+
+
+def requirement_start(
+    client, channel: str, thread_ts: str, user: str, inline_text: str, reporter: str | None
+) -> str:
+    """`요구사항` 최초 트리거. 반환 문자열은 스레드(thread_ts)에 게시한다.
+
+    - thread_ts 없음(슬래시 등 스레드 불가): 되묻기 대화 없이 한 방 저장/안내(하위호환).
+    - 인라인 내용 없음: 대화 시작 후 입력 요청.
+    - 인라인 내용 있음: 바로 저장하고 '추가?' 로 이어감.
+    """
+    content = (inline_text or "").strip()
+    if not thread_ts:
+        if not content:
+            return "요구사항 내용을 입력해 주세요. 예) `요구사항 화자분리 기능`"
+        try:
+            created = client.create_requirement(content, reporter)
+        except Exception:
+            return _MSG_SAVE_ERR
+        return (
+            f"요구사항이 접수됐어요. (접수번호 #{created.get('id')})\n"
+            "확인 후 반영하겠습니다. 감사합니다."
+        )
+    conversation.start(channel, thread_ts, user, conversation.STATE_AWAITING_TEXT)
+    if not content:
+        return _MSG_PROMPT
+    return _save_and_ask_more(client, channel, thread_ts, user, content, reporter)
+
+
+def requirement_reply(
+    client, channel: str, thread_ts: str, user: str, text: str, reporter: str | None
+) -> str | None:
+    """진행 중 되묻기 대화의 스레드 답글 한 스텝. 관리 대상이 아니면 None(무시).
+
+    - awaiting_text: 답글을 요구사항으로 저장 → awaiting_more, '추가?' 반환.
+    - awaiting_more: 정확히 '예' → awaiting_text, 입력 요청 / 그 외 → 종료.
+    """
+    state = conversation.get(channel, thread_ts, user)
+    if state is None:
+        return None
+    body = (text or "").strip()
+    if state == conversation.STATE_AWAITING_MORE:
+        if body == _YES:
+            conversation.set_state(channel, thread_ts, user, conversation.STATE_AWAITING_TEXT)
+            return _MSG_PROMPT
+        conversation.clear(channel, thread_ts)
+        return _MSG_END
+    # STATE_AWAITING_TEXT
+    if not body:
+        return _MSG_PROMPT  # 빈 답글 → 다시 요청
+    return _save_and_ask_more(client, channel, thread_ts, user, body, reporter)
 
 
 def help_text() -> str:
