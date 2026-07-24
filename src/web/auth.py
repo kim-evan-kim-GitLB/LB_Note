@@ -141,6 +141,17 @@ CREATE TABLE IF NOT EXISTS app_doc_template (
     template_url TEXT,               -- 관리자가 입력한 원본 URL(표시용)
     updated_at   TEXT
 );
+-- 앱 레벨 Jira 서비스 계정 설정(배포당 1행 id=1, 사용자별 아님). Basic auth = base64(email:api_token).
+-- api_token 은 장수명 시크릿이라 _enc_secret(Fernet)로 암호화 저장한다(CRED_ENC_KEY 있으면). base_url/
+-- email/default_project 는 비밀 아님(표시용). 미설정이면 app.py 가 env(JIRA_BASE_URL 등)로 폴백한다.
+CREATE TABLE IF NOT EXISTS jira_config (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),  -- 단일 행
+    base_url        TEXT NOT NULL,
+    email           TEXT NOT NULL,
+    api_token       TEXT NOT NULL,   -- _enc_secret(Fernet, 접두사 enc:fernet:). API 응답 절대 미노출.
+    default_project TEXT,
+    updated_at      TEXT
+);
 """
 
 # 사용자별 claude 자격증명 종류. oauth_token=CLAUDE_CODE_OAUTH_TOKEN(Claude Code CLI 토큰,
@@ -581,6 +592,19 @@ class UserStore:
                     (_ENC_PREFIX + cipher.encrypt(sec.encode()).decode(), r["provider"]),
                 )
                 migrated += 1
+            # jira_config.api_token 도 동일 규약(레거시 평문만 암호화, 멱등).
+            jrows = self._conn.execute(
+                "SELECT id, api_token FROM jira_config"
+            ).fetchall()
+            for r in jrows:
+                tok = r["api_token"] or ""
+                if not tok or tok.startswith(_ENC_PREFIX):
+                    continue
+                self._conn.execute(
+                    "UPDATE jira_config SET api_token=? WHERE id=?",
+                    (_ENC_PREFIX + cipher.encrypt(tok.encode()).decode(), r["id"]),
+                )
+                migrated += 1
             if migrated:
                 self._conn.commit()
         return migrated
@@ -793,6 +817,92 @@ class UserStore:
             self._conn.commit()
         return cur.rowcount > 0
 
+    # ---- 앱 레벨 Jira 서비스 계정 설정(jira_config, 단일 행 id=1) ----
+    def set_jira_config(
+        self, base_url: str, email: str, api_token: str, default_project: str | None = None
+    ) -> None:
+        """관리자가 Jira 서비스 계정(base_url/email/api_token) 저장. api_token 은 Fernet 암호화.
+
+        단일 행 upsert. base_url/email/api_token 은 필수(비면 ValueError). default_project 는 선택.
+        """
+        base_url = (base_url or "").strip().rstrip("/")
+        email = (email or "").strip()
+        api_token = (api_token or "").strip()
+        default_project = (default_project or "").strip() or None
+        if not (base_url and email and api_token):
+            raise ValueError("base_url/email/api_token 는 모두 필요합니다.")
+        stored = _enc_secret(api_token)  # CRED_ENC_KEY 있으면 암호화, 없으면 평문(하위호환)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO jira_config "
+                "(id, base_url, email, api_token, default_project, updated_at) "
+                "VALUES (1,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "base_url=excluded.base_url, email=excluded.email, "
+                "api_token=excluded.api_token, default_project=excluded.default_project, "
+                "updated_at=excluded.updated_at",
+                (
+                    base_url,
+                    email,
+                    stored,
+                    default_project,
+                    dt.datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            self._conn.commit()
+
+    def get_jira_config(self) -> dict | None:
+        """Jira 설정(api_token 복호 포함, **내부 전용**). 없으면 None.
+
+        반환: {base_url, email, api_token, default_project, updated_at}. api_token 은 절대 API
+        응답에 싣지 말 것(공개 상태는 jira_config_status). 암호문인데 키 없음/불일치로 복호 불가면
+        None(설정 미완 취급) — 디스크 데이터는 보존.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT base_url, email, api_token, default_project, updated_at "
+                "FROM jira_config WHERE id=1"
+            ).fetchone()
+        if not row:
+            return None
+        api_token = _dec_secret(row["api_token"] or "")
+        if not api_token:
+            return None  # 암호문인데 키 없음/불일치 → 미설정 취급(데이터는 보존)
+        return {
+            "base_url": row["base_url"],
+            "email": row["email"],
+            "api_token": api_token,
+            "default_project": row["default_project"],
+            "updated_at": row["updated_at"],
+        }
+
+    def clear_jira_config(self) -> bool:
+        """Jira 설정 삭제(→ env 폴백으로 복귀). 삭제된 행이 있으면 True."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM jira_config WHERE id=1")
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def jira_config_status(self) -> dict:
+        """Jira 설정 공개 상태(api_token **비노출**). 설정 UI 용.
+
+        반환: {configured, base_url, email, default_project}. 토큰은 어떤 필드에도 싣지 않는다.
+        """
+        cfg = self.get_jira_config()
+        if not cfg:
+            return {
+                "configured": False,
+                "base_url": None,
+                "email": None,
+                "default_project": None,
+            }
+        return {
+            "configured": True,
+            "base_url": cfg["base_url"],
+            "email": cfg["email"],
+            "default_project": cfg["default_project"],
+        }
+
 
 def public_user(u: dict) -> dict:
     """프론트 계약 user 객체(id/username/displayName/role). 비번 해시는 절대 노출 안 함."""
@@ -987,6 +1097,27 @@ def get_doc_template() -> dict | None:
 
 def clear_doc_template() -> bool:
     return store().clear_doc_template()
+
+
+# ---- 모듈 레벨 Jira 설정 헬퍼(싱글턴 store 위임) ----
+def set_jira_config(
+    base_url: str, email: str, api_token: str, default_project: str | None = None
+) -> None:
+    store().set_jira_config(base_url, email, api_token, default_project)
+
+
+def get_jira_config() -> dict | None:
+    """api_token 포함 — 내부 전용. API 응답에 그대로 싣지 말 것."""
+    return store().get_jira_config()
+
+
+def clear_jira_config() -> bool:
+    return store().clear_jira_config()
+
+
+def jira_config_status() -> dict:
+    """api_token 비노출 공개 상태."""
+    return store().jira_config_status()
 
 
 def update_profile(username: str, **fields) -> dict | None:
