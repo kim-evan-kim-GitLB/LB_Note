@@ -414,6 +414,33 @@ class JiraConfigRequest(BaseModel):
     defaultProject: str | None = None
 
 
+class JiraEpicSpec(BaseModel):
+    """새 에픽 생성 스펙 — issuetypeId + createmeta 기반 프론트 조립 fields(summary/duedate/description 등)."""
+    issuetypeId: str
+    fields: dict = {}
+
+
+class JiraTaskSpec(BaseModel):
+    """작업 생성 스펙 — issuetypeId + fields, sourceActionId(액션아이템 item_id 조인키, 멱등성용)."""
+    issuetypeId: str
+    fields: dict = {}
+    sourceActionId: str | None = None
+
+
+class JiraCreateIssuesRequest(BaseModel):
+    """회의 액션아이템 → Jira 에픽/작업 생성 요청.
+
+    epic 과 epicKey 는 상호배타(epic=새 에픽 생성, epicKey=기존 에픽에 붙이기). 둘 다 없으면
+    parent 없이 작업만. reporterAccountId 는 best-effort, watcherAccountIds 는 생성 이슈마다 추가.
+    """
+    projectKey: str
+    epic: JiraEpicSpec | None = None
+    epicKey: str | None = None
+    tasks: list[JiraTaskSpec] = []
+    reporterAccountId: str | None = None
+    watcherAccountIds: list[str] = []
+
+
 # 셀프 비번 변경 시 새 비밀번호 최소 길이.
 MIN_PASSWORD_LEN = 8
 
@@ -1585,6 +1612,16 @@ def _owned_or_404(meeting_id: str, user: dict) -> dict:
     """meeting 조회 + 소유자 확인. 없거나 남의 것이면 404(존재 자체를 숨김)."""
     m = store.get(meeting_id)
     if m is None or m.get("ownerId") != user["id"]:
+        raise HTTPException(status_code=404, detail="meeting 없음")
+    return m
+
+
+def _owned_or_admin_404(meeting_id: str, user: dict) -> dict:
+    """meeting 조회 + (소유자 또는 admin) 확인. 없거나 남의 것(비admin)이면 404(존재 자체를 숨김)."""
+    m = store.get(meeting_id)
+    if m is None:
+        raise HTTPException(status_code=404, detail="meeting 없음")
+    if m.get("ownerId") != user["id"] and (user.get("role") or "user") != "admin":
         raise HTTPException(status_code=404, detail="meeting 없음")
     return m
 
@@ -2789,6 +2826,169 @@ def jira_user_lookup(email: str = Query(...), user: dict = Depends(require_user_
     if not found:
         return {"accountId": None}
     return found
+
+
+def _jira_browse_url(cfg: dict, key: str | None) -> str | None:
+    """이슈 key → 브라우저 URL(base_url/browse/{key}). key 없으면 None."""
+    base = (cfg.get("base_url") or "").strip().rstrip("/")
+    return f"{base}/browse/{key}" if key else None
+
+
+def _split_issue_fields(raw: dict | None) -> tuple[str, object, dict]:
+    """createmeta 기반 프론트 fields → (summary, description, extra_fields).
+
+    summary/description 는 create_issue 인자로 분리하고 나머지(duedate/customfield_*/timetracking
+    등)는 extra_fields 로 통과시킨다. description 이 평문 문자열이면 jira_client._adf 로 ADF 로
+    감싼다(이미 dict 면 그대로). project/issuetype 은 create_issue 가 projectKey/issuetypeId 로 주입.
+    """
+    fields = dict(raw or {})
+    summary = str(fields.pop("summary", "") or "")
+    desc = fields.pop("description", None)
+    if isinstance(desc, str):
+        desc = jira_client._adf(desc)  # 평문 → ADF(엔드포인트에서 감싼다)
+    return summary, desc, fields
+
+
+@app.post("/api/meetings/{meeting_id}/jira-issues")
+def create_jira_issues(
+    meeting_id: str,
+    req: JiraCreateIssuesRequest,
+    user: dict = Depends(require_user_active),
+) -> dict:
+    """회의 액션아이템 → Jira 에픽/작업 동기 생성(소유자 또는 admin).
+
+    오케스트레이션: epic 있으면 새 에픽 생성 후 그 key 를 parent 로, epicKey 있으면 기존 에픽을
+    parent 로(생성 안 함), 둘 다 없으면 parent 없음. 각 task 는 per-item try/except 로 감싸 한 건
+    실패가 나머지를 막지 않는다. reporterAccountId 는 best-effort(권한 없으면 reporter 없이 재시도),
+    watcherAccountIds 는 생성 이슈마다 add_watchers best-effort. 생성된 key 는 매칭 액션아이템
+    (item_id ↔ sourceActionId)에 jiraKey/jiraUrl 로 되써 멱등성 확보(이미 jiraKey 있으면 재생성
+    스킵). 미설정 400 jira_not_configured, JiraAuthError/JiraError → 502(개별 task 실패는 200 안의
+    per-item error).
+    """
+    _require_hex32(meeting_id, what="meetingId")
+    m = _owned_or_admin_404(meeting_id, user)  # 소유·존재 게이트(admin 허용)
+    cfg = _require_jira_cfg()  # 미설정 400 jira_not_configured
+
+    action_items = m.get("actionItems") or []
+    existing_by_id: dict[str, dict] = {
+        it["item_id"]: it
+        for it in action_items
+        if isinstance(it, dict) and it.get("item_id")
+    }
+
+    reporter = req.reporterAccountId
+    # 전체 reporter 적용 여부(reporter 지정 시 True 로 시작, 한 건이라도 미적용이면 False).
+    reporter_applied = reporter is not None
+
+    def _create(issuetype_id: str, fields: dict | None, parent: str | None) -> dict:
+        """reporter best-effort 생성 — 지정 시 reporter 로 시도 후 JiraError 면 reporter 없이 재시도.
+
+        최종 실패(reporter 없이도 실패)는 JiraError 를 전파한다(호출측이 502/ per-item 매핑).
+        """
+        nonlocal reporter_applied
+        summary, desc, extra = _split_issue_fields(fields)
+        if reporter:
+            try:
+                return jira_client.create_issue(
+                    cfg, project_key=req.projectKey, issuetype_id=issuetype_id,
+                    summary=summary, description=desc, parent_key=parent,
+                    reporter_id=reporter, extra_fields=extra,
+                )
+            except jira_client.JiraError:
+                reporter_applied = False  # 한 건이라도 reporter 미적용이면 전체 false
+        return jira_client.create_issue(
+            cfg, project_key=req.projectKey, issuetype_id=issuetype_id,
+            summary=summary, description=desc, parent_key=parent, extra_fields=extra,
+        )
+
+    created_keys: list[str] = []  # watcher 대상(새로 생성한 이슈만)
+
+    # 1) 에픽: 새로 생성 or 기존 epicKey 사용(하드 에러 매핑 — 개별 task 와 달리 502).
+    epic_result: dict | None = None
+    epic_key: str | None = req.epicKey
+    if req.epic is not None:
+        try:
+            created = _create(req.epic.issuetypeId, req.epic.fields, None)
+        except jira_client.JiraAuthError as e:
+            raise HTTPException(
+                status_code=502,
+                detail={"error_code": "jira_auth_failed", "message": "Jira 인증에 실패했습니다."},
+            ) from e
+        except jira_client.JiraError as e:
+            raise HTTPException(
+                status_code=502,
+                detail={"error_code": "jira_error", "message": str(e)},
+            ) from e
+        epic_key = created["key"]
+        epic_result = {"key": created["key"], "url": created["url"], "created": True}
+        created_keys.append(created["key"])
+    elif req.epicKey:
+        epic_result = {"key": req.epicKey, "url": _jira_browse_url(cfg, req.epicKey), "created": False}
+
+    # 2) 각 작업 — per-item try/except, 멱등성(기존 jiraKey 스킵), key 되쓰기 수집.
+    task_results: list[dict] = []
+    writeback: dict[str, tuple[str, str | None]] = {}  # item_id → (key, url)
+    for t in req.tasks:
+        sid = t.sourceActionId
+        summary = str((t.fields or {}).get("summary") or "")
+        # 멱등성: 이미 jiraKey 가 있는 액션아이템은 재생성하지 않고 기존 키 반환.
+        if sid and (ex := existing_by_id.get(sid)) and ex.get("jiraKey"):
+            task_results.append({
+                "sourceActionId": sid,
+                "summary": summary or str(ex.get("text") or ""),
+                "key": ex.get("jiraKey"), "url": ex.get("jiraUrl"), "ok": True,
+            })
+            continue
+        try:
+            created = _create(t.issuetypeId, t.fields, epic_key)
+        except jira_client.JiraError as e:  # 한 건 실패가 나머지를 막지 않음
+            task_results.append({
+                "sourceActionId": sid, "summary": summary, "ok": False, "error": str(e),
+            })
+            continue
+        task_results.append({
+            "sourceActionId": sid, "summary": summary,
+            "key": created["key"], "url": created["url"], "ok": True,
+        })
+        created_keys.append(created["key"])
+        if sid:
+            writeback[sid] = (created["key"], created["url"])
+
+    # 3) watcher best-effort — 생성 이슈마다 추가, 실패는 collect(전체 실패시키지 않음).
+    watcher_ids = req.watcherAccountIds or []
+    watcher_failed: list[str] = []
+    if watcher_ids:
+        for key in created_keys:
+            try:
+                jira_client.add_watchers(cfg, key, watcher_ids)
+            except jira_client.JiraError:
+                watcher_failed.append(key)
+    watchers = {"attempted": len(created_keys) if watcher_ids else 0, "failed": watcher_failed}
+
+    # 4) 멱등성 되쓰기 — 매칭 액션아이템에 jiraKey/jiraUrl 기록(저장 실패해도 결과는 반환).
+    if writeback:
+        new_items: list = []
+        for it in action_items:
+            if isinstance(it, dict) and it.get("item_id") in writeback:
+                k, u = writeback[it["item_id"]]
+                it = {**it, "jiraKey": k, "jiraUrl": u}
+            new_items.append(it)
+        try:
+            store.update_if_match(meeting_id, {"actionItems": new_items}, None)
+        except Exception:  # noqa: BLE001 — 저장 실패는 경고만(생성은 이미 성공).
+            traceback.print_exc()
+            observability.audit("jira.issues.save_failed", meeting=meeting_id)
+
+    observability.audit(
+        "jira.issues.create", by=user["username"], meeting=meeting_id,
+        epic=(epic_result or {}).get("key"), taskCount=len(req.tasks),
+    )
+    return {
+        "epic": epic_result,
+        "tasks": task_results,
+        "watchers": watchers,
+        "reporterApplied": reporter_applied,
+    }
 
 
 # ---------- 관리자: 사용자 명부 관리 + 참석자 피커 디렉터리 ----------
