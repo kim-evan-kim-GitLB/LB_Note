@@ -2795,9 +2795,19 @@ def _jira_call(fn, *args, **kwargs):
 
 @app.get("/api/jira/projects")
 def jira_projects(user: dict = Depends(require_user_active)) -> dict:
-    """접근 가능한 Jira 프로젝트 목록 → {projects:[{key,name,style}]}. 미설정이면 400."""
+    """접근 가능한 Jira 프로젝트 목록 → {projects:[{key,name,style}], defaultProject}. 미설정이면 400.
+
+    defaultProject 는 관리자 설정(jira_config.default_project 또는 env)을 **비관리자에게도** 내려
+    다이얼로그 기본 선택에 쓴다(관리자 전용 /api/admin/jira-config 403 우회).
+    """
     cfg = _require_jira_cfg()
-    return {"projects": _jira_call(jira_client.get_projects, cfg)}
+    # defaultProject 는 _jira_status() 에서 얻는다(_jira_effective_cfg 는 default_project 를
+    # 버리므로 cfg.get 은 항상 None). _jira_status 는 DB(jira_config.default_project)·env
+    # (JIRA_DEFAULT_PROJECT) 양쪽을 정상 반영한다.
+    return {
+        "projects": _jira_call(jira_client.get_projects, cfg),
+        "defaultProject": (_jira_status().get("default_project") or None),
+    }
 
 
 @app.get("/api/jira/issue-types")
