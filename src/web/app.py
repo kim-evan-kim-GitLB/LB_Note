@@ -40,9 +40,9 @@ from src.web import (
     observability,
 )
 
+from src.cancellation import OperationCancelled
 from src.postprocess.backends.agent_cli import (
     AgentCLIAuthError,
-    AgentCLICancelled,
     claude_auth_status,
     use_cancel_event,
     use_credential,
@@ -1088,8 +1088,9 @@ def _run_ai_job(
     전역 폴백. 새 Thread 는 부모 ContextVar 를 자동 상속하지 않으므로 여기서 명시 설정한다.
 
     취소: cancel(Event)를 세마포어 획득 직후/단계 경계에서 확인해 이탈하고, agent_cli 진행 중에는
-    use_cancel_event 채널로 서브프로세스를 kill(AgentCLICancelled) — 슬롯을 빨리 반납해
-    뒤 사용자의 대기를 끊는다. STT 추론 자체는 비중단(짧음, RTFx≈232).
+    use_cancel_event 채널로 STT 는 배치 경계에서, agent_cli 는 서브프로세스 kill 로 이탈 — 슬롯을 빨리 반납해
+    뒤 사용자의 대기를 끊는다. STT 는 VAD 청크 배치 디코딩이라 배치 1개(초 단위)까지만 더 돌고 멈춘다.
+    (배치 내부 model.generate() 에서 멈춘 스톨은 여기서 못 끊는다 — 슬롯 회수는 재기동뿐.)
     """
     try:
         # [1단계: GPU] 슬롯 확보까지 대기(status='queued' 유지). 확보하면 'processing' 전환.
@@ -1135,7 +1136,7 @@ def _run_ai_job(
             "duration": _fmt_duration(contract.get("_duration_seconds")),
         }
         _mark_job(job_id, {"status": "done", "result": result})
-    except AgentCLICancelled:
+    except OperationCancelled:  # STT 배치 경계 취소 + agent_cli 취소(하위 타입) 공통
         _mark_job(job_id, {"status": "cancelled"})
     except AgentCLIAuthError as e:
         # 인증 만료/미로그인: 일반 실패와 구분해 error_code 를 실어 프론트가 "재인증" 흐름을
@@ -1396,7 +1397,7 @@ def _run_regenerate_job(
                 _inflight_delta("llm", -1)
         result = {"summary": summary, "actionItems": action_items}
         _mark_job(job_id, {"status": "done", "result": result})
-    except AgentCLICancelled:
+    except OperationCancelled:  # STT 배치 경계 취소 + agent_cli 취소(하위 타입) 공통
         _mark_job(job_id, {"status": "cancelled"})
     except AgentCLIAuthError as e:
         traceback.print_exc()

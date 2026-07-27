@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from src.backends.base import STTBackend
+from src.cancellation import raise_if_cancelled
 from src.types import Segment
 
 
@@ -161,6 +162,7 @@ class CohereASRBackend(STTBackend):
 
         if batch_size <= 1:                       # 안전 폴백(단일 경로)
             for cw in audios:
+                raise_if_cancelled()              # 청크 경계 취소 지점(아래 배치 경로와 동일)
                 inputs = self._processor(
                     cw, sampling_rate=sr, return_tensors="pt", language=lang
                 )
@@ -180,6 +182,10 @@ class CohereASRBackend(STTBackend):
                 texts.append(text.strip())
         else:
             for i in range(0, n, batch_size):
+                # 배치 경계 취소 지점 — STT 추론 자체는 중단 불가라, 여기서 끊지 않으면 취소한
+                # 잡이 전체 오디오를 다 디코딩할 때까지 GPU 슬롯을 물고 뒤 사용자를 막는다.
+                # 배치 1개는 초 단위(≤35s 청크 × batch)라 취소 반응도 그 수준이다.
+                raise_if_cancelled()
                 batch = audios[i:i + batch_size]
                 inputs = self._processor(
                     batch, sampling_rate=sr, return_tensors="pt", language=lang

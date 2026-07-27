@@ -41,9 +41,14 @@ import shutil
 import signal
 import subprocess
 import tempfile
-import threading
 import time
 
+from src.cancellation import (
+    OperationCancelled,
+    cancel_requested,
+    use_cancel_event,  # noqa: F401  (하위호환 재노출 — 기존 import 경로 유지)
+)
+from src.cancellation import _active_cancel as _cancel_var
 from src.postprocess.backends.base import LLMBackend, LLMCapabilities
 
 DEFAULT_MODEL = "sonnet"
@@ -100,34 +105,27 @@ class AgentCLIAuthError(RuntimeError):
     """
 
 
-class AgentCLICancelled(RuntimeError):
+class AgentCLICancelled(OperationCancelled):
     """사용자 취소로 CLI 호출이 중단됨. 실패가 아니므로 재시도하지 않고 즉시 전파한다.
 
     호출부(웹 잡 스레드)가 이 예외를 status='cancelled' 로 매핑한다.
+    OperationCancelled 를 상속하므로 STT 취소와 같은 except 로 잡힌다(호출부 분기 불필요).
     """
 
 
-# 취소 신호 채널(웹 "분석 취소"). 잡 스레드가 use_cancel_event 로 threading.Event 를 심으면
-# generate() 가 CLI 서브프로세스 대기 중 1초 간격으로 이를 확인, set 이면 프로세스를 kill 하고
-# AgentCLICancelled 를 던진다. 자격증명과 같은 이유로 ContextVar(스레드별 격리) 사용.
-_active_cancel: contextvars.ContextVar["threading.Event | None"] = contextvars.ContextVar(
-    "agent_cli_active_cancel", default=None
-)
-
-
-@contextlib.contextmanager
-def use_cancel_event(event: "threading.Event | None"):
-    """with 블록 동안만 취소 이벤트를 활성화하고, 빠져나오면 원복(누수 방지)."""
-    token = _active_cancel.set(event)
-    try:
-        yield
-    finally:
-        _active_cancel.reset(token)
+# 취소 신호 채널(웹 "분석 취소")은 src/cancellation.py 로 옮겼다 — STT 백엔드도 같은 채널을
+# 써야 하는데 여기 두면 src/backends 가 src/postprocess 를 임포트하게 돼 계층이 역전된다.
+# 아래 재노출은 하위호환용(기존 import 경로 유지).
+_active_cancel = _cancel_var
 
 
 def _raise_if_cancelled() -> None:
-    ev = _active_cancel.get()
-    if ev is not None and ev.is_set():
+    """CLI 경로 전용 — 취소 시 AgentCLICancelled(하위 타입)를 던진다.
+
+    공용 raise_if_cancelled() 는 OperationCancelled 를 던진다. CLI 호출부는 예외 이름으로
+    실패 원인을 구분해 로깅하므로 여기서는 하위 타입을 유지한다.
+    """
+    if cancel_requested():
         raise AgentCLICancelled("사용자 취소로 중단되었습니다.")
 
 
