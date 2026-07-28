@@ -21,6 +21,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -119,6 +120,10 @@ CRED_HEALTH_PER_USER_DELAY_SEC = float(os.environ.get("WEB_CRED_HEALTH_PER_USER_
 # ---------- Google Drive 회의록 동기화(사용자별 OAuth) ----------
 # 콜백 state(신원+CSRF) 토큰 TTL(초, 기본 10분) — 동의 왕복은 짧다.
 GOOGLE_STATE_TTL = int(os.environ.get("WEB_GOOGLE_STATE_TTL", "600"))
+
+# 사용자별 진단 이벤트 보존(기본 30일 / 2만 행). 정리 루프가 초과분을 지운다.
+USER_EVENT_MAX_AGE_SEC = float(os.environ.get("WEB_USER_EVENT_MAX_AGE_SEC", str(30 * 24 * 3600)))
+USER_EVENT_MAX_ROWS = int(os.environ.get("WEB_USER_EVENT_MAX_ROWS", "20000"))
 # 콜백 완료 후 프론트로 302 리다이렉트할 오리진. 미설정이면 상대경로(/settings)로 이동(동일출처).
 FRONTEND_ORIGIN = os.environ.get("WEB_FRONTEND_ORIGIN", "").rstrip("/")
 # Docs 변환 import 한도(~10MB) 방어 — transcript 세그먼트 상한(기본 무제한=None).
@@ -161,6 +166,16 @@ async def _cleanup_loop() -> None:
                 observability.audit("ai_job.purge", removed=purged)
         except Exception:  # noqa: BLE001 — 정리 실패가 스케줄러를 죽이지 않게 격리
             traceback.print_exc()
+        try:
+            # 사용자 진단 이벤트 보존 관리(무인 방치 시 무한 증식 방지). 디스크 정리 스위치와
+            # 무관하게 항상 돈다 — 정리를 꺼도 이 테이블은 계속 쌓이기 때문.
+            removed = await asyncio.to_thread(
+                auth.prune_user_events, USER_EVENT_MAX_AGE_SEC, USER_EVENT_MAX_ROWS
+            )
+            if removed:
+                observability.audit("user_events.prune", removed=removed)
+        except Exception:  # noqa: BLE001 — 정리 실패가 스케줄러를 죽이지 않게 격리
+            traceback.print_exc()
         await asyncio.sleep(CLEANUP_INTERVAL_SEC)
 
 
@@ -187,6 +202,9 @@ async def lifespan(app: FastAPI):
     호출해 로직을 단언한다(실 DB·스케줄러 미접촉).
     """
     in_test = os.environ.get("MEETSCRIPT_BLOCK_DEFAULT_DB") == "1"
+    # owner 가 실린 audit 이벤트를 사용자별 진단 이력으로 함께 적재(관리자 조회용).
+    # 테스트에서도 켠다 — 적재 경로 자체가 회귀 대상이고, DB 는 이미 임시 경로로 격리돼 있다.
+    observability.set_sink(auth.record_user_event)
     tasks: list[asyncio.Task] = []
     # _cleanup_loop 은 (CLEANUP_ENABLED 시)디스크 정리 + (항상)종료 잡 인메모리 GC 를 돈다 →
     # 디스크 정리를 꺼도(WEB_CLEANUP_ENABLED=0) 잡 GC 를 위해 루프는 띄운다(테스트 제외).
@@ -2090,19 +2108,33 @@ def google_connect(user: dict = Depends(require_user_active)) -> dict:
     서버 미설정(env 없음)이면 503(관리자 설정 필요).
     """
     if not google_oauth.oauth_configured():
+        # 재연동 실패 제보의 첫 갈래 — 서버 미설정이면 동의 화면까지 가지도 못한다.
+        observability.audit("google.connect_start", owner=user["username"], result="not_configured")
         raise HTTPException(status_code=503, detail="Google 연동이 설정되지 않았습니다(관리자 문의).")
     state = auth.make_token(user["id"], ttl=GOOGLE_STATE_TTL, scope="google_oauth")
     try:
         url = google_oauth.build_consent_url(state)
     except google_oauth.GoogleOAuthError as e:
+        observability.audit(
+            "google.connect_start", owner=user["username"], result=f"error:{type(e).__name__}"
+        )
         raise HTTPException(status_code=503, detail=str(e))
+    # "다시 연결을 눌렀는데 안 된다"는 제보를 받았을 때, 눌렀는지 자체를 확인할 수 있게 남긴다.
+    observability.audit("google.connect_start", owner=user["username"], result="consent_url_issued")
     return {"authUrl": url}
 
 
-def _google_redirect(status: str) -> RedirectResponse:
-    """콜백 후 프론트 설정 페이지로 302(?google=connected|error). 오리진 미설정 시 상대경로."""
+def _google_redirect(status: str, reason: str | None = None) -> RedirectResponse:
+    """콜백 후 프론트 설정 페이지로 302(?google=connected|error[&reason=...]).
+
+    reason 은 실패 갈래를 사용자/관리자가 구분할 수 있게 싣는다(사유 없이 error 만 주면 화면
+    캡처만으로는 원인 판별이 불가능하다). 비밀은 담지 않는다 — 코드성 짧은 문자열만.
+    """
     base = f"{FRONTEND_ORIGIN}/settings" if FRONTEND_ORIGIN else "/settings"
-    return RedirectResponse(url=f"{base}?google={status}", status_code=302)
+    url = f"{base}?google={status}"
+    if reason:
+        url += f"&reason={quote(reason)}"
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.get("/api/integrations/google/callback")
@@ -2117,10 +2149,18 @@ def google_callback(
     state 검증(신원·CSRF)은 user_from_token 이 담당 — 무효/만료/위조/스코프불일치면 401(재사용 차단).
     동의 거부(error)·code 누락·교환 실패는 프론트로 google=error 리다이렉트(사용자 안내).
     """
-    user = auth.user_from_token(state, scope="google_oauth")  # 무효 state → 401(CSRF 차단)
+    try:
+        user = auth.user_from_token(state, scope="google_oauth")  # 무효 state → 401(CSRF 차단)
+    except HTTPException:
+        # state 만료(TTL 600s)/위조. 예전에는 여기서 401 이 그대로 나가 **아무 흔적도 남지 않았다**
+        # — 콜백이 서버에 도달했는지조차 사후에 알 수 없었다. owner 를 모르므로 로그만 남긴다.
+        observability.audit("google.callback_state_invalid", has_code=bool(code), error=error)
+        raise
+    observability.audit("google.callback_arrived", owner=user["username"], has_code=bool(code))
     if error or not code:
-        observability.audit("google.connect_error", owner=user["username"], reason=error or "no_code")
-        return _google_redirect("error")
+        reason = error or "no_code"
+        observability.audit("google.connect_error", owner=user["username"], reason=reason)
+        return _google_redirect("error", reason)
     try:
         tok = google_oauth.exchange_code(code)
         auth.set_google_credential(user["username"], tok["refresh_token"], email=tok.get("email"))
@@ -2129,9 +2169,58 @@ def google_callback(
         observability.audit(
             "google.connect_error", owner=user["username"], reason=f"{type(e).__name__}: {e}"
         )
-        return _google_redirect("error")
+        return _google_redirect("error", "exchange_failed")
     observability.audit("google.connect", owner=user["username"], email=tok.get("email"))
     return _google_redirect("connected")
+
+
+@app.get("/api/settings/google/verify")
+def google_verify(user: dict = Depends(require_user_active)) -> dict:
+    """Google 자격증명 즉시 재검증(claude-credential/verify 와 대칭).
+
+    저장된 refresh_token 으로 실제 access_token 을 받아본다. 성공하면 무효 표시를 해제하고,
+    invalid_grant 면 무효 표시를 남긴다 — 설정 화면이 '연결됨' 표시만 믿지 않고 실제 유효성을
+    확인할 수 있게 한다. 응답에 토큰은 싣지 않는다.
+    """
+    cred = auth.get_google_credential(user["username"])
+    if not cred:
+        return {"valid": False, "errorCode": "google_not_connected", "status": auth.google_status(user["username"])}
+    try:
+        google_oauth.refresh_access_token(cred["refresh_token"])
+    except google_oauth.GoogleAuthExpired:
+        if auth.mark_google_credential_invalid(user["username"]):
+            observability.audit("google.auth_expired", owner=user["username"], via="verify")
+        return {
+            "valid": False,
+            "errorCode": "google_auth_expired",
+            "status": auth.google_status(user["username"]),
+        }
+    except google_oauth.GoogleOAuthError as e:
+        observability.audit("google.auth_error", owner=user["username"], via="verify", reason=type(e).__name__)
+        return {
+            "valid": False,
+            "errorCode": "google_auth_error",
+            "status": auth.google_status(user["username"]),
+        }
+    auth.clear_google_credential_invalid(user["username"])
+    observability.audit("google.verify_ok", owner=user["username"])
+    return {"valid": True, "errorCode": None, "status": auth.google_status(user["username"])}
+
+
+@app.get("/api/admin/user-events")
+def admin_user_events(
+    username: str | None = Query(default=None),
+    event: str | None = Query(default=None, description="이벤트명 접두사(예: google.)"),
+    limit: int = Query(default=100, ge=1, le=500),
+    user: dict = Depends(require_admin),
+) -> dict:
+    """사용자별 진단 이벤트 조회(admin 전용) — "이 사용자에게 무슨 일이 있었나".
+
+    개별 장애 제보(예: "다시 연결이 안 돼요")를 받았을 때 컨테이너 로그를 grep 하지 않고
+    해당 사용자의 최근 이력을 바로 본다. 비밀은 애초에 적재되지 않는다(audit 규약).
+    """
+    rows = auth.list_user_events(owner=username, event_prefix=event, limit=limit)
+    return {"count": len(rows), "events": rows}
 
 
 @app.delete("/api/settings/google")
@@ -2430,14 +2519,21 @@ def _google_access_token(username: str) -> str:
             detail={"error_code": "google_not_connected", "message": "Google 연동이 필요합니다."},
         )
     try:
-        return google_oauth.refresh_access_token(cred["refresh_token"])
+        token = google_oauth.refresh_access_token(cred["refresh_token"])
     except google_oauth.GoogleAuthExpired:
+        # 만료를 감지한 지점이 상태에 남긴다 — 이게 없으면 설정 화면은 '연결됨'인데 캘린더만
+        # 401 을 내서, 사용자가 어디서 재연동해야 하는지 알 수 없었다.
+        if auth.mark_google_credential_invalid(username):
+            observability.audit("google.auth_expired", owner=username)
         raise HTTPException(
             status_code=401,
             detail={"error_code": "google_auth_expired", "message": "Google 재연동이 필요합니다."},
         )
     except google_oauth.GoogleOAuthError as e:
+        observability.audit("google.auth_error", owner=username, reason=type(e).__name__)
         raise HTTPException(status_code=502, detail=f"Google 인증 실패: {e}")
+    auth.clear_google_credential_invalid(username)  # 정상 갱신 → 무효 표시 해제(자가 치유)
+    return token
 
 
 def _rfc3339(offset_days: int = 0) -> str:

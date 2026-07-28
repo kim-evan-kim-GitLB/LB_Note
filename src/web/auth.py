@@ -121,8 +121,22 @@ CREATE TABLE IF NOT EXISTS google_credentials (
     refresh_token  TEXT NOT NULL,   -- _enc_secret(Fernet, 접두사 enc:fernet:). API 응답 절대 미노출.
     email          TEXT,            -- 연결된 구글 계정(표시용). 없으면 None.
     root_folder_id TEXT,            -- drive.file 앱 루트 폴더 id(회의록 저장 위치)
-    updated_at     TEXT
+    updated_at     TEXT,
+    invalid_at     TEXT             -- refresh_token 무효(invalid_grant) 확인 시각. NULL 이면 정상.
 );
+-- 사용자별 진단 이벤트(관리자가 "이 사용자에게 무슨 일이 있었나"를 조회). observability.audit 의
+-- owner 필드가 실린 이벤트를 sink 로 받아 함께 적재한다. audit 는 stdout(+옵션 파일)로만 흘러서
+-- 개별 사용자의 장애 제보를 받으면 컨테이너 로그를 grep 해야 했다(연동 실패는 재현도 어렵다).
+-- 비밀은 담기지 않는다 — audit 규약대로 호출부가 owner/메타만 넘긴다. 보존은 prune_user_events.
+CREATE TABLE IF NOT EXISTS user_events (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts     TEXT NOT NULL,   -- ISO8601(초). 정렬·보존 기준
+    owner  TEXT NOT NULL,   -- username
+    event  TEXT NOT NULL,   -- audit 이벤트명(예: google.connect_error)
+    detail TEXT             -- audit 필드 k=v 직렬화(owner 제외). 없으면 NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_events_owner ON user_events(owner, id DESC);
+CREATE INDEX IF NOT EXISTS idx_user_events_ts ON user_events(ts);
 -- 앱 레벨 Google OAuth 클라이언트 설정(배포당 1개 앱 신분증 = client_id/secret). 사용자별이 아니라
 -- provider 단일 행. 관리자(role=admin)가 인앱에서 설정 → .env/재시작 없이 즉시 반영. client_secret 은
 -- _enc_secret(Fernet)로 암호화. 미설정이면 google_oauth 가 env(GOOGLE_OAUTH_*)로 폴백한다(하위호환).
@@ -196,6 +210,15 @@ class UserStore:
                 )
             except sqlite3.OperationalError:
                 pass  # 이미 존재(신규 DB 는 CREATE TABLE 에 포함)
+            # invalid_at: Google refresh_token 이 무효(invalid_grant)로 확인된 시각. 기존에는
+            # '행 존재 = 연결됨'이라 만료된 토큰도 설정 화면엔 계속 '연결됨'으로 보였다(캘린더는
+            # 401 을 내는데 설정은 연결됨 → 사용자가 어디서 재연동할지 모름). NULL 이면 정상.
+            try:
+                self._conn.execute(
+                    "ALTER TABLE google_credentials ADD COLUMN invalid_at TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass  # 이미 존재
             self._conn.commit()
 
     def upsert(
@@ -661,11 +684,12 @@ class UserStore:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO google_credentials "
-                "(username, refresh_token, email, root_folder_id, updated_at) "
-                "VALUES (?,?,?,NULL,?) "
+                "(username, refresh_token, email, root_folder_id, updated_at, invalid_at) "
+                "VALUES (?,?,?,NULL,?,NULL) "
                 "ON CONFLICT(username) DO UPDATE SET "
                 "refresh_token=excluded.refresh_token, email=excluded.email, "
-                "updated_at=excluded.updated_at",  # root_folder_id 는 보존(재연동 시 유효 폴더 유지)
+                "updated_at=excluded.updated_at, "
+                "invalid_at=NULL",  # 재연동 성공 → 무효 표시 해제. root_folder_id 는 보존
                 (username, stored, email, dt.datetime.now().isoformat(timespec="seconds")),
             )
             self._conn.commit()
@@ -713,15 +737,115 @@ class UserStore:
             self._conn.commit()
         return cur.rowcount > 0
 
+    def mark_google_credential_invalid(self, username: str) -> bool:
+        """refresh_token 무효(invalid_grant) 확인 → invalid_at 기록. 갱신된 행이 있으면 True.
+
+        자격증명을 지우지는 않는다 — email/root_folder_id 를 보존해 재연동 후 같은 폴더를 계속
+        쓰게 하고, '연결된 적 있으나 재연동 필요' 상태를 구분해 안내하기 위해서다.
+        이미 무효 표시된 행은 시각을 덮어쓰지 않는다(최초 감지 시각 보존).
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE google_credentials SET invalid_at=? "
+                "WHERE username=? AND invalid_at IS NULL",
+                (dt.datetime.now().isoformat(timespec="seconds"), username),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def clear_google_credential_invalid(self, username: str) -> None:
+        """무효 표시 해제(재연동 성공·검증 통과). 행이 없으면 무시."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE google_credentials SET invalid_at=NULL WHERE username=?", (username,)
+            )
+            self._conn.commit()
+
     def google_status(self, username: str) -> dict:
         """Google 연동 공개 상태(refresh_token **비노출**). 설정 UI 용.
 
-        반환: {"connected": bool, "email": str|None, "updatedAt": str|None}.
+        반환: {"connected", "email", "updatedAt", "needsReconnect", "invalidAt"}.
+        connected 의 의미는 기존과 같다(자격증명 행 존재) — 프론트 하위호환. 토큰이 실제로
+        유효한지는 needsReconnect(=invalid_at 기록됨)로 구분한다. 만료를 감지한 곳
+        (캘린더/드라이브/메일 호출, verify 엔드포인트)이 invalid_at 을 남긴다.
         """
         cred = self.get_google_credential(username)
         if not cred:
-            return {"connected": False, "email": None, "updatedAt": None}
-        return {"connected": True, "email": cred["email"], "updatedAt": cred["updated_at"]}
+            return {
+                "connected": False, "email": None, "updatedAt": None,
+                "needsReconnect": False, "invalidAt": None,
+            }
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT invalid_at FROM google_credentials WHERE username=?", (username,)
+            ).fetchone()
+        invalid_at = row["invalid_at"] if row else None
+        return {
+            "connected": True,
+            "email": cred["email"],
+            "updatedAt": cred["updated_at"],
+            "needsReconnect": bool(invalid_at),
+            "invalidAt": invalid_at,
+        }
+
+    # ---- 사용자별 진단 이벤트(user_events) ----
+    def record_user_event(self, owner: str, event: str, detail: str | None = None) -> None:
+        """진단 이벤트 1건 적재. 실패해도 호출부(요청 처리)를 깨뜨리지 않는다.
+
+        observability.audit 의 sink 로 연결돼, owner 가 실린 이벤트가 자동으로 들어온다.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO user_events (ts, owner, event, detail) VALUES (?,?,?,?)",
+                    (dt.datetime.now().isoformat(timespec="seconds"), owner, event, detail),
+                )
+                self._conn.commit()
+        except sqlite3.Error:
+            pass  # 진단 부가기능이 본 기능을 막지 않는다
+
+    def list_user_events(
+        self, owner: str | None = None, event_prefix: str | None = None, limit: int = 100
+    ) -> list[dict]:
+        """최근 이벤트 조회(최신순). owner/event_prefix 로 좁힌다. limit 상한 500."""
+        limit = max(1, min(int(limit), 500))
+        sql = "SELECT ts, owner, event, detail FROM user_events WHERE 1=1"
+        args: list[object] = []
+        if owner:
+            sql += " AND owner=?"
+            args.append(owner)
+        if event_prefix:
+            sql += " AND event LIKE ?"
+            args.append(f"{event_prefix}%")
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            {"ts": r["ts"], "owner": r["owner"], "event": r["event"], "detail": r["detail"]}
+            for r in rows
+        ]
+
+    def prune_user_events(self, max_age_sec: float, max_rows: int) -> int:
+        """보존 기간 초과분 + 행 수 상한 초과분(오래된 것부터) 삭제 → 삭제 건수.
+
+        무인 운영에서 조용히 커지는 것을 막는다(정리 루프가 주기 호출).
+        """
+        cutoff = (
+            dt.datetime.now() - dt.timedelta(seconds=max_age_sec)
+        ).isoformat(timespec="seconds")
+        removed = 0
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM user_events WHERE ts < ?", (cutoff,))
+            removed += cur.rowcount
+            cur = self._conn.execute(
+                "DELETE FROM user_events WHERE id NOT IN "
+                "(SELECT id FROM user_events ORDER BY id DESC LIMIT ?)",
+                (max(1, int(max_rows)),),
+            )
+            removed += cur.rowcount
+            self._conn.commit()
+        return removed
 
     # ---- 앱 레벨 Google OAuth 클라이언트 설정(app_oauth_config, provider='google') ----
     def set_google_oauth_config(
@@ -1065,6 +1189,28 @@ def set_google_root_folder(username: str, folder_id: str | None) -> None:
 
 def clear_google_credential(username: str) -> bool:
     return store().clear_google_credential(username)
+
+
+def mark_google_credential_invalid(username: str) -> bool:
+    return store().mark_google_credential_invalid(username)
+
+
+def clear_google_credential_invalid(username: str) -> None:
+    store().clear_google_credential_invalid(username)
+
+
+def record_user_event(owner: str, event: str, detail: str | None = None) -> None:
+    store().record_user_event(owner, event, detail)
+
+
+def list_user_events(
+    owner: str | None = None, event_prefix: str | None = None, limit: int = 100
+) -> list[dict]:
+    return store().list_user_events(owner, event_prefix, limit)
+
+
+def prune_user_events(max_age_sec: float, max_rows: int) -> int:
+    return store().prune_user_events(max_age_sec, max_rows)
 
 
 def google_status(username: str) -> dict:
