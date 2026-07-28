@@ -29,6 +29,9 @@ _counters: dict[str, int] = {}
 _lock = threading.Lock()
 _handler_ready = False
 
+# owner 가 실린 audit 이벤트를 추가로 받는 sink(앱이 set_sink 로 주입). 기본 None = 로그만.
+_sink = None
+
 
 def _ensure_handler() -> None:
     """WEB_AUDIT_LOG 지정 시 FileHandler 1회 부착(중복 방지). 미지정이면 propagate 만으로 충분."""
@@ -74,8 +77,19 @@ def _fmt_fields(fields: dict) -> str:
     return " ".join(parts)
 
 
+def set_sink(fn) -> None:
+    """owner 가 실린 audit 이벤트를 추가로 받을 sink 등록(None 이면 해제).
+
+    앱 기동 시 사용자별 진단 이벤트 저장소(auth.record_user_event)를 연결한다. audit 는 stdout
+    으로만 흘러서, 특정 사용자의 장애 제보를 받으면 컨테이너 로그를 뒤져야 했다(연동 실패처럼
+    재현이 어려운 건은 사실상 추적 불가). sink 실패는 삼킨다 — 진단이 본 기능을 막지 않는다.
+    """
+    global _sink
+    _sink = fn
+
+
 def audit(event: str, **fields: object) -> None:
-    """audit 이벤트 1건 기록 — 구조적 로그 1줄 + 동명 카운터 +1.
+    """audit 이벤트 1건 기록 — 구조적 로그 1줄 + 동명 카운터 +1 (+owner 있으면 sink).
 
     비밀(secret/password/token 값)은 절대 넘기지 않는다(호출부 책임). owner/meeting_id/메타만.
     """
@@ -83,6 +97,13 @@ def audit(event: str, **fields: object) -> None:
     incr(event)
     suffix = _fmt_fields(fields)
     _LOGGER.info("event=%s %s", event, suffix) if suffix else _LOGGER.info("event=%s", event)
+    owner = fields.get("owner")
+    if _sink is not None and owner:
+        detail = _fmt_fields({k: v for k, v in fields.items() if k != "owner"})
+        try:
+            _sink(str(owner), event, detail or None)
+        except Exception:  # noqa: BLE001 — 진단 적재 실패가 요청 처리를 깨뜨리지 않게 흡수
+            pass
 
 
 def snapshot() -> dict[str, int]:

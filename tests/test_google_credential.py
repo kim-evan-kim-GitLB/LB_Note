@@ -37,7 +37,10 @@ def test_google_credential_roundtrip_and_status_hides_token():
     with tempfile.TemporaryDirectory() as td:
         _auth, store = _fresh_auth(Path(td))
         # 미설정
-        assert store.google_status("admin") == {"connected": False, "email": None, "updatedAt": None}
+        assert store.google_status("admin") == {
+            "connected": False, "email": None, "updatedAt": None,
+            "needsReconnect": False, "invalidAt": None,  # 만료 표시(재연동 필요) — 미설정이면 False
+        }
         assert store.get_google_credential("admin") is None
         # 저장
         store.set_google_credential("admin", "1//refresh-secret-xyz", email="me@corp.com")
