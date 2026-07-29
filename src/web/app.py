@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
+from src import config as stt_config
 from src.web import (
     audio_store,
     google_calendar,
@@ -35,6 +36,7 @@ from src.web import (
     google_drive,
     google_gmail,
     google_oauth,
+    gpu_status,
     jira_client,
     maintenance,
     meeting_doc,
@@ -205,6 +207,19 @@ async def lifespan(app: FastAPI):
     # owner 가 실린 audit 이벤트를 사용자별 진단 이력으로 함께 적재(관리자 조회용).
     # 테스트에서도 켠다 — 적재 경로 자체가 회귀 대상이고, DB 는 이미 임시 경로로 격리돼 있다.
     observability.set_sink(auth.record_user_event)
+    # STT 실효 설정을 기동 시 남긴다 — 배포 환경파일이 코드 기본값을 덮어도 로그로 드러나게.
+    observability.audit(
+        "stt.config", batch_size=stt_config.STT_BATCH_SIZE, stt_slots=STT_CONCURRENCY,
+        llm_slots=LLM_CONCURRENCY, vram_cap_mb=stt_config.STT_VRAM_CAP_MB,
+        slots_from="env" if _STT_CONCURRENCY_ENV is not None else "default",
+    )
+    if _STT_CONCURRENCY_ENV is not None and STT_CONCURRENCY < STT_CONCURRENCY_DEFAULT:
+        print(
+            f"[stt-config] WEB_STT_CONCURRENCY={_STT_CONCURRENCY_ENV} 가 코드 기본값"
+            f"({STT_CONCURRENCY_DEFAULT})을 덮고 있습니다 — 슬롯이 {STT_CONCURRENCY}개로 동작합니다. "
+            "의도한 값이 아니면 배포 환경파일(.env.deploy)에서 해당 줄을 지우거나 값을 고치세요.",
+            flush=True,
+        )
     tasks: list[asyncio.Task] = []
     # _cleanup_loop 은 (CLEANUP_ENABLED 시)디스크 정리 + (항상)종료 잡 인메모리 GC 를 돈다 →
     # 디스크 정리를 꺼도(WEB_CLEANUP_ENABLED=0) 잡 GC 를 위해 루프는 띄운다(테스트 제외).
@@ -899,8 +914,19 @@ def _inflight_delta(kind: str, delta: int) -> None:
 
 # 동시 STT 추론 제한(백프레셔). GPU 1장에 요청마다 모델을 load 하므로, 동시에 N개만 돌리고
 # 나머지는 대기시킨다 → OOM/연산 경합 방지. 대기 중 잡 status='queued'(프론트가 "처리 대기 중…" 표시).
-# 기본 1(직렬). WEB_STT_CONCURRENCY 로 조정(예: VRAM 여유 시 2). (모델 상주/유휴 언로드는 v2.)
-STT_CONCURRENCY = max(1, int(os.environ.get("WEB_STT_CONCURRENCY", "1")))
+#
+# 기본 1 → 2 (2026-07-28). 슬롯이 1개면 잡 하나가 엔진에서 멈추는 순간 전면 정지다(슬롯 회수
+# 수단이 재기동뿐이라 그 사이 아무도 처리되지 않는다). 2개면 한쪽이 멈춰도 나머지가 돈다.
+# 주의: 아직 모델을 잡마다 load 하므로 슬롯당 모델 사본이 따로 올라간다 →
+#   슬롯 2개 = (모델 3.9GB + 배치 3.4GB) x 2 + CUDA 컨텍스트 1GB ≈ 16GB.
+# VRAM 이 빠듯하거나 GPU 를 다른 작업과 공유하면 WEB_STT_CONCURRENCY=1 로 되돌린다.
+# (모델 상주/공유로 사본을 없애면 슬롯당 배치 몫만 들어 훨씬 더 늘릴 수 있다 — v2.)
+STT_CONCURRENCY_DEFAULT = 2
+# 배포 환경파일(.env.deploy)은 저장소 밖 호스트에 있어, 예전 값(=1)이 남아 있으면 코드 기본값을
+# 조용히 덮는다 → 올린 줄 알았던 슬롯이 실제로는 1인 채로 돌 수 있다. env 지정 여부를 따로
+# 들고 있다가 기동 로그에 실효값을 남겨(아래 lifespan) 그 착오를 드러낸다.
+_STT_CONCURRENCY_ENV = os.environ.get("WEB_STT_CONCURRENCY")
+STT_CONCURRENCY = max(1, int(_STT_CONCURRENCY_ENV or STT_CONCURRENCY_DEFAULT))
 _stt_semaphore = threading.Semaphore(STT_CONCURRENCY)
 
 # LLM(요약·추출) 동시성 제한 — GPU 와 무관한 agent_cli/클라우드 호출이라 _stt_semaphore 와
@@ -1015,9 +1041,18 @@ def _queue_snapshot_locked() -> dict:
 
     active(점유)는 실제 세마포어 점유 카운터(_inflight)로 — 스톨로 error 마감돼도 워커가 슬롯을
     쥐고 있으면 그대로 집계된다(상태 추론이 놓치던 CR#4). 대기(queued)는 phase 로 집계한다.
+
+    sttStalled: 슬롯을 쥔 채 멈춘(스톨) 잡 수. 대기자가 "정상 혼잡"과 "앞이 멈춤"을 구분할 수
+    있게 큐 스냅샷에 실어 보낸다 — 이게 없으면 두 상황의 화면이 완전히 같아서, 사용자가
+    "3건이 앞서 진행 중"만 보고 하염없이 기다리게 된다(실사용자 제보 사례).
     """
-    stt_wait = llm_wait = 0
+    stt_wait = llm_wait = stt_stalled = 0
     for jid, m in _job_meta.items():
+        # 스톨 잡은 STT_STALL_MARK_ERROR=1 이면 status 가 error 로 마감돼도 워커가 슬롯을 쥔
+        # 상태다 → 대기 집계와 달리 status 필터 앞에서 센다. 반대로 워커가 결국 빠져나간 뒤
+        # 메타만 남는 구간(최대 JOB_RETENTION_SEC)의 오탐은 아래 실점유 상한으로 막는다.
+        if m.get("phase") == "transcribing" and m.get("warning") == "stt_stalled":
+            stt_stalled += 1
         if _jobs.get(jid, {}).get("status") not in ("queued", "processing"):
             continue
         ph = m.get("phase")
@@ -1027,7 +1062,38 @@ def _queue_snapshot_locked() -> dict:
             llm_wait += 1
     return {
         "sttSlots": STT_CONCURRENCY, "sttActive": _inflight["stt"], "sttQueued": stt_wait,
+        # 실제 점유 슬롯 수를 넘을 수 없다 — 슬롯이 하나도 안 잡혀 있으면 멈춘 점유자도 없다.
+        "sttStalled": min(stt_stalled, _inflight["stt"]),
         "llmSlots": LLM_CONCURRENCY, "llmActive": _inflight["llm"], "llmQueued": llm_wait,
+    }
+
+
+def _pending_results_locked(now: float) -> dict:
+    """재기동하면 사라지는 인메모리 잡 결과 집계(_jobs_lock 보유 상태에서 호출).
+
+    완료 잡의 결과(summary/transcript)는 스토어가 아니라 _jobs(인메모리)에만 있고, 프론트가
+    폴링해 가져갈 때까지 JOB_RETENTION_SEC 동안 남는다. 그래서 재기동은 "멈춘 슬롯 1개 회수"의
+    대가로 "아직 안 받아간 남의 회의 결과 전부"를 날릴 수 있다. 지금 재기동해도 되는지 판단할
+    수 있게 그 규모를 노출한다(운영자가 유휴 시점을 고를 수 있게).
+    """
+    items: list[dict] = []
+    for jid, j in _jobs.items():
+        if j.get("status") != "done" or not j.get("result"):
+            continue  # 결과가 있는 done 만 — error/cancelled 는 재기동으로 잃을 내용이 없다
+        ts = _job_finished_at.get(jid)
+        items.append({
+            "jobId": jid,
+            "owner": _job_owner.get(jid),
+            # 종료 관측 시각은 정리 루프(_purge_finished_jobs)가 채운다. 아직 안 돌았으면
+            # None(방금 끝난 잡) — 미관측을 0초로 위장하지 않는다.
+            "ageSec": round(now - ts, 1) if ts is not None else None,
+        })
+    items.sort(key=lambda a: -(a["ageSec"] or 0.0))  # 오래된 것(먼저 만료될 것) 상단
+    return {
+        "count": len(items),
+        "owners": len({i["owner"] for i in items if i["owner"] is not None}),
+        "retentionSec": JOB_RETENTION_SEC,
+        "items": items[:20],
     }
 
 
@@ -1074,13 +1140,52 @@ def _scan_stt_stalls() -> list[dict]:
     return newly
 
 
+# 마지막으로 기록한 GPU 압박 수준. 상태가 '바뀔 때만' audit 한다 — 스캔 주기마다 남기면
+# 정상 상태에서도 로그가 계속 쌓여 정작 전환 시점을 못 찾는다.
+_gpu_pressure_last: str | None = None
+
+
+def _scan_gpu_pressure() -> str | None:
+    """GPU 여유를 확인해 압박 수준이 바뀌었을 때만 audit → 전환된 수준(없으면 None).
+
+    nvidia-smi 서브프로세스 호출이라 이벤트 루프에서 직접 부르지 않는다(호출부가 to_thread).
+    """
+    global _gpu_pressure_last
+    snap = gpu_status.snapshot(stt_config.STT_BATCH_SIZE, force=True)
+    level = snap.get("pressure")
+    if level == _gpu_pressure_last:
+        return None
+    prev, _gpu_pressure_last = _gpu_pressure_last, level
+    if prev is None and level in ("ok", "unknown"):
+        return None  # 기동 직후 정상 상태는 굳이 남기지 않는다(첫 전환부터 기록)
+    observability.audit(
+        "gpu.pressure_change", pressure=level, previous=prev,
+        free_mb=snap.get("freeMb"), required_mb=snap.get("requiredMb"),
+    )
+    if level in ("insufficient", "tight"):
+        print(
+            f"[gpu-pressure] {level} — 여유 {snap.get('freeMb')}MB / 필요 "
+            f"{snap.get('requiredMb')}MB. 다른 작업이 GPU 를 점유하면 STT 잡이 OOM 으로 실패합니다.",
+            flush=True,
+        )
+    return level
+
+
 async def _stt_stall_watchdog_loop() -> None:
-    """STT_STALL_SCAN_SEC 주기로 스톨 스캔(블로킹 없음 — 짧은 인메모리 스캔). 예외는 삼켜 루프 유지."""
+    """STT_STALL_SCAN_SEC 주기로 스톨 스캔(블로킹 없음 — 짧은 인메모리 스캔). 예외는 삼켜 루프 유지.
+
+    같은 주기로 GPU 여유도 확인한다 — 스톨과 자원 부족은 증상이 비슷한데(둘 다 '처리가 안 됨')
+    대응이 다르다. 한 루프에서 같이 보고 audit 을 남겨 사후에 구분할 수 있게 한다.
+    """
     while True:
         await asyncio.sleep(STT_STALL_SCAN_SEC)
         try:
             _scan_stt_stalls()
         except Exception:  # noqa: BLE001 — 스캔 실패가 워치독을 죽이지 않게 격리
+            traceback.print_exc()
+        try:
+            await asyncio.to_thread(_scan_gpu_pressure)  # 서브프로세스 호출 → 루프 비블로킹
+        except Exception:  # noqa: BLE001 — GPU 조회 실패가 워치독을 죽이지 않게 격리
             traceback.print_exc()
 
 
@@ -1090,6 +1195,23 @@ def _job_cancelled(job_id: str, cancel: threading.Event) -> bool:
         return False
     _mark_job(job_id, {"status": "cancelled"})
     return True
+
+
+def _is_vram_oom(exc: BaseException) -> bool:
+    """CUDA VRAM 부족으로 인한 실패인가 — 예외 체인까지 훑는다.
+
+    torch 를 여기서 import 하지 않고 타입명/메시지로 판정한다(웹 계층이 GPU 라이브러리에
+    직접 묶이지 않게). 체인을 따라가는 이유: cohere 백엔드가 int8 폴백에 실패하면 원래
+    OutOfMemoryError 를 다시 올리면서 폴백 오류를 __cause__ 로 매단다.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(cur):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def _run_ai_job(
@@ -1170,7 +1292,18 @@ def _run_ai_job(
         # STT 단계(전사/슬롯 대기) 실패는 엔진 이상으로 구분 태깅 → 프론트가 "자격증명/경합"과
         # 다른 원인(백엔드 엔진)임을 안내할 수 있게 한다. LLM 단계 실패는 일반 오류로 둔다.
         payload = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-        if _job_phase(job_id) in ("waiting_stt", "transcribing"):
+        if _is_vram_oom(e):
+            # VRAM 부족은 엔진 결함이 아니다 — 원인(다른 작업의 GPU 점유)도 조치(잠시 후 재시도)도
+            # 다르다. 같은 코드로 묶으면 "엔진 점검"을 안내하게 되어 엉뚱한 곳을 뒤지게 된다.
+            snap = gpu_status.snapshot(stt_config.STT_BATCH_SIZE, force=True)
+            payload["error_code"] = "stt_vram_exhausted"
+            payload["error"] = "GPU 메모리가 부족해 전사에 실패했습니다."
+            payload["gpu"] = snap
+            observability.audit(
+                "stt.vram_oom", owner=_job_owner.get(job_id), job_id=job_id,
+                free_mb=snap.get("freeMb"), required_mb=snap.get("requiredMb"),
+            )
+        elif _job_phase(job_id) in ("waiting_stt", "transcribing"):
             payload["error_code"] = "stt_engine_error"
         _mark_job(job_id, payload)
     finally:
@@ -1205,7 +1338,20 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
         args=(job_id, audio_bytes, req.mimeType, credential, cancel),
         daemon=True,
     ).start()
-    return {"jobId": job_id, "status": "queued"}
+    out = {"jobId": job_id, "status": "queued"}
+    # 접수 시점의 GPU 여유를 알린다 — 거부하지는 않는다(남이 곧 놓을 수도 있고, 판단은 GPU 를
+    # 실제로 잡는 시점에야 확정된다). 다만 "실패할 수 있음"을 미리 알면 사용자가 재시도 타이밍을
+    # 고를 수 있다. 지금은 실패하고 나서야, 그것도 '엔진 오류'로만 알 수 있었다.
+    snap = gpu_status.snapshot(stt_config.STT_BATCH_SIZE)
+    warn = gpu_status.warning_text(snap)
+    if warn:
+        out["gpuWarning"] = warn
+        out["gpu"] = snap
+        observability.audit(
+            "gpu.pressure_on_submit", owner=user["username"],
+            pressure=snap["pressure"], free_mb=snap.get("freeMb"), required_mb=snap["requiredMb"],
+        )
+    return out
 
 
 @app.get("/api/ai/jobs/{job_id}")
@@ -1248,6 +1394,9 @@ def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
     out["queue"] = snap
     if ahead is not None:
         out["ahead"] = ahead
+    # 진행 중인 잡에만 GPU 여유를 싣는다(끝난 잡에 지금 시점 경고를 붙이면 오해를 부른다).
+    if j.get("status") in ("queued", "processing"):
+        out["gpu"] = gpu_status.snapshot(stt_config.STT_BATCH_SIZE)
     # 사람이 읽는 원인 힌트(프론트가 그대로 노출 가능) — 무한루프 3원인을 구분해 준다.
     out["reasonHint"] = _job_reason_hint(out)
     return out
@@ -1262,6 +1411,15 @@ def _job_reason_hint(out: dict) -> str | None:
         code = out.get("error_code")
         if code == "claude_auth_expired":
             return "claude 인증이 만료되어 요약/추출이 실패했습니다 — 재인증이 필요합니다."
+        if code == "stt_vram_exhausted":
+            gpu = out.get("gpu") or {}
+            detail = (
+                f"(여유 {gpu['freeMb']}MB / 필요 {gpu['requiredMb']}MB) " if gpu.get("freeMb") else ""
+            )
+            return (
+                f"GPU 메모리가 부족해 실패했습니다{detail}— 다른 작업이 GPU 를 점유 중일 수 "
+                "있습니다. 잠시 후 다시 시도해 주세요."
+            )
         if code == "stt_engine_error":
             return "STT 엔진 오류로 전사에 실패했습니다 — 백엔드 엔진 점검이 필요합니다."
         if code == "stt_stalled":
@@ -1274,6 +1432,23 @@ def _job_reason_hint(out: dict) -> str | None:
     if status == "queued":
         if phase == "waiting_stt":
             ahead = out.get("ahead")
+            # 앞선 잡이 멈춰 있으면 "정상 순서 대기"와 다른 문구를 준다. 둘을 같은 문구로
+            # 보여주면 사용자는 기다리면 되는 상황인지 신고해야 하는 상황인지 구분할 수 없다.
+            q = out.get("queue") or {}
+            if q.get("sttStalled"):
+                return (
+                    "앞선 STT 처리가 응답하지 않아 순서가 지연되고 있습니다 "
+                    "— 관리자 확인이 필요합니다."
+                )
+            gpu = out.get("gpu") or {}
+            # 우리 STT 슬롯이 하나도 안 잡힌 상태에서 여유가 부족하면 점유자는 외부다
+            # (우리 잡이 돌고 있으면 그 잡이 쓰는 몫이라 '다른 작업 탓'으로 단정할 수 없다).
+            if not q.get("sttActive") and gpu.get("pressure") == "insufficient":
+                return (
+                    f"다른 작업이 GPU 를 점유해 여유 메모리가 부족합니다"
+                    f"(여유 {gpu['freeMb']}MB / 필요 {gpu['requiredMb']}MB) "
+                    f"— 관리자 확인이 필요합니다."
+                )
             if ahead:
                 return f"다른 STT 처리 {ahead}건이 앞서 진행 중입니다 — 순서 대기 중입니다."
             return "STT 처리 슬롯을 기다리는 중입니다."
@@ -1320,10 +1495,14 @@ def admin_ai_jobs(user: dict = Depends(require_admin)) -> dict:
 
     queue: 슬롯 점유·대기 집계. active: 진행 중(queued/processing) 잡을 경과시간 내림차순으로
     (오래 걸린 잡·스톨이 상단). 스톨 임계값(sttStallSec)과 마감 여부(markError)도 노출.
+
+    pendingResults: 재기동 시 사라지는 인메모리 완료 결과 규모. 스톨 회수 수단이 재기동뿐이라,
+    "지금 재기동하면 몇 명이 결과를 잃는가"를 보고 시점을 고를 수 있어야 한다.
     """
     now = time.monotonic()
     with _jobs_lock:
         snap = _queue_snapshot_locked()
+        pending = _pending_results_locked(now)
         active: list[dict] = []
         for jid, m in _job_meta.items():
             st = _jobs.get(jid, {}).get("status")
@@ -1344,6 +1523,9 @@ def admin_ai_jobs(user: dict = Depends(require_admin)) -> dict:
         "activeCount": len(active),
         "stalledCount": len(stalled),
         "active": active,
+        "pendingResults": pending,
+        # 다른 작업의 GPU 점유로 잡이 OOM 으로 죽는 상황을 진단할 수 있게 여유/필요량을 노출.
+        "gpu": gpu_status.snapshot(stt_config.STT_BATCH_SIZE),
     }
 
 

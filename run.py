@@ -37,8 +37,10 @@ def main() -> int:
                     help="청킹 방식: vad(VAD 분할, 기본) | fixed(고정 길이, 기존 동작)")
     ap.add_argument("--vad-backend", choices=["energy", "silero"], default="energy",
                     help="분할용 VAD 백엔드: energy(기본, ~15x 빠름) | silero")
-    ap.add_argument("--batch-size", type=int, default=8,
-                    help="VAD 분할 청크 배치 디코딩 크기(greedy 라 결과 동일, 가속용)")
+    ap.add_argument("--batch-size", type=int, default=config.STT_BATCH_SIZE,
+                    help="VAD 분할 청크 배치 디코딩 크기(기본 32). 크게 잡을수록 빠르고 VRAM 을 더 쓴다. "
+                         "배치 구성이 바뀌면 패딩이 달라져 텍스트가 미세하게 달라질 수 있으나 "
+                         "WER 차이는 노이즈 수준(실측 bs=1~128 에서 0.397~0.400)")
     ap.add_argument("--target-sec", type=float, default=30.0,
                     help="VAD 분할 청크 목표 최대 길이(초). <35s 라야 내부 청커 재분할 없음")
     args = ap.parse_args()

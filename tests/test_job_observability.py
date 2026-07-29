@@ -216,6 +216,109 @@ def test_scan_stt_stall_mark_error_sets_cancel():
         assert ev.is_set()
 
 
+# ---------- 대기자에게 스톨 노출(HOL blocking 가시화) ----------
+def test_queue_snapshot_reports_stalled_holder():
+    """슬롯을 쥔 채 멈춘 잡을 sttStalled 로 집계 — MARK_ERROR 로 error 마감돼도 잡힌다."""
+    with _tmp() as (_auth, appmod, _client):
+        appmod._inflight["stt"] = 1  # 워커가 STT 임계구역 점유 중
+        _seed(appmod, "stuck", "dev", "error", "stt", "transcribing")
+        appmod._job_meta["stuck"]["warning"] = "stt_stalled"
+        with appmod._jobs_lock:
+            snap = appmod._queue_snapshot_locked()
+        assert snap["sttStalled"] == 1
+
+
+def test_queue_snapshot_stalled_bounded_by_inflight():
+    """워커가 빠져나가 슬롯이 풀린 뒤 메타만 남은 구간은 스톨로 세지 않는다(오탐 방지).
+
+    잡 메타는 종료 후에도 JOB_RETENTION_SEC 동안 남으므로, 상한이 없으면 이미 해소된
+    스톨 경고를 최대 2시간 동안 대기자에게 계속 보여주게 된다.
+    """
+    with _tmp() as (_auth, appmod, _client):
+        appmod._inflight["stt"] = 0  # 슬롯 반납 완료
+        _seed(appmod, "old", "dev", "cancelled", "stt", "transcribing")
+        appmod._job_meta["old"]["warning"] = "stt_stalled"
+        with appmod._jobs_lock:
+            snap = appmod._queue_snapshot_locked()
+        assert snap["sttStalled"] == 0
+
+
+def test_waiter_sees_stall_instead_of_generic_queue_message():
+    """대기자 문구가 '정상 혼잡'과 갈린다 — 실사용자 제보("3건 앞서 진행 중"인데 안 됨) 대응."""
+    with _tmp() as (auth, appmod, client):
+        hd = _headers(auth, appmod, "dev")
+        appmod._inflight["stt"] = 1
+        _seed(appmod, "stuck", "admin", "processing", "stt", "transcribing", age=999.0)
+        appmod._job_meta["stuck"]["warning"] = "stt_stalled"
+        _seed(appmod, "mine", "dev", "queued", "stt", "waiting_stt", age=1.0)
+        body = client.get("/api/ai/jobs/mine", headers=hd).json()
+        assert body["queue"]["sttStalled"] == 1
+        assert "응답하지 않아" in body["reasonHint"]
+        assert "앞서 진행 중입니다" not in body["reasonHint"]  # 정상 혼잡 문구로 가지 않는다
+
+
+def test_waiter_keeps_generic_message_without_stall():
+    """회귀: 스톨이 없으면 기존 '순서 대기' 문구 그대로(거짓 경보 방지)."""
+    with _tmp() as (auth, appmod, client):
+        hd = _headers(auth, appmod, "dev")
+        appmod._inflight["stt"] = 1
+        _seed(appmod, "busy", "admin", "processing", "stt", "transcribing")
+        _seed(appmod, "mine", "dev", "queued", "stt", "waiting_stt", age=1.0)
+        body = client.get("/api/ai/jobs/mine", headers=hd).json()
+        assert body["queue"]["sttStalled"] == 0
+        assert "1건이 앞서 진행 중입니다" in body["reasonHint"]
+
+
+# ---------- 미수령 결과(재기동 시 유실분) 노출 ----------
+def _seed_done(appmod, job_id: str, owner: str, *, result: dict | None, finished_ago: float | None):
+    """완료 잡 시드. finished_ago=None 이면 정리 루프가 아직 종료를 관측하지 않은 상태."""
+    with appmod._jobs_lock:
+        appmod._jobs[job_id] = {"status": "done", "result": result} if result else {"status": "done"}
+        appmod._job_owner[job_id] = owner
+        if finished_ago is not None:
+            appmod._job_finished_at[job_id] = appmod.time.monotonic() - finished_ago
+
+
+def test_pending_results_counts_only_unclaimed_done_with_result():
+    """재기동으로 잃는 건 '결과가 담긴 done' 뿐 — error/cancelled/결과없음은 제외."""
+    with _tmp() as (_auth, appmod, _client):
+        _seed_done(appmod, "d1", "dev", result={"summary": {}}, finished_ago=100.0)
+        _seed_done(appmod, "d2", "admin", result={"summary": {}}, finished_ago=10.0)
+        _seed_done(appmod, "d3", "dev", result=None, finished_ago=10.0)  # 결과 없는 done
+        _seed(appmod, "e1", "dev", "error", "stt", "transcribing")
+        _seed(appmod, "c1", "dev", "cancelled", "stt", "transcribing")
+        _seed(appmod, "p1", "dev", "processing", "stt", "transcribing")  # 진행 중은 대상 아님
+        with appmod._jobs_lock:
+            pend = appmod._pending_results_locked(appmod.time.monotonic())
+        assert pend["count"] == 2
+        assert pend["owners"] == 2  # dev, admin
+        assert pend["items"][0]["jobId"] == "d1"  # 오래된 것(먼저 만료될 것) 상단
+        assert pend["retentionSec"] == appmod.JOB_RETENTION_SEC
+
+
+def test_pending_results_age_none_until_purge_observes():
+    """정리 루프가 종료를 관측하기 전에는 ageSec=None — 미관측을 0초로 위장하지 않는다."""
+    with _tmp() as (_auth, appmod, _client):
+        _seed_done(appmod, "fresh", "dev", result={"summary": {}}, finished_ago=None)
+        with appmod._jobs_lock:
+            pend = appmod._pending_results_locked(appmod.time.monotonic())
+        assert pend["count"] == 1 and pend["items"][0]["ageSec"] is None
+        appmod._purge_finished_jobs(ttl=10_000)  # 종료 최초 관측 시각 기록(제거는 아직)
+        with appmod._jobs_lock:
+            pend = appmod._pending_results_locked(appmod.time.monotonic())
+        assert isinstance(pend["items"][0]["ageSec"], float)
+
+
+def test_admin_ai_jobs_exposes_pending_results():
+    with _tmp() as (auth, appmod, client):
+        ha = _headers(auth, appmod, "admin")
+        _seed_done(appmod, "d1", "dev", result={"summary": {}}, finished_ago=5.0)
+        body = client.get("/api/admin/ai-jobs", headers=ha).json()
+        assert body["pendingResults"]["count"] == 1
+        assert body["pendingResults"]["items"][0]["owner"] == "dev"
+        assert "sttStalled" in body["queue"]
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

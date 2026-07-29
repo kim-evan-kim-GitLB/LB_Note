@@ -19,7 +19,6 @@ import sys
 from pathlib import Path
 
 from src.postprocess.glossary import (
-    apply_corrections,
     load_glossary,
     load_glossary_version,
 )
