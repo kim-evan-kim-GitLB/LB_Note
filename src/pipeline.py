@@ -144,7 +144,7 @@ def run_pipeline(
         enhancers = chosen
         quality_info = {"metrics": metrics, "decision": chosen, "reason": reason}
     elif enhancers is None:
-        enhancers = config.parse_enhancers(config.ENHANCERS)  # 기본 ['wpe']: WPE→VAD→모델
+        enhancers = config.parse_enhancers(config.ENHANCERS)  # 기본 []: 전처리 없이 VAD→모델
 
     pre = preprocess(
         samples, sr,
