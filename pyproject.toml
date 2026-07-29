@@ -66,6 +66,9 @@ explicit = true
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# 벤더링한 상류 코드는 린트 대상이 아니다 — 우리 스타일에 맞춰 고치면 상류와 diff 가 생겨
+# 갱신 때마다 충돌한다(현재 gtcrn 의 E711 1건이 여기 해당).
+extend-exclude = ["src/backends/_vendor"]
 
 [dependency-groups]
 dev = [

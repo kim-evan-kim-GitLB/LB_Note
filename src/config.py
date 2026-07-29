@@ -17,6 +17,24 @@ OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(PROJECT_ROOT / "output")))
 STT_BACKEND = os.getenv("STT_BACKEND", "cohere")
 STT_LANGUAGE = os.getenv("STT_LANGUAGE", "Korean")
 
+# VAD 분할 청크 배치 디코딩 크기. 8 -> 32 상향(2026-07-28 실측 근거):
+#   - 속도    51.5분 음원 18.1s -> 8.2s (2.22배). GPU 를 다른 작업과 공유하는 상태에서 측정
+#   - 품질    WER 0.400 -> 0.398 (bs=1 기준선 0.397). 차이는 노이즈 수준
+#   - VRAM    reserved peak 5,834 -> 7,344 MiB (+1.5GB)
+#   - 발자국  VRAM x 점유시간 103 -> 58 GB.s (0.57배). 짧게 끝나 남을 오히려 덜 방해한다
+#   - 취소    배치 경계 취소 지연 상한 0.58s -> 1.08s (수용 범위)
+# 배치가 클수록 커널 실행 횟수가 줄어 시분할 경합에 강하다(bs=8 은 경합 시 RTFx 40% 손실,
+# bs=32 는 거의 무손실). 단 VRAM 이 빠듯한 환경에서는 낮춰야 한다 — 8 은 4GB VRAM 시절 값.
+STT_BATCH_SIZE = int(os.getenv("STT_BATCH_SIZE", "32"))
+
+# 이 프로세스가 쓸 수 있는 VRAM 상한(MiB). 0 이면 제한 없음.
+# 이 서버의 GPU 는 STT 전용이 아니다 — 다른 작업자의 학습/실험과 공유한다. 상한이 없으면 STT 가
+# 예산을 넘어 남의 작업을 OOM 으로 죽일 수 있고, 그쪽은 수 시간치 학습을 잃는다. 상한을 걸면
+# STT 가 자기 몫 안에서 먼저 실패하므로 사고가 우리 쪽에서 멈춘다.
+# 기본 20GB — 실측 최대 사용량(슬롯 2 x bs=32 동시 = 13.2GB)보다 충분히 크고, 정상 동작을
+# 제약하지 않는다. GPU 를 독점하는 환경이면 0 으로 꺼도 된다.
+STT_VRAM_CAP_MB = int(os.getenv("STT_VRAM_CAP_MB", "20480"))
+
 COHERE_MODEL_PATH = Path(
     os.getenv(
         "COHERE_MODEL_PATH",
