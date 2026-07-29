@@ -47,11 +47,24 @@ COHERE_QUANTIZATION = os.getenv("COHERE_QUANTIZATION", "")
 HF_TOKEN = os.getenv("HF_TOKEN") or None
 
 # --- 프론트엔드 전처리 ---
-# ENHANCERS: 쉼표 구분 순서. ""=none, 예: "wpe,gtcrn" (dereverb→denoise).
-# 기본 "wpe": 표준 파이프라인 = WPE(울림 제거)→VAD→모델. 울림 제거 단독은 대역제한 음원에서도
-# WER 개선·반복환각 억제 검증됨(asr test.m4a 55분: WER 0.39→0.36, CER 0.25→0.22, P2 환각 2→0).
-# GTCRN(denoise)은 대역제한에 net-negative라 기본 제외(필요 시 ENHANCERS=wpe,gtcrn). 끄려면 ENHANCERS="".
-ENHANCERS = os.getenv("ENHANCERS", "wpe")
+# ENHANCERS: 쉼표 구분 순서. ""=none(기본), 예: "wpe" / "wpe,gtcrn" (dereverb→denoise).
+#
+# 2026-07-29 기본값을 "wpe" -> "" 로 변경. 이유는 비용/효과가 맞지 않아서다.
+#   WPE 는 nara_wpe 단일채널 구현이고 **CPU 전용**이라(src/backends/wpe_dereverb.py) 처리
+#   시간이 오디오 길이에 정비례한다. 실측(tools/bench_wpe_ablation.py, 30분 음원):
+#     ENHANCERS=wpe  -> STT 170.3s (실효 RTFx 10.6)
+#     ENHANCERS=""   -> STT   6.1s (실효 RTFx 295.1)   = 28배
+#   즉 STT 시간의 96% 가 WPE 였고, 문서상 RTFx 232 는 전처리를 뺀 수치였다.
+#   정확도 대가는 작았다(tools/bench_wpe_wer.py, ax 회의 83분 / Clova reference):
+#     wpe  WER 0.3934 CER 0.2539  (STT 456.3s)
+#     none WER 0.3994 CER 0.2598  (STT  15.4s)   = 30배 빠르고 WER +0.006
+#
+# 단, 효과는 음원 의존적이다 — 잔향이 심한 원거리 녹음에서는 WPE 가 값을 할 수 있다.
+# 울림이 심한 음원은 개별적으로 ENHANCERS=wpe 로 처리하고, 근본적으로는 auto-enhance
+# 라우팅(src/pipeline.py 의 chosen 경로)으로 "잰 뒤 필요할 때만" 태우는 것이 목표다(후속).
+#
+# GTCRN(denoise)은 대역제한에 net-negative라 기본 제외(필요 시 ENHANCERS=wpe,gtcrn).
+ENHANCERS = os.getenv("ENHANCERS", "")
 # VAD_BACKEND: ""=off, "silero"
 VAD_BACKEND = os.getenv("VAD_BACKEND", "")
 VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
