@@ -19,10 +19,13 @@ import tempfile
 import traceback
 from pathlib import Path
 
+from src import config
+from src.cancellation import OperationCancelled
 from src.pipeline import run_pipeline
 from src.postprocess.backends import get_llm_backend
 from src.postprocess.backends.agent_cli import AgentCLIAuthError
 from src.postprocess.extract_schema import seconds_to_timestamp
+from src.postprocess.orchestrator import run_meeting_core
 from src.postprocess.glossary import load_glossary
 from src.postprocess.pipeline import _apply_glossary, _glossary_block, gate_segments
 from src.postprocess.schema import CleanResult, normalize_segments
@@ -109,15 +112,7 @@ def extract_action_items(
 
     passthrough 등 JSON 출력이 안 되는 백엔드는 빈 결과가 나오므로 호출부에서 건너뛴다.
     """
-    ex_input = [
-        {
-            "id": s["id"],
-            "start": s["start"],
-            "end": s["end"],
-            "text": (s.get("cleaned") or s.get("text") or ""),
-        }
-        for s in cleaned_segments
-    ]
+    ex_input = core_segments(cleaned_segments)
     backend = get_llm_backend(backend_name)
     result = ExtractStage().run(ex_input, backend, ctx={"summary_hints": summary_hints})
     # anchor 결정적 산출: LLM 출력 anchor 는 신뢰하지 않는다(보통 null/추측). 계약대로
@@ -139,15 +134,7 @@ def summarize_meeting(
 
     passthrough 등 JSON 출력이 안 되는 백엔드는 빈 요약이 나오므로 호출부에서 건너뛴다.
     """
-    sum_input = [
-        {
-            "id": s["id"],
-            "start": s["start"],
-            "end": s["end"],
-            "text": (s.get("cleaned") or s.get("text") or ""),
-        }
-        for s in cleaned_segments
-    ]
+    sum_input = core_segments(cleaned_segments)
     backend = get_llm_backend(backend_name)
     summary = SummarizeStage().run(sum_input, backend)
     summary = ground_summary(summary, sum_input)
@@ -196,6 +183,55 @@ def transcribe_to_segments(
     return seg_dicts, duration
 
 
+def core_segments(seg_dicts: list[dict]) -> list[dict]:
+    """정제 segment → core/스테이지 입력 형태([{id,start,end,text}]).
+
+    text 는 정제본(cleaned) 우선, 없으면 원문. 요약·추출·core 가 같은 입력을 보게 한곳에 모았다.
+    """
+    return [
+        {
+            "id": s["id"],
+            "start": s["start"],
+            "end": s["end"],
+            "text": (s.get("cleaned") or s.get("text") or ""),
+        }
+        for s in seg_dicts
+    ]
+
+
+def _enrich_with_core(
+    seg_dicts: list[dict],
+    duration: float | None,
+    *,
+    extract_backend_name: str | None = None,
+    summarize_backend_name: str | None = None,
+    clean_backend_name: str = "passthrough",
+) -> dict:
+    """다중 agent core 경로. 인증 만료는 전파, 그 외 실패는 빈 산출로 degrade(기존 정책 유지)."""
+    ex_backend = extract_backend_name or clean_backend_name
+    core: dict = {"summary": None, "actionItems": [], "coreMeta": {}}
+    try:
+        core = run_meeting_core(
+            core_segments(seg_dicts),
+            summarize_backend=summarize_backend_name,
+            extract_backend=ex_backend,
+        )
+    except AgentCLIAuthError:
+        # 인증 만료/미로그인은 graceful degrade 대상이 아니다 → 호출부가 인증 흐름으로 분기.
+        raise
+    except OperationCancelled:
+        raise  # 취소는 상위 잡이 'cancelled' 로 마감해야 한다
+    except Exception:  # noqa: BLE001 — core 실패가 전사·정제 산출을 죽이지 않는다
+        traceback.print_exc()
+    contract = build_meeting_contract_from_segments(
+        seg_dicts, action_items=core.get("actionItems") or [], summary=core.get("summary")
+    )
+    contract["_duration_seconds"] = duration
+    # 관측용 메타(웹 계약 필드 아님 — 호출부가 로깅·진단에 쓰고 저장 전에 떼어낸다).
+    contract["_core_meta"] = core.get("coreMeta") or {}
+    return contract
+
+
 def enrich_to_contract(
     seg_dicts: list[dict],
     duration: float | None,
@@ -208,7 +244,19 @@ def enrich_to_contract(
 
     process_audio_to_contract 의 후반부(GPU 비접촉). clean_backend_name 은 추출 백엔드 미지정 시
     폴백 결정용(기존 규약: 추출=정제 백엔드 폴백).
+
+    CORE_ENABLED(기본 ON)면 다중 agent core(orchestrator)로 처리한다 — 언어 게이트 → 라우팅 →
+    요약·추출 병렬 → (장시간이면 병합) → critic 1패스 → 결정적 그라운딩. 끄면 아래 레거시 경로
+    (요약 1콜 → 힌트 → 추출 1콜, 순차)로 동작한다.
     """
+    if config.CORE_ENABLED:
+        return _enrich_with_core(
+            seg_dicts,
+            duration,
+            extract_backend_name=extract_backend_name,
+            summarize_backend_name=summarize_backend_name,
+            clean_backend_name=clean_backend_name,
+        )
     # 요약 먼저(방법2): 요약의 결정/이슈를 추출 힌트로 쓰기 위해 추출보다 앞에 둔다.
     # 미지정 시 off(passthrough). 명시 백엔드일 때만 SummarizeStage 가동(설계 §6 폴백 정책).
     sum_backend = summarize_backend_name

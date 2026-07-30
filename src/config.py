@@ -96,6 +96,44 @@ AUTO_ENHANCE_SNR_LO = float(os.getenv("AUTO_ENHANCE_SNR_LO", "12.0"))
 AUTO_ENHANCE_CUTOFF_OK_HZ = float(os.getenv("AUTO_ENHANCE_CUTOFF_OK_HZ", "7000.0"))
 
 
+# --- 언어 게이트 (영어 환각 전사 방어, 기본 ON) ---
+# 설계·캘리브레이션: docs/2026-07-30-영어환각-언어게이트-설계.md §1-2·§3.
+# 실측 마진(환각 한글비율 0.00~0.01 / 정상 최저 0.59)이 커서 기본값으로 안전하다.
+# "0" 으로 두면 게이트 전체 no-op(안전 스위치) — 요약·추출 입력이 종전과 동일해진다.
+LANG_GATE_ENABLED = os.getenv("LANG_GATE_ENABLED", "1") not in ("", "0", "false", "False")
+# 제외 임계: 한글비율이 이 값 미만 **그리고** 한글 문자수가 MIN_HANGUL 미만이면 주입 제외.
+LANG_GATE_EXCLUDE_RATIO = float(os.getenv("LANG_GATE_EXCLUDE_RATIO", "0.15"))
+LANG_GATE_MIN_HANGUL = int(os.getenv("LANG_GATE_MIN_HANGUL", "5"))
+# 제외 최소 길이(문자): 이보다 짧은 라틴 조각은 버리지 않고 저신뢰 표시만 한다.
+# 실측 환각은 365~427자였고 짧은 조각은 진짜 발화("OK", "LGTM 네")일 확률이 높다.
+LANG_GATE_MIN_CHARS = int(os.getenv("LANG_GATE_MIN_CHARS", "40"))
+# 문자 폭주 제외: cps 가 이 값 초과 그리고 한글비율이 CPS_RATIO 미만일 때만(빠른 한국어 보호).
+LANG_GATE_MAX_CPS = float(os.getenv("LANG_GATE_MAX_CPS", "12.0"))
+LANG_GATE_CPS_RATIO = float(os.getenv("LANG_GATE_CPS_RATIO", "0.5"))
+# 저신뢰(회색지대) 임계: 한글비율이 이 값 미만이면 표시만 한다(정상 발화 실측 최저 0.59).
+LANG_GATE_LOW_CONF_RATIO = float(os.getenv("LANG_GATE_LOW_CONF_RATIO", "0.45"))
+
+
+# --- 다중 agent core (라우터 + 병렬 전문 agent + critic 1패스, 2026-07-30 결정) ---
+# 설계: docs/2026-07-30-영어환각-언어게이트-설계.md §2. 케이스 판정은 결정적(LLM 미사용)이며
+# LLM 콜은 전부 병렬로 돌린다 — 시간 예산이 "단일 콜의 2배 이내"라서 순차 실행은 불가.
+CORE_ENABLED = os.getenv("CORE_ENABLED", "1") not in ("", "0", "false", "False")
+# critic(검증 1패스). 끄면 요약·액션을 그대로 통과시킨다(콜 1개 절약).
+CORE_CRITIC_ENABLED = os.getenv("CORE_CRITIC_ENABLED", "1") not in ("", "0", "false", "False")
+# 동시 LLM 콜 상한. 회의 1건 안에서만 적용(서버 전체 동시성은 상위 세마포어가 통제).
+CORE_MAX_PARALLEL = int(os.getenv("CORE_MAX_PARALLEL", "4"))
+# 장시간 회의 분할(map) 창 크기·겹침(세그먼트 개수 단위). 겹침은 창 경계 논의 유실 방지용.
+CORE_WINDOW_SEGMENTS = int(os.getenv("CORE_WINDOW_SEGMENTS", "120"))
+CORE_WINDOW_OVERLAP = int(os.getenv("CORE_WINDOW_OVERLAP", "3"))
+# long_form 판정: 이 길이(초)를 넘으면 분할. 기본 40분(단일 콜 맥락·시간 한계 경험치).
+CORE_LONG_FORM_SEC = float(os.getenv("CORE_LONG_FORM_SEC", "2400"))
+# multi_topic 프록시: 세그먼트가 이 수 이상이면 다주제로 보고 owner 추론을 억제한다.
+CORE_MULTI_TOPIC_SEGMENTS = int(os.getenv("CORE_MULTI_TOPIC_SEGMENTS", "80"))
+# low_quality 판정 임계: 저신뢰 비율 / 동일 본문 반복 비율.
+CORE_LOW_QUALITY_RATIO = float(os.getenv("CORE_LOW_QUALITY_RATIO", "0.15"))
+CORE_DUPLICATE_RATIO = float(os.getenv("CORE_DUPLICATE_RATIO", "0.3"))
+
+
 def parse_enhancers(spec: str | None) -> list[str]:
     """ENHANCERS 스펙 문자열 → 정규화된 이름 리스트."""
     if not spec:
@@ -113,6 +151,7 @@ def env_status() -> dict:
         "enhancers": parse_enhancers(ENHANCERS),
         "vad_backend": VAD_BACKEND or None,
         "gtcrn_model_exists": GTCRN_MODEL_PATH.exists(),
+        "lang_gate": LANG_GATE_ENABLED,
     }
 
 
