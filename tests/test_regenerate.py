@@ -226,6 +226,39 @@ def test_http_regenerate_job_passthrough_completes():
         assert "summary" in jr["result"] and "actionItems" in jr["result"]
 
 
+def test_segments_skip_hidden_entries():
+    """숨긴 구간(hidden=True)은 재요약 입력에서 제외된다.
+
+    설계 docs/2026-07-30-회의록-구간-숨김-설계.md §3-2 — 입력에서 빠지므로 ground_summary 의
+    멤버십 필터가 그 id 인용을 자동으로 떨군다(별도 게이트 불필요).
+    """
+    from src.web.app import _segments_from_transcript
+
+    tr = [
+        {"text": "남김1", "timestamp": "00:10", "segmentId": 0},
+        {"text": "숨김", "timestamp": "00:20", "segmentId": 1, "hidden": True},
+        {"text": "남김2", "timestamp": "00:30", "segmentId": 2},
+    ]
+    segs = _segments_from_transcript(tr)
+    assert [s["id"] for s in segs] == [0, 2], "hidden 엔트리 제외"
+    assert [s["text"] for s in segs] == ["남김1", "남김2"]
+    # end 는 남은 항목 기준으로 이어붙는다(숨긴 구간의 시간은 건너뛴다)
+    assert segs[0]["start"] == 10.0 and segs[0]["end"] == 30.0
+
+
+def test_http_regenerate_all_hidden_400_with_reason():
+    """전부 숨김 → 400, 사유를 구분해 안내(빈 transcript 와 다른 메시지)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _h(auth, appmod)
+        m = _make(
+            client, h,
+            transcript=[{"text": "지움", "timestamp": "00:01", "segmentId": 0, "hidden": True}],
+        )
+        r = client.post(f"/api/meetings/{m['id']}/regenerate", headers=h)
+        assert r.status_code == 400, r.text
+        assert "숨겨져" in r.json()["detail"], r.text
+
+
 def test_http_regenerate_empty_transcript_400():
     with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
         h = _h(auth, appmod)

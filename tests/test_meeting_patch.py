@@ -392,6 +392,90 @@ def test_store_etag_monotonic_on_rapid_updates():
         assert etags == sorted(etags), "ETag 가 단조 증가하지 않음"
 
 
+# ---------- 구간 숨김(소프트 삭제, docs/2026-07-30-회의록-구간-숨김-설계.md) ----------
+def _tr2() -> list[dict]:
+    return [
+        {"speakerId": "", "text": "한 줄", "timestamp": "00:01", "segmentId": 0},
+        {"speakerId": "", "text": "두 줄", "timestamp": "00:05", "segmentId": 1},
+    ]
+
+
+def test_patch_transcript_hidden_set_and_restore():
+    """hidden=True 저장 → 조회 유지, hidden=False 로 되돌리면 키가 사라진다(복구)."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h, transcript=_tr2())
+        hidden_tr = [{**_tr2()[0], "hidden": True}, _tr2()[1]]
+        r = client.patch(f"/api/meetings/{m['id']}", json={"transcript": hidden_tr}, headers=h)
+        assert r.status_code == 200, r.text
+        out = r.json()["transcript"]
+        assert out[0]["hidden"] is True and "hidden" not in out[1]
+        # 개수·본문·타임스탬프·segmentId 는 보존(하드 삭제 아님 → 앵커 정합 유지)
+        assert len(out) == 2 and out[0]["text"] == "한 줄" and out[0]["segmentId"] == 0
+        # 재조회에도 유지
+        got = client.get(f"/api/meetings/{m['id']}", headers=h).json()["transcript"]
+        assert got[0]["hidden"] is True
+        # 복구: hidden=False → 키 제거
+        restore_tr = [{**out[0], "hidden": False}, out[1]]
+        r2 = client.patch(f"/api/meetings/{m['id']}", json={"transcript": restore_tr}, headers=h)
+        assert r2.status_code == 200, r2.text
+        assert "hidden" not in r2.json()["transcript"][0]
+
+
+def test_patch_transcript_hidden_does_not_set_edited():
+    """숨김은 '교정'이 아니다 — hidden 만 바꾼 엔트리에 edited 가 붙지 않는다."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h, transcript=_tr2())
+        hidden_tr = [{**_tr2()[0], "hidden": True}, _tr2()[1]]
+        out = client.patch(
+            f"/api/meetings/{m['id']}", json={"transcript": hidden_tr}, headers=h
+        ).json()["transcript"]
+        assert out[0].get("edited") is not True
+
+
+def test_patch_transcript_hidden_non_bool_is_normalized():
+    """비불리언 주입(문자열·객체)은 bool() 로 흡수 — 422 가 아니라 정규화."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h, transcript=_tr2())
+        weird = [
+            {**_tr2()[0], "hidden": "yes"},   # truthy → True
+            {**_tr2()[1], "hidden": ""},      # falsy → 키 제거
+        ]
+        r = client.patch(f"/api/meetings/{m['id']}", json={"transcript": weird}, headers=h)
+        assert r.status_code == 200, r.text
+        out = r.json()["transcript"]
+        assert out[0]["hidden"] is True and "hidden" not in out[1]
+
+
+def test_patch_transcript_hidden_with_text_edit_together():
+    """숨김과 텍스트 교정은 독립 — 동시에 적용되고 edited 는 text 변경에만 붙는다."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h, transcript=_tr2())
+        both = [
+            {**_tr2()[0], "hidden": True},
+            {**_tr2()[1], "text": "두 줄 교정"},
+        ]
+        out = client.patch(
+            f"/api/meetings/{m['id']}", json={"transcript": both}, headers=h
+        ).json()["transcript"]
+        assert out[0]["hidden"] is True and out[0].get("edited") is not True
+        assert out[1]["text"] == "두 줄 교정" and out[1]["edited"] is True
+
+
+def test_patch_transcript_hidden_does_not_relax_count_invariant():
+    """hidden 을 허용해도 개수·timestamp 불변은 그대로 — 하드 삭제는 여전히 422."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _auth_headers(auth, appmod, "admin")
+        m = _create_meeting(client, h, transcript=_tr2())
+        r = client.patch(
+            f"/api/meetings/{m['id']}", json={"transcript": [{**_tr2()[0], "hidden": True}]}, headers=h
+        )
+        assert r.status_code == 422, r.text
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
