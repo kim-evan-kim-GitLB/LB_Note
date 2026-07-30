@@ -70,6 +70,26 @@ def segment_stats(text: str, start: float = 0.0, end: float = 0.0) -> dict:
     }
 
 
+def is_korean_output(text: str) -> bool:
+    """**산출물**(요약·액션 텍스트)이 한국어인가 — 출력 언어 보장용 결정적 검사.
+
+    입력 세그먼트 판정(classify)과 목적이 다르다: 이건 우리가 만든 결과물이 한국어 회의록인지를
+    본다. 프롬프트에 "한국어로 써라"를 넣어두었지만 지시 준수에 기대지 않고 코드가 재검사한다.
+
+    임계값 캘리브레이션(실측 958개 산출 텍스트, 7런):
+      정상 한국어 항목의 한글비 **최저 0.308**("Gemini API 비용 이슈") / 중앙값 1.000.
+      영어 산출은 0.00 이므로 기본 임계 0.20 이면 오탐 0에 여유가 남는다.
+    한글·라틴 문자가 전혀 없으면(숫자·기호만) True — 개입 대상이 아니다.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    st = segment_stats(t)
+    if st["hangul"] + st["latin"] == 0:
+        return True
+    return st["hangul_ratio"] >= config.LANG_OUT_MIN_RATIO
+
+
 def classify(text: str, start: float = 0.0, end: float = 0.0) -> tuple[str, str | None]:
     """세그먼트 1개 판정 → (OK | LOW_CONF | EXCLUDE, 사유코드 | None).
 

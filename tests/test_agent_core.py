@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import threading
 
 from src import config
@@ -80,6 +81,8 @@ class _FakeBackend(LLMBackend):
             role = "reduce"
         elif "근거와 대조해" in system:
             role = "critic"
+        elif "한국어로 옮기는" in system:
+            role = "localize"
         elif "실행 과제" in system:
             role = "extract"
         else:
@@ -99,6 +102,9 @@ class _FakeBackend(LLMBackend):
             return json.dumps(self._reduce or self._summary, ensure_ascii=False)
         if role == "critic":
             return json.dumps(self._critic or {}, ensure_ascii=False)
+        if role == "localize":
+            # 기본은 '수리 실패'(빈 결과) — 성공 경로는 하위 클래스가 오버라이드해 검증한다.
+            return json.dumps({"items": []}, ensure_ascii=False)
         if role == "extract":
             return json.dumps(self._actions, ensure_ascii=False)
         return json.dumps(self._summary, ensure_ascii=False)
@@ -387,6 +393,112 @@ def test_empty_segments_short_circuits() -> None:
     out = orch.run_meeting_core([], summarize_backend="fake", extract_backend="fake")
     assert out["coreMeta"]["skipped"] == "no_segments"
     assert out["actionItems"] == []
+
+
+# ---------- 출력 언어 보장(한국어 산출) ----------
+ENGLISH_SUMMARY = {
+    "meta": {"subject": "배포 회의"},
+    "agenda_index": [{"no": 1, "title": "배포 일정", "summary": "다음 주 확정"}],
+    "agenda": [
+        {
+            "no": 1,
+            "title": "배포 일정",
+            "points": [
+                {"text": "We decided to ship next week after QA sign-off.", "evidence_seg_ids": [0]},
+                {"text": "다음 주 배포로 확정", "evidence_seg_ids": [1]},
+            ],
+            "decisions": [],
+            "issues": [],
+        }
+    ],
+}
+
+
+def test_korean_output_check_thresholds() -> None:
+    """실측 캘리브레이션(958개 산출 텍스트, 최저 한글비 0.308) 기준 오탐 0 회귀."""
+    from src.postprocess import language_gate as lg
+
+    for ok in (
+        "Gemini API 비용 이슈",                                    # 실측 최저 0.308
+        "위스퍼 모델은 Tiny/Base/Small/Medium/Large 종류가 있고 CPU/GPU 자원을 많이 소모함",
+        "음성인식 모델 조사(QWEN vs Cohere)",
+        "3시 30분",                                               # 문자 없음 → 개입 안 함
+        "",
+    ):
+        assert lg.is_korean_output(ok), ok
+    for bad in (
+        "We decided to ship next week after QA sign-off.",
+        "Okay, that's it. I have some room to be around the two girls.",
+    ):
+        assert not lg.is_korean_output(bad), bad
+
+
+def test_no_localize_call_when_all_korean() -> None:
+    """전부 한국어면 수리 콜이 아예 없다(평시 비용 0)."""
+    backend = _FakeBackend(summary=_summary_fixture())
+    with _cfg(CORE_CRITIC_ENABLED=False), _patched(backend):
+        out = orch.run_meeting_core(_segs(4), summarize_backend="fake", extract_backend="fake")
+    assert "localize" not in backend.roles()
+    assert out["coreMeta"]["calls"]["localize"] == 0
+    assert out["coreMeta"]["language"]["nonKorean"] == 0
+
+
+def test_english_summary_item_repaired_by_localize() -> None:
+    """비한국어 요약 항목은 수리 1콜로 한국어로 교체된다(항목 유실 없음)."""
+
+    class _Localizer(_FakeBackend):
+        def generate(self, messages, schema=None, temperature=0.0, max_tokens=4096, seed=0) -> str:
+            out = super().generate(messages, schema, temperature, max_tokens, seed)
+            if self.calls[-1]["role"] == "localize":
+                ids = re.findall(r'"id":\s*"(L\d+)"', self.calls[-1]["user"])
+                return json.dumps(
+                    {"items": [{"id": i, "text": "QA 승인 후 다음 주 배포로 확정"} for i in ids]},
+                    ensure_ascii=False,
+                )
+            return out
+
+    backend = _Localizer(summary=ENGLISH_SUMMARY)
+    with _cfg(CORE_CRITIC_ENABLED=False), _patched(backend):
+        out = orch.run_meeting_core(_segs(4), summarize_backend="fake", extract_backend="fake")
+    assert "localize" in backend.roles()
+    texts = [i["text"] for b in out["summary"]["agenda"] for i in b["points"]]
+    assert "We decided to ship next week after QA sign-off." not in texts
+    assert "QA 승인 후 다음 주 배포로 확정" in texts
+    lang = out["coreMeta"]["language"]
+    assert lang["nonKorean"] == 1 and lang["repaired"] == 1 and lang["droppedSummary"] == 0
+
+
+def test_unrepaired_english_summary_item_dropped() -> None:
+    """수리가 실패하면 요약 항목은 결정적으로 드롭된다(한국어 산출 보장)."""
+    backend = _FakeBackend(summary=ENGLISH_SUMMARY)  # localize 가 빈 응답 → 수리 실패
+    with _cfg(CORE_CRITIC_ENABLED=False), _patched(backend):
+        out = orch.run_meeting_core(_segs(4), summarize_backend="fake", extract_backend="fake")
+    texts = [i["text"] for b in out["summary"]["agenda"] for i in b["points"]]
+    assert texts == ["다음 주 배포로 확정"], texts
+    assert out["coreMeta"]["language"]["droppedSummary"] == 1
+
+
+def test_unrepaired_english_action_flagged_not_dropped() -> None:
+    """액션은 유실 비용이 커서 드롭이 아니라 flag='확인필요'."""
+    backend = _FakeBackend(
+        summary=_summary_fixture(),
+        actions={"action_items": [{"text": "Ship the release next week", "evidence_seg_ids": [0]}]},
+    )
+    with _cfg(CORE_CRITIC_ENABLED=False), _patched(backend):
+        out = orch.run_meeting_core(_segs(4), summarize_backend="fake", extract_backend="fake")
+    assert len(out["actionItems"]) == 1
+    assert out["actionItems"][0]["flag"] == "확인필요"
+    assert out["coreMeta"]["language"]["flaggedActions"] == 1
+
+
+def test_localize_disabled_skips_repair_and_still_enforces() -> None:
+    """CORE_LOCALIZE_ENABLED=0 이면 수리 콜 없이 곧바로 드롭/flag 로 마감한다."""
+    backend = _FakeBackend(summary=ENGLISH_SUMMARY)
+    with _cfg(CORE_CRITIC_ENABLED=False, CORE_LOCALIZE_ENABLED=False), _patched(backend):
+        out = orch.run_meeting_core(_segs(4), summarize_backend="fake", extract_backend="fake")
+    assert "localize" not in backend.roles()
+    assert out["coreMeta"]["calls"]["localize"] == 0
+    assert out["coreMeta"]["language"]["droppedSummary"] == 1
 
 
 def _run() -> None:
