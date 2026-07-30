@@ -1544,16 +1544,29 @@ def _ts_to_seconds(ts: object) -> float:
     return 0.0
 
 
+def _hidden_count(transcript: object) -> int:
+    """transcript 의 숨김(hidden=True) 엔트리 개수 — 감사로그용."""
+    if not isinstance(transcript, list):
+        return 0
+    return sum(1 for e in transcript if isinstance(e, dict) and e.get("hidden"))
+
+
 def _segments_from_transcript(transcript: list) -> list[dict]:
     """저장본 transcript → 재요약 입력 pseudo-segment([{id,start,end,text}]).
 
     id = segmentId(토대 PR 로 영속, 없으면 위치 인덱스 폴백). text = 교정된 transcript text(편집 반영).
     start = timestamp→초, end = 다음 항목 start(마지막은 start). 새 summary/actionItems 의
     evidence_seg_ids 가 이 id(=segmentId) 공간을 참조하므로 transcript 와 anchor/점프가 자기정합한다.
+
+    hidden=True(사용자가 숨긴 구간)는 **제외**한다 — 숨긴 내용이 새 요약·액션의 근거가 되면
+    안 된다(설계 docs/2026-07-30-회의록-구간-숨김-설계.md §3-2). 입력에서 빠지므로
+    ground_summary 의 멤버십 필터가 그 id 인용을 자동으로 떨군다.
     """
     segs: list[dict] = []
     for i, e in enumerate(transcript or []):
         if not isinstance(e, dict):
+            continue
+        if e.get("hidden"):
             continue
         text = str(e.get("text", "")).strip()
         if not text:
@@ -1622,9 +1635,16 @@ def regenerate_meeting(meeting_id: str, user: dict = Depends(require_user_active
     확정은 별도 POST .../regenerate/apply(백업+교체). 미리보기는 프론트 메모리 한정(새로고침 시 폐기).
     """
     m = _owned_or_404(meeting_id, user)
-    segments = _segments_from_transcript(m.get("transcript") or [])
+    stored_transcript = m.get("transcript") or []
+    segments = _segments_from_transcript(stored_transcript)
     if not segments:
-        raise HTTPException(status_code=400, detail="재요약할 transcript 가 없습니다.")
+        # 숨김으로 전부 비었으면 사유를 구분해 안내한다(사용자가 되돌릴 지점을 알 수 있게).
+        detail = (
+            "모든 구간이 숨겨져 있어 재요약할 내용이 없습니다. 숨김을 일부 해제한 뒤 다시 시도하세요."
+            if any(isinstance(e, dict) and e.get("hidden") for e in stored_transcript)
+            else "재요약할 transcript 가 없습니다."
+        )
+        raise HTTPException(status_code=400, detail=detail)
     credential = auth.get_credential(user["username"])
     job_id = uuid.uuid4().hex
     cancel = threading.Event()
@@ -1897,7 +1917,8 @@ def patch_meeting(
     구조보존 편집(편집 시에만, 독립 적용):
       - transcript: 저장본에 비어있지 않은 transcript 가 있고 patch 에 transcript 가 포함되면
         개수·timestamp·speakerId 불변을 검증(위반 422)하고 text 가 바뀐 엔트리에 edited=True 를
-        서버가 set 한다(위치 식별, 클라 edited 무시).
+        서버가 set 한다(위치 식별, 클라 edited 무시). 가변 필드는 text·hidden 둘뿐이며
+        hidden(구간 숨김=소프트 삭제)은 매 요청 값이 현재 상태다(edited 와 무관, 복구=false).
       - summary(P6): 저장본 summary 에 agenda 가 있고 patch 에 summary 가 포함되면 블록/항목
         개수·no·title·anchor·evidence·item_id 불변을 검증(위반 422)하고 SummaryItem.text 만
         편집 허용, 바뀐 항목에 edited/edited_at/original_text 를 서버가 set·evidence 스냅샷
@@ -1910,7 +1931,7 @@ def patch_meeting(
     validate+write 단일 구간). transcript 구조검증은 락 안에서 재조회한 저장본 기준으로
     수행되므로(락 밖 읽기본 cur 기준이 아님) If-Match 없는 편집의 TOCTOU 가 차단된다.
     """
-    _owned_or_404(meeting_id, user)  # 소유 확인 후에만 수정(소유권/존재 게이트)
+    cur = _owned_or_404(meeting_id, user)  # 소유 확인 후에만 수정(소유권/존재 게이트)
     patch.pop("ownerId", None)  # 소유자 변경 불가(store 도 한 번 더 강제)
     patch.pop("updatedAt", None)  # updatedAt(ETag)은 서버가 부여 — 클라 값 무시
 
@@ -1959,6 +1980,17 @@ def patch_meeting(
     if updated is None:  # 비교 직전 삭제된 경합
         raise HTTPException(status_code=404, detail="meeting 없음")
     observability.incr("meeting.patch")
+    # 구간 숨김(소프트 삭제) 변화는 별도 감사로그 — 회의록 내용이 빠지는 사건이라 추적 대상.
+    before = _hidden_count(cur.get("transcript"))
+    after = _hidden_count(updated.get("transcript"))
+    if after != before:
+        observability.audit(
+            "transcript.hide",
+            meeting_id=meeting_id,
+            owner=user["username"],
+            hidden=after,
+            delta=after - before,
+        )
     response.headers["ETag"] = f'"{updated["updatedAt"]}"'
     return _fill_display_date(updated)
 

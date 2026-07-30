@@ -92,6 +92,26 @@ def test_transcript_edit_preserves_segment_id() -> None:
     assert out[1]["segmentId"] == 2, "위조 segmentId 무시(저장본 보존)"
 
 
+def test_transcript_edit_mutable_field_whitelist_is_text_and_hidden() -> None:
+    """가변 필드는 text·hidden 둘뿐 — 그 외 임의 필드는 저장본 값이 이긴다(위조 표면 제한)."""
+    stored = [{"speakerId": "s1", "text": "원문", "timestamp": "00:12", "segmentId": 7, "confidence": 0.9}]
+    incoming = [
+        {
+            "speakerId": "s1",
+            "text": "원문",
+            "timestamp": "00:12",
+            "hidden": True,        # 허용
+            "confidence": 0.1,     # 미지 필드 위조 → 무시
+            "injected": "x",       # 미지 필드 주입 → 무시
+        }
+    ]
+    out = validate_transcript_edit(stored, incoming)
+    assert out[0]["hidden"] is True
+    assert out[0]["confidence"] == 0.9, "저장본 미지 필드 보존(클라 값 무시)"
+    assert "injected" not in out[0]
+    assert out[0].get("edited") is not True, "hidden 토글은 교정이 아니다"
+
+
 def _run() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

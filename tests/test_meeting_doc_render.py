@@ -135,6 +135,38 @@ def test_doc_title_stamp_and_fallback():
     assert meeting_doc.doc_title({}) == "회의록"
 
 
+def test_hidden_transcript_excluded_from_exports():
+    """숨긴 구간(hidden=True)은 HTML·평문·템플릿 치환값 어디에도 나오지 않는다.
+
+    설계 docs/2026-07-30-회의록-구간-숨김-설계.md §3-3 — Docs/PDF/Drive 는 이 두 렌더러에서
+    파생되므로 여기서 빠지면 모든 내보내기에서 빠진다.
+    """
+    m = {
+        **_MEETING,
+        "transcript": [
+            {"segmentId": 0, "timestamp": "00:01", "speakerId": "화자1", "text": "남는 발화"},
+            {"segmentId": 1, "timestamp": "00:05", "speakerId": "화자2", "text": "지운 발화", "hidden": True},
+        ],
+    }
+    html = meeting_doc.render_meeting_html(m)
+    assert "남는 발화" in html and "지운 발화" not in html
+    values = meeting_doc.render_template_values(m)
+    assert "남는 발화" in values["transcript"] and "지운 발화" not in values["transcript"]
+
+
+def test_all_hidden_transcript_drops_section_gracefully():
+    """전부 숨기면 전사 섹션 자체가 사라진다(예외 없음)."""
+    m = {
+        "title": "전부 숨김",
+        "summary": {},
+        "actionItems": [],
+        "transcript": [{"timestamp": "00:01", "text": "지움", "hidden": True}],
+    }
+    html = meeting_doc.render_meeting_html(m)
+    assert "<h1>전부 숨김</h1>" in html
+    assert "전체 대화" not in html and "지움" not in html
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

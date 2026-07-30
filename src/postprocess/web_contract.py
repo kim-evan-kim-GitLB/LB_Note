@@ -179,18 +179,24 @@ def validate_transcript_edit(stored: list[dict], incoming: list[dict]) -> list[d
     저장본(stored)에 이미 비어있지 않은 transcript 가 있을 때만 적용한다:
       - 엔트리 개수 불변
       - 각 엔트리의 timestamp · speakerId 불변
-      - text 만 변경 허용
+      - text · hidden 만 변경 허용(가변 필드 화이트리스트)
     위반(개수/타임스탬프/speakerId 변경) 시 TranscriptStructureError.
 
     text 가 실제로 바뀐 엔트리는 서버가 edited=True 를 set 한다(클라이언트 제공 edited 무시).
     저장본이 비어있던(초기 상태) 경우엔 제약 미적용 → 호출부에서 그대로 통과시킨다.
 
-    필드 보존(M3): 결과 엔트리는 **저장본(old) 베이스**로 만들고 검증된 새 text 만 교체한다.
-    timestamp·speakerId 및 저장본의 미지 필드(향후 confidence 등)는 old 에서 그대로 보존되며,
-    incoming 의 임의 필드(위조·미지 키)는 반영하지 않는다 → 클라이언트가 transcript 편집으로
-    변조할 수 있는 표면을 text 단 하나로 제한한다.
+    hidden(구간 숨김 = 소프트 삭제, 설계 docs/2026-07-30-회의록-구간-숨김-설계.md):
+      - truthy → hidden=True, 그 외/부재 → 키 제거(저장본 군더더기 방지·복구 = 키 삭제).
+      - 엔트리는 **지우지 않는다** — segmentId 공간이 보존돼야 기존 summary/actionItems 의
+        evidence 앵커·타임스탬프 점프가 살아있다(그래서 개수 불변 규칙도 유지).
+      - hidden 토글은 '교정'이 아니므로 edited 를 세우지 않는다(사용자에게 다른 사건).
 
-    반환: edited 플래그가 서버 기준으로 정규화된 새 transcript 리스트(원본 비파괴).
+    필드 보존(M3): 결과 엔트리는 **저장본(old) 베이스**로 만들고 검증된 새 text/hidden 만
+    교체한다. timestamp·speakerId 및 저장본의 미지 필드(향후 confidence 등)는 old 에서 그대로
+    보존되며, incoming 의 임의 필드(위조·미지 키)는 반영하지 않는다 → 클라이언트가 transcript
+    편집으로 변조할 수 있는 표면을 text·hidden 둘로만 제한한다.
+
+    반환: edited/hidden 플래그가 서버 기준으로 정규화된 새 transcript 리스트(원본 비파괴).
     """
     if len(incoming) != len(stored):
         raise TranscriptStructureError(
@@ -204,7 +210,7 @@ def validate_transcript_edit(stored: list[dict], incoming: list[dict]) -> list[d
             raise TranscriptStructureError(f"transcript[{idx}] speakerId 불변 위반")
         new_text = str(new.get("text", ""))
         old_text = str(old.get("text", ""))
-        # M3: 저장본 베이스 + 검증된 새 text 만 교체. 미지 필드/타임스탬프/speakerId 는 old 보존.
+        # M3: 저장본 베이스 + 검증된 새 text/hidden 만 교체. 미지 필드/타임스탬프/speakerId 는 old 보존.
         entry = dict(old)
         entry["text"] = new_text
         # edited 는 누적: 저장본이 이미 edited 면 유지, 이번에 바뀌었으면 set. 클라 값 무시.
@@ -212,6 +218,12 @@ def validate_transcript_edit(stored: list[dict], incoming: list[dict]) -> list[d
             entry["edited"] = True
         else:
             entry.pop("edited", None)
+        # hidden(숨김)은 누적하지 않는다 — 매 요청의 값이 곧 현재 상태(복구=false/키 부재).
+        # 문자열·객체 등 비불리언 주입은 bool() 로 흡수(422 아님 — 표면이 넓어지지 않으므로).
+        if new.get("hidden"):
+            entry["hidden"] = True
+        else:
+            entry.pop("hidden", None)
         out.append(entry)
     return out
 

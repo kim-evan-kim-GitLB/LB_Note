@@ -164,9 +164,22 @@ def _render_action_items(meeting: dict) -> list[str]:
     return out
 
 
-def _render_transcript(meeting: dict, max_segments: int | None) -> list[str]:
+def _visible_transcript(meeting: dict) -> list[dict]:
+    """내보내기 대상 transcript — 빈 줄과 **숨긴 구간(hidden=True)** 을 제외한다.
+
+    사용자가 회의록에서 지운(숨긴) 구간은 Docs/PDF/Drive 산출물에도 나오지 않아야 한다
+    (설계 docs/2026-07-30-회의록-구간-숨김-설계.md §3-3). 저장본은 보존되므로 되돌릴 수 있다.
+    """
     transcript = meeting.get("transcript") or []
-    segs = [s for s in transcript if isinstance(s, dict) and str(s.get("text") or "").strip()]
+    return [
+        s
+        for s in transcript
+        if isinstance(s, dict) and not s.get("hidden") and str(s.get("text") or "").strip()
+    ]
+
+
+def _render_transcript(meeting: dict, max_segments: int | None) -> list[str]:
+    segs = _visible_transcript(meeting)
     if not segs:
         return []
     out = ["<h2>전체 대화(transcript)</h2>"]
@@ -280,8 +293,7 @@ def _plain_action_items(meeting: dict) -> str:
 
 
 def _plain_transcript(meeting: dict) -> str:
-    transcript = meeting.get("transcript") or []
-    segs = [s for s in transcript if isinstance(s, dict) and str(s.get("text") or "").strip()]
+    segs = _visible_transcript(meeting)  # 숨긴 구간 제외(관리자 Docs 템플릿 {{transcript}} 경로)
     out: list[str] = []
     for s in segs:
         ts = str(s.get("timestamp") or "").strip()
