@@ -119,7 +119,8 @@ def test_agenda_index_and_meta_passthrough() -> None:
 
 def test_stage_stamps_version_and_backend() -> None:
     summary = SummarizeStage().run(SEGS, _FakeBackend())
-    assert summary.prompt_version == "summarize-ko-1.0", summary.prompt_version
+    # v1.1: 환각 방어(비한국어 덩어리·자막 상용구)·저신뢰 표시 줄·출력 언어 규칙 추가.
+    assert summary.prompt_version == "summarize-ko-1.1", summary.prompt_version
     assert summary.backend == "fake", summary.backend
 
 

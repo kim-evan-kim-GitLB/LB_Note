@@ -68,7 +68,12 @@ class SummarizeStage:
     ) -> MeetingSummary:
         ctx = ctx or {}
         system_tmpl, user_tmpl = _split_sections(_load_prompt(self._prompt_path))
-        messages = build_messages(segments, system_tmpl, user_tmpl)
+        # 다중 agent core: case 별 지시문 보강 + 저신뢰 segment 표시(`[id]~`).
+        if ctx.get("extra_directives"):
+            system_tmpl = f"{system_tmpl}\n\n{ctx['extra_directives']}"
+        messages = build_messages(
+            segments, system_tmpl, user_tmpl, low_conf_ids=ctx.get("low_conf_ids")
+        )
         raw = backend.generate(
             messages,
             schema=None,

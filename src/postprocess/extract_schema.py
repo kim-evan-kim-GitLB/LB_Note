@@ -40,9 +40,22 @@ def load_cleaned_segments(cleaned_json: Path | str) -> list[dict]:
     return out
 
 
-def transcript_with_ids(segments: list[dict]) -> str:
-    """추출 프롬프트 주입용 본문: 각 줄 `[id] 본문`. 빈 segment 는 생략(근거 무의미)."""
-    lines = [f"[{s['id']}] {s['text']}".rstrip() for s in segments if s.get("text")]
+def transcript_with_ids(
+    segments: list[dict], low_conf_ids: set[int] | dict[int, str] | None = None
+) -> str:
+    """추출 프롬프트 주입용 본문: 각 줄 `[id] 본문`. 빈 segment 는 생략(근거 무의미).
+
+    low_conf_ids(언어 게이트): 인식 신뢰도가 낮은 segment id 집합. 해당 줄은 `[id]~ 본문` 으로
+    표시하고, 프롬프트가 "표시된 줄만을 근거로 항목을 만들지 마라"를 강제한다
+    (설계 docs/2026-07-30-영어환각-언어게이트-설계.md §3·§4).
+    """
+    marks = set(low_conf_ids or ())
+    lines = []
+    for s in segments:
+        if not s.get("text"):
+            continue
+        mark = "~" if s.get("id") in marks else ""
+        lines.append(f"[{s['id']}]{mark} {s['text']}".rstrip())
     return "\n".join(lines)
 
 

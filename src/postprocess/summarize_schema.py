@@ -234,7 +234,9 @@ def _time_range(starts: list[float], ends: list[float]) -> str | None:
 
 
 def ground_summary(
-    summary: MeetingSummary, segments: list[dict]
+    summary: MeetingSummary,
+    segments: list[dict],
+    low_conf_ids: set[int] | dict[int, str] | None = None,
 ) -> MeetingSummary:
     """요약 게이트 [D'] + 결정적 산출(설계 §7).
 
@@ -244,9 +246,15 @@ def ground_summary(
     - 빈 안건 블록(세 섹션 모두 비고 근거 없음)은 드롭.
 
     LLM 이 준 anchor/time_range/evidence_seg_ids(블록)는 사용하지 않고 여기서 재산출한다.
+
+    low_conf_ids(언어 게이트, 2026-07-30): 인식 저신뢰 segment id. 유효 근거가 **전부** 저신뢰인
+    요약 항목은 드롭한다 — 프롬프트에 "저신뢰 단독근거 금지"를 넣었더라도 LLM 준수에 기대지 않고
+    결정적으로 막는다. 요약은 항목 수가 많아 드롭이 안전하다(액션은 유실 비용이 커서 flag 처리 —
+    설계 docs/2026-07-30-영어환각-언어게이트-설계.md §5).
     """
     start_by_id = {int(s["id"]): float(s["start"]) for s in segments}
     end_by_id = {int(s["id"]): float(s.get("end", s["start"])) for s in segments}
+    low_conf = {int(x) for x in (low_conf_ids or ())}
 
     def ground_items(items: list[SummaryItem]) -> list[SummaryItem]:
         out: list[SummaryItem] = []
@@ -255,6 +263,8 @@ def ground_summary(
             valid = list(dict.fromkeys(s for s in it.evidence_seg_ids if s in start_by_id))
             if not valid:
                 continue  # 근거 없는 항목 드롭(그라운딩 필수)
+            if low_conf and all(s in low_conf for s in valid):
+                continue  # 저신뢰 단독근거 항목 드롭(환각 후보)
             it.evidence_seg_ids = valid
             it.anchor = seconds_to_timestamp(min(start_by_id[s] for s in valid))
             out.append(it)

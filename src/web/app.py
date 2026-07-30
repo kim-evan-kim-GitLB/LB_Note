@@ -58,6 +58,7 @@ from src.postprocess.web_contract import (
     validate_summary_edit,
     validate_transcript_edit,
 )
+from src.postprocess.orchestrator import run_meeting_core
 from src.web.service import (
     _summary_action_hints,
     enrich_to_contract,
@@ -1275,6 +1276,7 @@ def _run_ai_job(
             "transcript": contract.get("transcript", []),
             "duration": _fmt_duration(contract.get("_duration_seconds")),
         }
+        _audit_core_meta(job_id, contract.get("_core_meta"))
         _mark_job(job_id, {"status": "done", "result": result})
     except OperationCancelled:  # STT 배치 경계 취소 + agent_cli 취소(하위 타입) 공통
         _mark_job(job_id, {"status": "cancelled"})
@@ -1544,6 +1546,31 @@ def _ts_to_seconds(ts: object) -> float:
     return 0.0
 
 
+def _audit_core_meta(job_id: str, core_meta: object) -> None:
+    """다중 agent core 실행 메타를 감사로그로 남긴다(관측성).
+
+    무엇이 왜 걸러졌는지(언어 게이트 제외·저신뢰), 어떤 case 로 라우팅됐는지, LLM 콜을 몇 번
+    썼는지를 남긴다 — 산출이 빈약할 때 프롬프트 문제인지 게이트 과잉인지 구분하는 근거가 된다.
+    """
+    if not isinstance(core_meta, dict) or not core_meta:
+        return
+    gate = core_meta.get("gate") or {}
+    calls = core_meta.get("calls") or {}
+    critic = core_meta.get("critic") or {}
+    observability.audit(
+        "core.run",
+        job_id=job_id,
+        cases=",".join((core_meta.get("plan") or {}).get("cases") or []) or "none",
+        windows=(core_meta.get("plan") or {}).get("windows"),
+        excluded=len(gate.get("excluded") or {}),
+        low_conf=len(gate.get("lowConf") or {}),
+        calls=sum(v for v in calls.values() if isinstance(v, int)),
+        critic_dropped=(critic.get("summaryDropped", 0) + critic.get("actionsDropped", 0)),
+        critic_flagged=critic.get("actionsFlagged", 0),
+        critic_added=critic.get("actionsAdded", 0),
+    )
+
+
 def _hidden_count(transcript: object) -> int:
     """transcript 의 숨김(hidden=True) 엔트리 개수 — 감사로그용."""
     if not isinstance(transcript, list):
@@ -1601,14 +1628,30 @@ def _run_regenerate_job(
             _inflight_delta("llm", 1)
             try:
                 with use_credential(credential), use_cancel_event(cancel):
-                    summary = summarize_meeting(segments, backend_name=SUMMARIZE_BACKEND or "passthrough")
-                    hints = _summary_action_hints(summary)
-                    action_items = extract_action_items(
-                        segments, backend_name=EXTRACT_BACKEND, summary_hints=hints
-                    )
+                    if stt_config.CORE_ENABLED:
+                        # 재요약도 초기 처리와 **같은 core** 를 탄다(언어 게이트·라우팅·critic 동일).
+                        # 두 경로가 갈리면 "재요약하면 결과가 달라진다"는 혼선이 생긴다.
+                        core = run_meeting_core(
+                            segments,
+                            summarize_backend=SUMMARIZE_BACKEND or "passthrough",
+                            extract_backend=EXTRACT_BACKEND,
+                        )
+                        summary = core.get("summary")
+                        action_items = core.get("actionItems") or []
+                        core_meta = core.get("coreMeta")
+                    else:
+                        summary = summarize_meeting(
+                            segments, backend_name=SUMMARIZE_BACKEND or "passthrough"
+                        )
+                        hints = _summary_action_hints(summary)
+                        action_items = extract_action_items(
+                            segments, backend_name=EXTRACT_BACKEND, summary_hints=hints
+                        )
+                        core_meta = None
             finally:
                 _inflight_delta("llm", -1)
         result = {"summary": summary, "actionItems": action_items}
+        _audit_core_meta(job_id, core_meta)
         _mark_job(job_id, {"status": "done", "result": result})
     except OperationCancelled:  # STT 배치 경계 취소 + agent_cli 취소(하위 타입) 공통
         _mark_job(job_id, {"status": "cancelled"})

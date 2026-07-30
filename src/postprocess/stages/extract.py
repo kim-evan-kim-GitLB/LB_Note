@@ -67,14 +67,17 @@ def build_messages(
     system_tmpl: str,
     user_tmpl: str,
     summary_hints: list[str] | None = None,
+    low_conf_ids: set[int] | dict[int, str] | None = None,
 ) -> list[dict]:
     """추출용 (system, user) 메시지. user = 구분자로 격리한 transcript(각 줄 `[id] 본문`).
 
     summary_hints(방법2): 요약의 결정/이슈 텍스트를 "참고 힌트"로 격리 주입한다. 힌트는 누락
     보강용 단서일 뿐 근거가 아니다 — 프롬프트가 "힌트라도 transcript에 evidence 없으면 버려라"를
     강제하므로 환각 위험은 없다. 힌트도 구분자로 격리(인젝션 방어).
+
+    low_conf_ids(언어 게이트): 저신뢰 segment 는 `[id]~` 로 표시해 단독 근거 사용을 막는다.
     """
-    body = transcript_with_ids(segments)
+    body = transcript_with_ids(segments, low_conf_ids)
     user = user_tmpl.replace("{{TRANSCRIPT_WITH_IDS}}", body)
     if TRANSCRIPT_OPEN not in user:
         # 템플릿에 구분자가 없으면 명시적으로 격리(방어).
@@ -115,8 +118,15 @@ class ExtractStage:
     ) -> ExtractResult:
         ctx = ctx or {}
         system_tmpl, user_tmpl = _split_sections(_load_prompt(self._prompt_path))
+        # 다중 agent core: case 별 지시문 보강 + 저신뢰 segment 표시(`[id]~`).
+        if ctx.get("extra_directives"):
+            system_tmpl = f"{system_tmpl}\n\n{ctx['extra_directives']}"
         messages = build_messages(
-            segments, system_tmpl, user_tmpl, summary_hints=ctx.get("summary_hints")
+            segments,
+            system_tmpl,
+            user_tmpl,
+            summary_hints=ctx.get("summary_hints"),
+            low_conf_ids=ctx.get("low_conf_ids"),
         )
         raw = backend.generate(
             messages,
