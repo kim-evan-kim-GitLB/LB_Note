@@ -33,6 +33,7 @@ from src.postprocess.backends.agent_cli import AgentCLIAuthError
 from src.postprocess.extract_schema import seconds_to_timestamp, transcript_with_ids
 from src.postprocess.stages.critic import DROP, FLAG, CriticResult, CriticStage
 from src.postprocess.stages.extract import ExtractStage
+from src.postprocess.stages.localize import LocalizeStage
 from src.postprocess.stages.reduce import ReduceStage
 from src.postprocess.stages.summarize import SummarizeStage
 from src.postprocess.summarize_schema import MeetingSummary, ground_summary
@@ -232,6 +233,94 @@ def _apply_critic(
     return summary, out_actions, stats
 
 
+def _korean_targets(summary: MeetingSummary | None, actions: list[dict]) -> list[dict]:
+    """출력 언어 검사 대상 텍스트 필드 목록.
+
+    각 항목은 {"id","text","kind","get","set"} 이며 set 으로 제자리 치환한다. 검사 범위는 사용자에게
+    보이는 텍스트 전부(회의 주제·안건명·목차 한 줄·요약 항목·액션)다.
+    """
+    targets: list[dict] = []
+
+    def add(kind: str, text: str, setter) -> None:
+        if str(text or "").strip():
+            targets.append({"id": f"L{len(targets) + 1}", "text": text, "kind": kind, "set": setter})
+
+    if summary is not None:
+        meta = summary.meta
+        if meta is not None:
+            add("subject", getattr(meta, "subject", ""), lambda v, m=meta: setattr(m, "subject", v))
+        for entry in summary.agenda_index:
+            add("index_title", entry.title, lambda v, e=entry: setattr(e, "title", v))
+            add("index_summary", entry.summary, lambda v, e=entry: setattr(e, "summary", v))
+        for blk in summary.agenda:
+            add("agenda_title", blk.title, lambda v, b=blk: setattr(b, "title", v))
+            for section in ("points", "decisions", "issues"):
+                for it in getattr(blk, section):
+                    add("summary_item", it.text, lambda v, o=it: setattr(o, "text", v))
+    for item in actions:
+        add("action", item.get("text", ""), lambda v, o=item: o.__setitem__("text", v))
+    return targets
+
+
+def _enforce_korean(
+    summary: MeetingSummary | None,
+    actions: list[dict],
+    backend_name: str | None,
+    *,
+    localize: bool = True,
+) -> tuple[MeetingSummary | None, list[dict], dict]:
+    """출력 언어 보장(결정적 검사 → 수리 1콜 → 결정적 마감).
+
+    1) 모든 산출 텍스트의 한글비를 코드가 재검사한다(language_gate.is_korean_output).
+       전부 한국어면 **콜 없이 즉시 반환**한다 — 실측 958개 산출 텍스트가 전부 통과했으므로 평시 비용 0.
+    2) 비한국어 항목만 모아 LocalizeStage 로 **1콜** 수리한다(번역만, 의미 보존).
+    3) 수리 후에도 비한국어인 것은 결정적으로 마감한다:
+         - 요약 항목  → 섹션에서 제거(빈 안건 블록·목차 동기화는 뒤이은 ground_summary 가 처리)
+         - 액션       → flag='확인필요'(사람 검토 큐. 액션은 유실 비용이 커서 드롭하지 않는다)
+         - 주제·안건명·목차 → 그대로 둔다(제목 하나 때문에 안건 전체를 버리는 건 과하다)
+       이 비대칭은 저신뢰 근거 처리(§5)와 같은 원칙이다.
+    """
+    stats = {"nonKorean": 0, "repaired": 0, "droppedSummary": 0, "flaggedActions": 0, "calls": 0}
+    targets = _korean_targets(summary, actions)
+    bad = [t for t in targets if not language_gate.is_korean_output(t["text"])]
+    stats["nonKorean"] = len(bad)
+    if not bad:
+        return summary, actions, stats
+
+    if localize and backend_name and backend_name != "passthrough":
+        stats["calls"] = 1
+        payload = [{"id": t["id"], "kind": t["kind"], "text": t["text"]} for t in bad]
+        try:
+            fixed = LocalizeStage().run(payload, get_llm_backend(backend_name))
+        except _PROPAGATE:
+            raise
+        except Exception:  # noqa: BLE001 — 수리 실패는 아래 결정적 마감으로 흡수
+            traceback.print_exc()
+            fixed = {}
+        for t in list(bad):
+            new = fixed.get(t["id"])
+            if new and language_gate.is_korean_output(new):
+                t["set"](new)
+                t["text"] = new
+                stats["repaired"] += 1
+                bad.remove(t)
+
+    for t in bad:  # 수리 실패분 결정적 마감
+        if t["kind"] == "summary_item" and summary is not None:
+            for blk in summary.agenda:
+                for section in ("points", "decisions", "issues"):
+                    kept = [it for it in getattr(blk, section) if it.text != t["text"]]
+                    if len(kept) != len(getattr(blk, section)):
+                        stats["droppedSummary"] += len(getattr(blk, section)) - len(kept)
+                        setattr(blk, section, kept)
+        elif t["kind"] == "action":
+            for item in actions:
+                if item.get("text") == t["text"] and not item.get("flag"):
+                    item["flag"] = FLAG_REVIEW
+                    stats["flaggedActions"] += 1
+    return summary, actions, stats
+
+
 def _ground_actions(
     items: list[dict], segments: list[dict], low_conf: dict[int, str]
 ) -> list[dict]:
@@ -384,7 +473,17 @@ def run_meeting_core(
                     )
                     meta["critic"]["actionsAdded"] = len(critic_result.missing_actions)
 
-    # ---------- Stage 4: 결정적 적용·그라운딩 ----------
+    # ---------- Stage 4a: 출력 언어 보장(결정적 검사 → 필요 시 수리 1콜 → 드롭/flag) ----------
+    summary, actions, lang_stats = _enforce_korean(
+        summary,
+        actions,
+        summarize_backend if sum_on else extract_backend,
+        localize=config.CORE_LOCALIZE_ENABLED,
+    )
+    meta["calls"]["localize"] = lang_stats.pop("calls", 0)
+    meta["language"] = lang_stats
+
+    # ---------- Stage 4b: 결정적 적용·그라운딩 ----------
     if summary is not None:
         summary = ground_summary(summary, kept, low_conf)
     actions = _ground_actions(actions, kept, low_conf)

@@ -112,6 +112,12 @@ LANG_GATE_MAX_CPS = float(os.getenv("LANG_GATE_MAX_CPS", "12.0"))
 LANG_GATE_CPS_RATIO = float(os.getenv("LANG_GATE_CPS_RATIO", "0.5"))
 # 저신뢰(회색지대) 임계: 한글비율이 이 값 미만이면 표시만 한다(정상 발화 실측 최저 0.59).
 LANG_GATE_LOW_CONF_RATIO = float(os.getenv("LANG_GATE_LOW_CONF_RATIO", "0.45"))
+# 산출물 출력 언어 보장 임계(입력 판정과 별개): 요약·액션 텍스트의 한글비가 이 값 미만이면
+# 비한국어 산출로 보고 수리(1콜)→실패 시 요약 드롭·액션 flag. 실측 정상 최저 0.308 이라 0.20 은
+# 오탐 0 에 여유가 있다(958개 산출 텍스트 캘리브레이션, docs/2026-07-30 §6-2).
+LANG_OUT_MIN_RATIO = float(os.getenv("LANG_OUT_MIN_RATIO", "0.20"))
+# 비한국어 산출 수리 콜 사용 여부. 끄면 수리 없이 곧바로 드롭/flag 로 처리한다.
+CORE_LOCALIZE_ENABLED = os.getenv("CORE_LOCALIZE_ENABLED", "1") not in ("", "0", "false", "False")
 
 
 # --- 다중 agent core (라우터 + 병렬 전문 agent + critic 1패스, 2026-07-30 결정) ---
