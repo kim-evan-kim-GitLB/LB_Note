@@ -81,6 +81,26 @@ POST /api/meetings/{meeting_id}/slack-dm
 4. **rate limit** — `users.lookupByEmail` 은 Tier2(분당 약 20회). 참석자 10명 수준이면 무관하나
    대량 발송 시 순차 호출 + 백오프 필요.
 
+### 3.2 v1 구현 완료 (2026-08-04, 실토큰 검증 전)
+
+§3.1 계약대로 구현. 신규 테스트 32개 포함 **백엔드 전체 489 통과**, ruff 클린, `tsc --noEmit` 무경고.
+
+- **백엔드** `src/web/slack_notify.py` — Slack Web API 직접 호출(stdlib urllib, 신규 의존성 0).
+  ⚠️Slack 은 실패도 **HTTP 200 + `{"ok": false, "error": ...}`** 로 주므로 상태코드가 아니라 본문
+  `ok` 를 봐야 한다(일반 REST 와 다른 유일한 함정). 예외는 `SlackError` / `SlackAuthError`(토큰류)
+  / `SlackUserNotFound`(users_not_found)로 나눠 엔드포인트가 per-item 상태로 매핑한다.
+- **엔드포인트** `POST /api/meetings/{id}/slack-dm` + `GET /api/settings/slack/status`(configured 만
+  노출, 토큰 값 비노출). 봇 토큰 무효(`SlackAuthError`)는 **첫 실패에서 즉시 502 중단** — 남은
+  수신자를 시도해봐야 전부 같은 실패다.
+- **프론트** ReviewView 연동 패널에서 Slack 을 "준비 중" 아래에서 **실동작 항목으로 승격**,
+  발송 다이얼로그(참석자 자동 채움 + 명부 피커 + 머리말 + 수신자별 결과) 추가.
+  실패가 하나라도 있으면 다이얼로그를 닫지 않는다(누가 못 받았는지 보여주고 재시도 유도).
+  "준비 중" 배너는 제거 — Slack·Jira 모두 실동작 기능이 되어 문구가 거짓이 됐다.
+- **회의 딥링크 불가**: 프론트에 라우팅이 없어(SPA 내부 상태 전환) 회의별 URL 이 존재하지 않는다
+  → 메시지 링크는 `WEB_FRONTEND_ORIGIN` 앱 루트만 건다. 회의별 링크는 라우팅 도입이 선행돼야 함.
+- **미검증**: 실제 Slack DM 발송(개발 `/app/.env` 에 `SLACK_*` 없음). 배포는 웹·봇 컨테이너가
+  같은 `.env.deploy` 를 공유하므로(`docker-compose.yml` 59행/84행) **env 작업 불필요**.
+
 ## 4. Jira 연동 = 액션아이템 1:1 이슈
 
 - **인증**: API 토큰(Basic: email + api_token), 서버측 Fernet 저장(google_credentials 패턴).
@@ -92,7 +112,7 @@ POST /api/meetings/{meeting_id}/slack-dm
 
 ## 5. 단계
 
-1. Slack 참석자 텍스트 DM (기존 스코프) — **v1 확정, 구현 대기(§3.1)**
+1. Slack 참석자 텍스트 DM (기존 스코프) — **구현 완료, 실토큰 검증 대기(§3.2)**
 2. Slack PDF 첨부 (`files:write` 추가 + 앱 재설치 + 로컬 PDF 렌더러)
 3. Jira 액션아이템 이슈 생성 (관리자 설정) — **구현 완료**(`src/web/jira_client.py`,
    `POST /api/meetings/{id}/jira-issues`)
