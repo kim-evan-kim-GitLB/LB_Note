@@ -41,6 +41,7 @@ from src.web import (
     maintenance,
     meeting_doc,
     observability,
+    slack_notify,
 )
 
 from src.cancellation import OperationCancelled
@@ -473,6 +474,16 @@ class JiraCreateIssuesRequest(BaseModel):
     tasks: list[JiraTaskSpec] = []
     reporterAccountId: str | None = None
     watcherAccountIds: list[str] = []
+
+
+class SlackDmRequest(BaseModel):
+    """회의록 참석자 Slack DM 발송 요청.
+
+    recipients = 수신자 이메일(명부/참석자 피커에서 선택). note = 발송자 머리말(선택).
+    v1 은 텍스트 DM 만 — PDF 첨부는 files:write 스코프가 필요해 범위 밖(설계문서 §3.1).
+    """
+    recipients: list[str] = []
+    note: str | None = None
 
 
 # 셀프 비번 변경 시 새 비밀번호 최소 길이.
@@ -2357,6 +2368,16 @@ def google_status(user: dict = Depends(require_user_active)) -> dict:
     return st
 
 
+@app.get("/api/settings/slack/status")
+def slack_status(user: dict = Depends(require_user_active)) -> dict:
+    """Slack 연동 가용 여부 — {configured}. 프론트가 'Slack 전송' 버튼 활성화 판단에 쓴다.
+
+    사용자별 연동이 아니라 **워크스페이스 공용 봇 토큰**이라 사용자 상태(connected)가 없다.
+    토큰 값은 절대 노출하지 않는다(존재 여부만).
+    """
+    return {"configured": slack_notify.is_configured()}
+
+
 @app.post("/api/settings/google/connect")
 def google_connect(user: dict = Depends(require_user_active)) -> dict:
     """동의 URL 발급 → {authUrl}. state=scope 'google_oauth' 단기 토큰(신원+CSRF).
@@ -2764,6 +2785,74 @@ def send_meeting_email(
         "email.sent", meeting_id=meeting_id, owner=user["username"], to=len(to), cc=len(cc)
     )
     return {"ok": True, "messageId": msg_id, "sentTo": to, "cc": cc}
+
+
+# ---------- Slack 참석자 DM (docs/2026-07-24-slack-jira-연동-설계.md §3.1) ----------
+@app.post("/api/meetings/{meeting_id}/slack-dm")
+def send_meeting_slack_dm(
+    meeting_id: str, req: SlackDmRequest, user: dict = Depends(require_user_active)
+) -> dict:
+    """회의록을 참석자에게 Slack 개인 DM 발송(소유자만). 내용=요약+액션아이템(전사 제외).
+
+    Gmail 발송(send-email)과 동일한 동기 액션이되, 인증은 사용자별 OAuth 가 아니라 **워크스페이스
+    공용 봇 토큰**을 쓴다 → 수신자에겐 'LB Note 봇' DM 으로 보이므로 본문 첫 줄에 공유자를 밝힌다.
+
+    수신자별로 독립 처리해 한 명의 실패가 나머지를 막지 않는다(Jira 이슈 생성과 같은 per-item
+    격리). 상태: sent | not_found(Slack 계정 없음) | error. 이메일 매칭은 Slack 프로필 이메일과
+    **정확히 일치**해야 하므로 not_found 는 흔한 정상 결과 — 반드시 UI 에 노출할 것.
+
+    미설정 400 slack_not_configured(SLACK_BOT_TOKEN 없음), 토큰 무효 502 slack_auth_failed,
+    수신자 없음 422.
+    """
+    _require_hex32(meeting_id, what="meetingId")
+    m = _owned_or_404(meeting_id, user)  # 소유·존재 게이트
+    if not slack_notify.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "slack_not_configured",
+                "message": "서버에 Slack 봇 토큰이 설정되지 않았습니다(관리자 확인).",
+            },
+        )
+    recipients = _clean_email_list(req.recipients)
+    if not recipients:
+        raise HTTPException(status_code=422, detail="수신자 이메일이 최소 1명 필요합니다.")
+    note = str(req.note or "").strip()[:2000] or None
+    sender = str(user.get("displayName") or "").strip() or user["username"]
+    # 프론트가 SPA 내부 상태로 화면을 전환해 회의별 딥링크 URL 이 없다 → 앱 루트만 건다.
+    # (회의별 링크를 걸려면 프론트에 라우팅 도입이 선행돼야 함 = 후속.)
+    meeting_url = FRONTEND_ORIGIN or None
+    text, blocks = slack_notify.render_meeting_message(
+        m, sender=sender, note=note, meeting_url=meeting_url
+    )
+    token = slack_notify.bot_token()
+
+    results: list[dict] = []
+    for email in recipients:
+        try:
+            slack_notify.send_dm(token, email, text=text, blocks=blocks)
+            results.append({"email": email, "status": "sent"})
+        except slack_notify.SlackUserNotFound:
+            results.append({"email": email, "status": "not_found"})
+        except slack_notify.SlackAuthError as e:
+            # 토큰 자체가 죽은 상태 — 남은 수신자를 시도해봐야 전부 같은 실패다. 즉시 중단.
+            observability.audit("slack.auth_failed", owner=user["username"], meeting_id=meeting_id)
+            raise HTTPException(
+                status_code=502,
+                detail={"error_code": "slack_auth_failed", "message": f"Slack 인증 실패: {e}"},
+            ) from e
+        except slack_notify.SlackError as e:
+            results.append({"email": email, "status": "error", "error": str(e)})
+
+    sent_count = sum(1 for r in results if r["status"] == "sent")
+    observability.audit(
+        "slack.dm_sent",
+        meeting_id=meeting_id,
+        owner=user["username"],
+        recipients=len(recipients),
+        sent=sent_count,
+    )
+    return {"ok": True, "results": results, "sentCount": sent_count}
 
 
 # ---------- Google Calendar 양방향 연동 ----------
