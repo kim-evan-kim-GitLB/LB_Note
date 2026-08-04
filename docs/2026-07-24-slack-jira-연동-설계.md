@@ -46,6 +46,41 @@ Jira 티켓: WDLABD2411-589.
 - **구현 시 확인**: PDF 생성이 현재 Google Drive export 에만 의존 -> Slack 은 Google 비의존
   **로컬 PDF 생성 경로** 필요(`meeting_doc.py` 재사용 검토).
 
+### 3.1 v1 확정 (2026-08-04)
+
+**v1 = 참석자 텍스트 DM (PDF 첨부 제외).** 텍스트만으로 한정하면 기존 봇 앱의 보유 스코프
+(`chat:write` / `users:read.email` / `im:write`)로 충분해 **앱 재설치도, 사용자·관리자 추가 설정도
+불필요**하다. PDF 는 `files:write` 추가 + 앱 재설치 + 로컬 PDF 렌더러가 모두 선행돼야 하므로 2단계.
+
+계약(Gmail 발송 `app.py:2706` 의 동기 액션 + Jira 등록 `app.py:3223` 의 per-item 실패 격리를 합친 형태):
+
+```
+POST /api/meetings/{meeting_id}/slack-dm
+  body: {recipients: ["a@x.com", ...], note?: "머리말"}
+  200:  {results: [{email, status: sent|not_found|error, error?}], sentCount: N}
+  400:  {error_code: "slack_not_configured"}     # Google 연동의 error_code 계약과 동일
+```
+
+- 신규 모듈 `src/web/slack_notify.py` — `SLACK_BOT_TOKEN` 으로 Slack Web API 직접 호출. 봇 프로세스
+  (`src/slack_bot/`)와 **별개 프로세스, 같은 토큰**. 게이트는 `_require_hex32` + `_owned_or_404`.
+- 본문 렌더러는 `meeting_doc._plain_summary()` / `_plain_action_items()` 재사용 + mrkdwn 블록
+  변환만 신규. 전사 제외, 회의록 웹 링크 첨부(Gmail 본문과 동일 정책).
+- **수신자 기본값 = 참석자 자동 채움** — 다이얼로그를 열면 `participants` 중 명부 이메일이 있는
+  사람을 자동 선택(가감 가능). Gmail 발송의 명부 이메일 피커를 그대로 재사용한다.
+- 프론트: ReviewView 연동 패널에서 Slack 항목을 "준비 중" 구분선 **위로** 승격.
+
+**열린 리스크 4가지**
+
+1. **발송 명의** — 워크스페이스 공용 봇 토큰이라 수신자에겐 "LB Note 봇" DM 으로 보인다(개인
+   Gmail 발송과 다름). 메시지 첫 줄에 `OOO님이 공유한 회의록` 을 넣어 보완. 개인 명의로 보내려면
+   per-user Slack OAuth 저장 레이어가 추가로 필요 -> 후속.
+2. **이메일 매칭 실패** — Slack 프로필 이메일 != LB Note 계정 이메일이면 `not_found`(기존 봇
+   `handle_reset` 과 동일 전제). **수신자별 결과를 반드시 UI 에 노출** — 조용한 실패 금지.
+3. **배포 env** — `SLACK_BOT_TOKEN` 이 현재 slackbot 컨테이너 기준으로만 설정돼 있을 수 있다.
+   웹 컨테이너에도 주입 필요. 누락 시 `slack_not_configured` 로 명확히 안내된다.
+4. **rate limit** — `users.lookupByEmail` 은 Tier2(분당 약 20회). 참석자 10명 수준이면 무관하나
+   대량 발송 시 순차 호출 + 백오프 필요.
+
 ## 4. Jira 연동 = 액션아이템 1:1 이슈
 
 - **인증**: API 토큰(Basic: email + api_token), 서버측 Fernet 저장(google_credentials 패턴).
@@ -57,10 +92,24 @@ Jira 티켓: WDLABD2411-589.
 
 ## 5. 단계
 
-1. Slack 참석자 텍스트 DM (기존 스코프)
-2. Slack PDF 첨부 (`files:write` 추가 + 앱 재설치)
-3. Jira 액션아이템 이슈 생성 (관리자 설정)
+1. Slack 참석자 텍스트 DM (기존 스코프) — **v1 확정, 구현 대기(§3.1)**
+2. Slack PDF 첨부 (`files:write` 추가 + 앱 재설치 + 로컬 PDF 렌더러)
+3. Jira 액션아이템 이슈 생성 (관리자 설정) — **구현 완료**(`src/web/jira_client.py`,
+   `POST /api/meetings/{id}/jira-issues`)
 4. 후속: 담당자 개인 DM(owner->명부 연결), Jira assignee(accountId), 상태 역동기화
+
+## 6. 회의록 화면 Notion 제거 (2026-08-04)
+
+연동 패널의 Notion 은 백엔드 구현이 없는 프론트 프로토타입(토큰 브라우저 저장 + `console.log`
+스텁)이었고, 로드맵에도 없어 **전 코드베이스에서 제거**했다(LB_Note-web
+`feature/171-remove-notion`, 170줄 삭제, `tsc --noEmit` + `vite build` 통과).
+
+- `ReviewView.tsx` 연동 항목·가이드 모달, `IntegrationSettingsView.tsx` 연동 섹션·퀵네비·
+  `discoverNotion`, `integrationService.ts` `fetchNotionDatabases`/`pushToNotion`,
+  `server.ts` `/api/notion/databases` 프록시, `types.ts` `IntegrationConfig` 필드 3개.
+- 백엔드(`src/web/`)에는 원래 Notion 코드가 없어 영향 없음.
+- 남은 정리 대상(별건): `ReviewView.tsx` 가이드 모달의 "준비 중" 배너 조건에 `jira` 가 아직
+  포함돼 있으나 Jira 등록은 실동작 기능 -> 안내 문구 불일치.
 
 ---
 
