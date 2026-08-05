@@ -75,6 +75,8 @@ from src.web.store import (
 )
 # service import 가 config(load_dotenv)를 끌어와 .env 가 로드된 뒤 auth 를 가져온다(순서 주의).
 from src.web import auth
+# glossary_service 는 auth 를 끌어오므로 반드시 위 auth import 뒤에 둔다(같은 순서 규약).
+from src.web import glossary_service
 
 # 정제 백엔드(plan D1=passthrough). 환경변수로 클라우드(agent_cli)·로컬 LLM(ollama 등) 교체 가능.
 CLEAN_BACKEND = os.environ.get("WEB_CLEAN_BACKEND", "passthrough")
@@ -447,6 +449,18 @@ class JiraConfigRequest(BaseModel):
     email: str
     apiToken: str
     defaultProject: str | None = None
+
+
+class GlossaryTermRequest(BaseModel):
+    """용어 사전 항목 — source(오인식 표기) → target(정답 표기)."""
+    source: str
+    target: str
+
+
+class GlossaryPreviewRequest(BaseModel):
+    """저장 전 미리보기 요청. 내 회의록 몇 군데가 바뀌는지 실제 코퍼스로 확인한다."""
+    source: str
+    target: str
 
 
 class JiraEpicSpec(BaseModel):
@@ -1232,8 +1246,12 @@ def _run_ai_job(
     mime_type: str | None,
     credential: dict | None,
     cancel: threading.Event,
+    glossary: dict[str, str] | None = None,
 ) -> None:
     """STT+정제(GPU 슬롯) → 요약·추출(LLM 슬롯) → 잡 결과 저장. 실패해도 status=error(폴백 원칙).
+
+    glossary(전역+개인 병합 사전)는 **접수 시점에** 요청 스레드가 확정해 넘긴다 — 잡 스레드에는
+    요청 사용자 컨텍스트가 없고, 처리 중 사용자가 사전을 고쳐도 그 회의의 결과가 흔들리면 안 된다.
 
     credential(현재 사용자 자격증명, secret 포함)은 use_credential 로 이 스레드 컨텍스트에만
     심어 agent_cli 백엔드가 사용자별 인증으로 호출하게 한다(스레드별 ContextVar 격리). None 이면
@@ -1256,8 +1274,9 @@ def _run_ai_job(
             _inflight_delta("stt", 1)  # 실제 슬롯 점유 시작(스톨 error 마감돼도 여기 반환까지 점유)
             try:
                 with use_credential(credential), use_cancel_event(cancel):
-                    seg_dicts, duration = transcribe_to_segments(
-                        audio_bytes, mime_type=mime_type, backend_name=CLEAN_BACKEND
+                    seg_dicts, duration, stt_meta = transcribe_to_segments(
+                        audio_bytes, mime_type=mime_type, backend_name=CLEAN_BACKEND,
+                        glossary=glossary,
                     )
             finally:
                 _inflight_delta("stt", -1)  # 슬롯 반납(세마포어 해제 직전)
@@ -1287,8 +1306,21 @@ def _run_ai_job(
             "transcript": contract.get("transcript", []),
             "duration": _fmt_duration(contract.get("_duration_seconds")),
         }
+        # STT 단계 관측 신호 — 특히 적응형 재디코딩이 건너뛴 사유(skipped_reason)는
+        # "왜 안 살아났는지"를 운영에서 알 수 있는 유일한 단서다.
+        redecode = (stt_meta or {}).get("redecode") or {}
+        observability.audit(
+            "stt.run",
+            job_id=job_id,
+            chunks=stt_meta.get("chunkCount"),
+            target_sec=stt_meta.get("targetSec"),
+            redecode_candidates=redecode.get("candidates", 0),
+            redecode_replaced=redecode.get("replaced", 0),
+            redecode_skipped=redecode.get("skipped_reason") or "none",
+            collapsed=(stt_meta.get("repetitionGuard") or {}).get("collapsed_segments", 0),
+        )
         _audit_core_meta(job_id, contract.get("_core_meta"))
-        _mark_job(job_id, {"status": "done", "result": result})
+        _mark_job(job_id, {"status": "done", "result": result, "diag": _job_diag(contract, result)})
     except OperationCancelled:  # STT 배치 경계 취소 + agent_cli 취소(하위 타입) 공통
         _mark_job(job_id, {"status": "cancelled"})
     except AgentCLIAuthError as e:
@@ -1337,6 +1369,13 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
 
     # 현재 사용자 자격증명(secret 포함, 내부 주입용) 조회 → 잡 스레드로 전달.
     credential = auth.get_credential(user["username"])
+    # 용어 사전(파일 씨앗 + 전역 + 개인)도 여기서 확정한다 — 잡 스레드는 요청 사용자를 모른다.
+    # 사전 조회가 실패해도 전사는 진행해야 한다(교정은 부가 기능) → 파일 씨앗으로 폴백.
+    try:
+        job_glossary = glossary_service.merged_for(user["username"])
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        job_glossary = None
     job_id = uuid.uuid4().hex
     # 'queued' 로 시작: 스레드가 동시성 슬롯을 확보하면 _run_ai_job 이 'processing' 으로 전환한다.
     # (슬롯이 비어 있으면 거의 즉시 processing, 혼잡하면 대기 → 프론트가 "처리 대기 중…" 표시.)
@@ -1348,7 +1387,7 @@ def ai_process(req: ProcessRequest, user: dict = Depends(require_user_active)) -
     _init_job_meta(job_id, "stt")  # 관측 메타(phase/타이밍) 초기화 — 스레드 시작 전에
     threading.Thread(
         target=_run_ai_job,
-        args=(job_id, audio_bytes, req.mimeType, credential, cancel),
+        args=(job_id, audio_bytes, req.mimeType, credential, cancel, job_glossary),
         daemon=True,
     ).start()
     out = {"jobId": job_id, "status": "queued"}
@@ -1415,6 +1454,54 @@ def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
     return out
 
 
+def _job_diag(contract: dict, result: dict) -> dict:
+    """완료된 잡의 진단 요약 — "성공했는데 산출이 비었다" 를 설명하기 위한 최소 정보.
+
+    계약(result)에는 넣지 않는다. 폴링 응답에만 실려 사용자·관리자가 원인을 볼 수 있게 한다.
+    """
+    core = contract.get("_core_meta") or {}
+    summary = result.get("summary") or {}
+    return {
+        "summaryEmpty": not (summary.get("agenda") or []),
+        "actionsEmpty": not (result.get("actionItems") or []),
+        "failures": core.get("failures") or {},
+        "callsOk": core.get("callsOk") or {},
+        "cases": (core.get("plan") or {}).get("cases") or [],
+    }
+
+
+def _empty_output_hint(out: dict) -> str | None:
+    """done 인데 산출이 빈 경우의 원인 힌트. 정상 완료면 None.
+
+    구분해야 하는 것들 — 이 구분이 없어 과거에 "요약이 왜 비었는지" 를 알 수 없었다:
+      1) LLM 응답 파싱 실패(비정상) 2) 단계 예외(비정상)
+      3) 보수 모드가 근거 부족으로 스스로 비운 것(정상 동작)
+    """
+    diag = out.get("diag") or {}
+    if not diag.get("summaryEmpty") and not diag.get("actionsEmpty"):
+        return None
+    failures = diag.get("failures") or {}
+    parse = failures.get("summarizeParse", 0) + failures.get("extractParse", 0)
+    if parse:
+        return (
+            f"요약/추출 응답을 해석하지 못해 {parse}건이 비었습니다 "
+            "— 응답이 잘렸거나 형식이 깨졌습니다. 관리자 확인이 필요합니다."
+        )
+    if failures.get("worker"):
+        return (
+            f"요약/추출 단계에서 {failures['worker']}건이 실패해 산출이 비었습니다 "
+            "— 서버 로그 확인이 필요합니다."
+        )
+    if "low_quality" in (diag.get("cases") or []):
+        return (
+            "전사 품질이 낮아(오인식·비한국어 비중 높음) 근거가 약한 항목을 만들지 않았습니다 "
+            "— 산출이 빈 것은 이 경우 정상 동작입니다."
+        )
+    if diag.get("summaryEmpty") and not (diag.get("callsOk") or {}).get("summarize"):
+        return "요약 백엔드가 꺼져 있거나 호출이 실패했습니다 — 서버 설정 확인이 필요합니다."
+    return None
+
+
 def _job_reason_hint(out: dict) -> str | None:
     """폴링 응답 → 한 줄 원인 힌트(경합/전사중/요약중/스톨/엔진오류/인증). 없으면 None."""
     status, phase = out.get("status"), out.get("phase")
@@ -1438,7 +1525,11 @@ def _job_reason_hint(out: dict) -> str | None:
         if code == "stt_stalled":
             return "STT 엔진 무응답으로 마감되었습니다 — 백엔드 엔진 점검이 필요합니다."
         return None
-    if status in ("done", "cancelled"):
+    if status == "done":
+        # "성공했는데 요약이 비었다" 는 정확히 이 분기로 빠져 힌트 없이 나갔다 — 사용자가 겪은
+        # 미생성 사고에서 원인 판별이 불가능했던 이유다. 삼켜진 실패가 있으면 그대로 알린다.
+        return _empty_output_hint(out)
+    if status == "cancelled":
         return None
     if out.get("warning") == "stt_stalled":  # 여기부터 진행 중(queued/processing)만
         return "STT 엔진이 응답하지 않습니다(스톨 의심) — 관리자 확인이 필요합니다."
@@ -1575,7 +1666,11 @@ def _audit_core_meta(job_id: str, core_meta: object) -> None:
         windows=(core_meta.get("plan") or {}).get("windows"),
         excluded=len(gate.get("excluded") or {}),
         low_conf=len(gate.get("lowConf") or {}),
+        # calls 는 **계획된** 콜 수, calls_ok 는 실제로 결과가 돌아온 수다.
+        # 둘을 구분하지 않으면 "calls=3" 을 "요약이 실행됐다" 로 오독한다.
         calls=sum(v for v in calls.values() if isinstance(v, int)),
+        calls_ok=sum(v for v in (core_meta.get("callsOk") or {}).values() if isinstance(v, int)),
+        failures=",".join(f"{k}={v}" for k, v in (core_meta.get("failures") or {}).items()) or "none",
         critic_dropped=(critic.get("summaryDropped", 0) + critic.get("actionsDropped", 0)),
         critic_flagged=critic.get("actionsFlagged", 0),
         critic_added=critic.get("actionsAdded", 0),
@@ -3106,6 +3201,117 @@ def delete_doc_template(user: dict = Depends(require_admin)) -> dict:
     cleared = auth.clear_doc_template()
     observability.audit("doc_template.clear", by=user["username"], cleared=cleared)
     return {"ok": True, "cleared": cleared, "status": _doc_template_status()}
+
+
+# ---------- 용어 사전(STT 오인식 결정적 교정) ----------
+# 적용 시점은 **STT 적재 시 1회**다. 이미 저장된 회의록에는 소급되지 않는다 — 본문만 바꾸면
+# 요약·액션의 evidence_seg_ids 앵커가 어긋나기 때문. 프론트가 이 사실을 반드시 안내한다.
+
+
+def _glossary_payload(user: dict) -> dict:
+    layers = glossary_service.layers_for(user["username"])
+    return {
+        **layers,
+        "version": glossary_service.version_for(user["username"]),
+        "effectiveCount": len(glossary_service.merged_for(user["username"])),
+        "isAdmin": (user.get("role") or "user") == "admin",
+        "retroactive": False,  # 계약으로 못박는다 — UI 문구가 코드와 갈라지지 않게.
+    }
+
+
+@app.get("/api/glossary")
+def get_glossary(user: dict = Depends(require_user_active)) -> dict:
+    """내게 적용되는 사전 전체(씨앗/전역/개인 층위 + 최종 개수 + 버전)."""
+    return _glossary_payload(user)
+
+
+@app.post("/api/glossary/preview")
+def preview_glossary(
+    req: GlossaryPreviewRequest, user: dict = Depends(require_user_active)
+) -> dict:
+    """후보 항목을 **내 회의록**에 돌려본 결과 + 저장 전 경고.
+
+    샘플 문장이 아니라 본인 코퍼스로 확인해야 오탐(엉뚱한 단어가 걸림)이 드러난다.
+    """
+    out = glossary_service.preview(
+        req.source, req.target, store.list(owner_id=user["id"])
+    )
+    out["warnings"] = glossary_service.validate_candidate(
+        user["username"], "user", req.source, req.target
+    )
+    return out
+
+
+@app.put("/api/glossary/personal")
+def put_personal_glossary_term(
+    req: GlossaryTermRequest, user: dict = Depends(require_user_active)
+) -> dict:
+    """개인 항목 등록/수정. 같은 표기가 전역에도 있으면 개인이 이긴다.
+
+    경고(validate)는 **차단하지 않고 반환**한다. 단일 패스 치환으로 바뀐 뒤로는 연쇄·왕복 같은
+    실제 파손이 사라졌고, 남은 경고는 "의도한 게 맞는지" 확인용이라 저장을 막을 근거가 못 된다.
+    빈 값·자기 자신 치환처럼 **결과가 없는 입력만** 400 으로 거부한다.
+    """
+    source, target = req.source.strip(), req.target.strip()
+    if source == target:
+        raise HTTPException(status_code=400, detail="찾을 말과 바꿀 말이 같습니다.")
+    try:
+        saved = auth.upsert_glossary_term(
+            "user", user["username"], source, target, by=user["username"]
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    observability.audit("glossary.set", scope="user", owner=user["username"], source=source)
+    return {
+        "ok": True,
+        "saved": saved,
+        "warnings": glossary_service.validate_candidate(user["username"], "user", source, target),
+        **_glossary_payload(user),
+    }
+
+
+@app.delete("/api/glossary/personal")
+def delete_personal_glossary_term(
+    source: str, user: dict = Depends(require_user_active)
+) -> dict:
+    """개인 항목 삭제. source 는 **쿼리 파라미터**다 — 경로에 두면 '/' 가 든 표기
+    (예: "A/B")가 라우팅에 걸려 405 가 나고 그 항목을 영영 못 지운다(실측)."""
+    deleted = auth.delete_glossary_term("user", user["username"], source)
+    observability.audit(
+        "glossary.delete", scope="user", owner=user["username"], source=source, deleted=deleted
+    )
+    return {"ok": True, "deleted": deleted, **_glossary_payload(user)}
+
+
+@app.put("/api/admin/glossary")
+def put_global_glossary_term(
+    req: GlossaryTermRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """전역(회사 공통) 항목 등록/수정 — 모든 사용자의 다음 전사부터 적용된다."""
+    source, target = req.source.strip(), req.target.strip()
+    if source == target:
+        raise HTTPException(status_code=400, detail="찾을 말과 바꿀 말이 같습니다.")
+    try:
+        saved = auth.upsert_glossary_term("global", "", source, target, by=user["username"])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    observability.audit("glossary.set", scope="global", by=user["username"], source=source)
+    return {
+        "ok": True,
+        "saved": saved,
+        "warnings": glossary_service.validate_candidate(None, "global", source, target),
+        **_glossary_payload(user),
+    }
+
+
+@app.delete("/api/admin/glossary")
+def delete_global_glossary_term(source: str, user: dict = Depends(require_admin)) -> dict:
+    """전역 항목 삭제. source 는 쿼리 파라미터(위 개인 삭제와 같은 이유)."""
+    deleted = auth.delete_glossary_term("global", "", source)
+    observability.audit(
+        "glossary.delete", scope="global", by=user["username"], source=source, deleted=deleted
+    )
+    return {"ok": True, "deleted": deleted, **_glossary_payload(user)}
 
 
 # ---------- Jira 연동(앱 레벨 서비스 계정, Phase 1: 설정 + 조회 전용) ----------

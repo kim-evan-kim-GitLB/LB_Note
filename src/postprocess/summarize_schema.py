@@ -185,6 +185,11 @@ class MeetingSummary:
     meta: MeetingMeta = field(default_factory=MeetingMeta)
     agenda_index: list[AgendaIndexEntry] = field(default_factory=list)
     agenda: list[AgendaBlock] = field(default_factory=list)
+    # 관측 전용(계약 필드 아님, to_dict 에 싣지 않는다): LLM 응답을 JSON 으로 파싱하지 못해
+    # 빈 결과로 degrade 됐는가. 예전에는 이 실패가 예외도 로그도 없이 사라져
+    # "요약이 왜 비었는지"를 진단할 방법이 없었다. 호출부가 읽어 감사로그로 올린다.
+    parse_failed: bool = False
+    raw_head: str = ""
 
     def to_dict(self) -> dict:
         return {

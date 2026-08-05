@@ -17,18 +17,151 @@ from src.chunker import (
     DEFAULT_OVERLAP_SEC,
     DEFAULT_PAD_SEC,
     DEFAULT_SEG_OVERLAP_SEC,
-    DEFAULT_TARGET_SEC,
     chunk_audio,
     merge_segments,
     merge_vad_segments,
+    subdivide_chunk,
     vad_segment_chunks,
 )
+from src.langmetrics import hangul_ratio
 from src.preprocess import PreprocessResult, preprocess, remap_time
 from src.repetition import collapse_repetitions
 from src.stt import get_backend, get_enhancer, get_vad
 from src.types import Segment
 
 SCHEMA_VERSION = "1.1"
+
+
+def _chunk_header(chunking_info: dict, chunk_sec: float, overlap_sec: float) -> str:
+    """transcript.md 헤더의 청킹 설명 — 실제 분할 방식을 반영한다."""
+    if chunking_info.get("method", "").endswith("vad_segmentation"):
+        return (f"vad/{chunking_info.get('vad_backend')}, "
+                f"target={chunking_info.get('target_sec')}s, "
+                f"avg={chunking_info.get('chunk_len_avg_sec')}s")
+    return f"chunk={chunk_sec}s, overlap={overlap_sec}s"
+
+
+def _assert_chunk_alignment(n_chunks: int, n_segments: int, target_sec: float) -> None:
+    """배치 디코딩 출력 수 == 입력 청크 수 보장.
+
+    모델 특징추출기는 입력이 `max_audio_clip_s - overlap_chunk_second`(=30.0s)를 넘으면
+    내부에서 다시 쪼갠다. 그러면 출력 행이 입력 청크보다 많아지고, 뒤따르는 zip 이 초과분을
+    조용히 잘라내 **그 이후 모든 세그먼트의 텍스트와 타임스탬프가 어긋난다**(예외도 경고도 없이).
+    DEFAULT_TARGET_SEC(30.0)이 그 임계와 정확히 같아 여유가 없으므로 여기서 못 박는다.
+    """
+    if n_segments != n_chunks:
+        raise RuntimeError(
+            f"STT 출력 수 불일치: 청크 {n_chunks} vs 세그먼트 {n_segments}. "
+            f"target_sec({target_sec}) 이 모델 내부 재분할 임계(30.0s)를 넘었을 가능성이 큽니다 "
+            f"— 이대로 진행하면 이후 세그먼트의 타임스탬프가 어긋납니다."
+        )
+
+
+def _redecode_candidates(texts: list[str]) -> list[int]:
+    """재디코딩 후보 인덱스 — 한글비율이 임계 미만이고 충분히 긴 청크.
+
+    판정 불가(None: 숫자·기호만, 빈 텍스트)는 후보에서 제외한다. 짧은 라틴 조각
+    ("OK", "LGTM")은 진짜 발화일 확률이 높아 min_chars 로 걸러낸다.
+    """
+    out: list[int] = []
+    for i, t in enumerate(texts):
+        s = (t or "").strip()
+        if len(s) < config.STT_REDECODE_MIN_CHARS:
+            continue
+        r = hangul_ratio(s)
+        if r is not None and r < config.STT_REDECODE_RATIO:
+            out.append(i)
+    return out
+
+
+def _adaptive_redecode(
+    backend,
+    chunks: list,
+    texts: list[str],
+    *,
+    regions: list[tuple[float, float]],
+    sr: int,
+    language: str,
+    batch_size: int,
+) -> tuple[list[str], dict]:
+    """언어를 이탈한 청크만 짧게 다시 디코딩해 텍스트를 교체한다.
+
+    긴 청크(≤30s)에서 모델이 한국어로 인식하지 못하고 발음을 영어 철자로 옮기는 경우가 있다.
+    같은 오디오를 8초 단위로 다시 디코딩하면 실제 발화가 복원된다(진단 문서 참조).
+    전역으로 청크를 짧게 만들지 않는 이유는 정상 음원에서 WER 이 나빠지기 때문이다 —
+    그래서 **실패한 청크만** 손본다.
+
+    교체는 개선됐을 때만 한다. 재디코딩 결과의 한글비율이 원본보다 높지 않으면 원본을 유지한다
+    (재디코딩이 항상 낫다는 보장이 없으므로 회귀를 만들지 않는 쪽으로 닫는다).
+
+    Returns: (교체 반영된 texts, 관측용 info dict)
+    """
+    info: dict = {
+        "enabled": True,
+        "ratio_threshold": config.STT_REDECODE_RATIO,
+        "target_sec": config.STT_REDECODE_TARGET_SEC,
+        "candidates": 0,
+        "redecoded": 0,
+        "replaced": 0,
+        "skipped_reason": None,
+    }
+    cand = _redecode_candidates(texts)
+    info["candidates"] = len(cand)
+    if not cand:
+        return texts, info
+    # 음원 전체가 비한국어면(실제 영어 회의 등) 재디코딩은 의미 없이 시간만 배로 든다.
+    if len(cand) > max(1, int(len(texts) * config.STT_REDECODE_MAX_FRACTION)):
+        info["skipped_reason"] = "too_many_candidates"
+        print(f"[pipeline] 적응형 재디코딩 건너뜀: 후보 {len(cand)}/{len(texts)} "
+              f"(> {config.STT_REDECODE_MAX_FRACTION:.0%})")
+        return texts, info
+
+    # 후보들의 하위 청크를 한 번에 모아 단일 배치로 디코딩한다(호출 1회).
+    sub_audios: list = []
+    spans: list[tuple[int, int, int]] = []      # (원본 청크 idx, 시작, 끝) — sub_audios 상의 구간
+    for i in cand:
+        subs = subdivide_chunk(
+            chunks[i], regions=regions, sr=sr, target_sec=config.STT_REDECODE_TARGET_SEC,
+        )
+        if len(subs) <= 1:                      # 더 못 쪼갬 → 다시 돌려봐야 같은 결과
+            continue
+        spans.append((i, len(sub_audios), len(sub_audios) + len(subs)))
+        sub_audios.extend(subs)
+    if not sub_audios:
+        return texts, info
+
+    info["redecoded"] = len(spans)
+    mnt_sec = max((len(a) / float(sr) for a in sub_audios), default=0.0)
+    mnt = int(mnt_sec * config.REPETITION_TOKENS_PER_SEC)
+    mnt = max(config.REPETITION_MNT_FLOOR, min(config.REPETITION_MNT_CEIL, mnt))
+    print(f"[pipeline] 적응형 재디코딩: 청크 {len(spans)}건 → 하위 {len(sub_audios)}조각 "
+          f"(target={config.STT_REDECODE_TARGET_SEC}s)")
+    sub_segs = backend.transcribe_arrays(
+        sub_audios, sr=sr, start_offsets=[0.0] * len(sub_audios),
+        language=language, batch_size=batch_size, max_new_tokens=mnt,
+    )
+
+    out = list(texts)
+    for idx, a, b in spans:
+        merged = " ".join(s.text.strip() for s in sub_segs[a:b] if s.text.strip()).strip()
+        if not merged:
+            continue
+        before = hangul_ratio(out[idx])
+        after = hangul_ratio(merged)
+        # 판정 불가(None)는 비교하지 않는다 — 개선 근거가 없으면 원본을 지킨다.
+        if after is None or before is None or after <= before:
+            continue
+        out[idx] = merged
+        info["replaced"] += 1
+    print(f"[pipeline] 적응형 재디코딩: {info['replaced']}/{info['redecoded']}건 교체")
+    return out, info
+
+
+def _maybe_redecode(backend, chunks, texts, **kw) -> tuple[list[str], dict]:
+    """STT_REDECODE 스위치를 존중하는 진입점. 꺼져 있으면 완전 no-op."""
+    if not config.STT_REDECODE:
+        return texts, {"enabled": False}
+    return _adaptive_redecode(backend, chunks, texts, **kw)
 
 
 def _build_payload(
@@ -90,6 +223,8 @@ def _build_payload(
                 **({"flag": s.meta["flag"]} if s.meta.get("flag") else {}),
                 **({"original_text": s.meta["original_text"]}
                    if s.meta.get("repetition_collapsed") else {}),
+                # 적응형 재디코딩으로 교체된 구간 — 어느 구간이 구제됐는지 추적 가능해야 한다.
+                **({"redecoded": True} if s.meta.get("redecoded") else {}),
             }
             for s in merged
         ],
@@ -110,13 +245,22 @@ def run_pipeline(
     segmentation: str = "vad",
     vad_backend: str = "energy",
     batch_size: int = config.STT_BATCH_SIZE,
-    target_sec: float = DEFAULT_TARGET_SEC,
+    target_sec: float | None = None,   # None → config.STT_TARGET_SEC(환경변수, 모델 임계로 클램프)
     auto_enhance: bool | None = None,
 ) -> dict:
     out_dir = Path(out_dir) if out_dir else config.OUTPUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     language = language or config.STT_LANGUAGE
     audio_path = Path(audio_path)
+    # 미지정 시 환경변수 기본값. config 에서 모델 재분할 임계로 이미 클램프된 값이다.
+    if target_sec is None:
+        target_sec = config.STT_TARGET_SEC
+    elif target_sec > config.STT_TARGET_SEC_MAX:
+        # CLI 로 넘긴 값도 막는다 — 넘기면 배치 경로가 어긋나 회의 하나가 통째로 죽는다.
+        raise ValueError(
+            f"target_sec={target_sec} 는 모델 재분할 임계({config.STT_TARGET_SEC_MAX}s)를 넘습니다. "
+            f"이 값을 넘기면 STT 출력 수가 입력 청크 수와 어긋납니다."
+        )
 
     print(f"[pipeline] load audio: {audio_path}")
     samples, sr = load_audio(audio_path)
@@ -226,12 +370,23 @@ def run_pipeline(
                 language=language, batch_size=batch_size,
                 max_new_tokens=mnt,
             )
+            _assert_chunk_alignment(len(chunks), len(batch_segs), target_sec)
+
+            # 적응형 재디코딩: 언어를 이탈한 청크만 짧게 다시 디코딩(근거는 함수 docstring).
+            texts, redecode_info = _maybe_redecode(
+                backend, chunks, [s.text for s in batch_segs],
+                regions=regions, sr=sr, language=language, batch_size=batch_size,
+            )
+            chunking_info["redecode"] = redecode_info
+
             # is_overlap_seam 를 meta 로 전달(merge_vad_segments 가 seam 만 dedup).
-            for ch, seg in zip(chunks, batch_segs):
+            for ch, seg, text in zip(chunks, batch_segs, texts):
                 meta = dict(seg.meta)
                 meta["is_overlap_seam"] = ch.is_overlap_seam
+                if text != seg.text:
+                    meta["redecoded"] = True
                 raw_segments.append(Segment(
-                    start=seg.start, end=seg.end, text=seg.text,
+                    start=seg.start, end=seg.end, text=text,
                     confidence=seg.confidence, speaker=seg.speaker, meta=meta,
                 ))
         else:
@@ -332,7 +487,8 @@ def run_pipeline(
         f"- elapsed: {elapsed:.2f}s\n"
         f"- rtfx: {payload['performance']['rtfx']}\n"
         f"- vram_peak: {vram_peak} MB\n"
-        f"- chunks: {len(chunks)} (chunk={chunk_sec}s, overlap={overlap_sec}s)\n\n"
+        # 분할 방식에 맞는 값을 적는다 — vad 모드인데 고정 분할 기본값(60s/10s)을 찍고 있었다.
+        f"- chunks: {len(chunks)} ({_chunk_header(chunking_info, chunk_sec, overlap_sec)})\n\n"
         f"## Transcript\n\n{transcript}\n",
         encoding="utf-8",
     )
@@ -381,8 +537,10 @@ def main() -> int:
                     help="VAD 분할 청크 배치 디코딩 크기(기본 32). 크게 잡을수록 빠르고 VRAM 을 더 쓴다. "
                          "배치 구성이 바뀌면 패딩이 달라져 텍스트가 미세하게 달라질 수 있으나 "
                          "WER 차이는 노이즈 수준(실측 bs=1~128 에서 0.397~0.400)")
-    ap.add_argument("--target-sec", type=float, default=DEFAULT_TARGET_SEC,
-                    help="VAD 분할 청크 목표 최대 길이(초). <35s 라야 내부 청커 재분할 없음")
+    ap.add_argument("--target-sec", type=float, default=None,
+                    help=f"VAD 분할 청크 목표 최대 길이(초). 미지정 시 STT_TARGET_SEC(현재 "
+                         f"{config.STT_TARGET_SEC}s). 모델 재분할 임계 "
+                         f"{config.STT_TARGET_SEC_MAX}s 를 넘으면 거부된다")
     ap.add_argument("--auto-enhance", action="store_true",
                     help="P5 증거기반 향상 라우팅: 품질 측정 후 노이즈우세+대역양호일 때만 denoise "
                          "(대역제한이면 향상 생략). --dereverb/--denoise 명시 시 무시.")

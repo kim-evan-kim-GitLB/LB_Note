@@ -139,4 +139,9 @@ class ExtractStage:
             return parse_extract_output(raw)
         except (json.JSONDecodeError, ValueError):
             # passthrough/비-JSON 백엔드 → 빈 결과(추출은 JSON mode 백엔드/핸드오프 전제).
-            return ExtractResult(items=[])
+            # 실백엔드면 비정상 — 상위가 감사로그로 올린다(summarize 와 동일 규약).
+            return ExtractResult(
+                items=[],
+                parse_failed=backend.name != "passthrough",
+                raw_head=(raw or "")[:200],
+            )
