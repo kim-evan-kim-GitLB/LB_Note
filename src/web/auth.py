@@ -166,6 +166,21 @@ CREATE TABLE IF NOT EXISTS jira_config (
     default_project TEXT,
     updated_at      TEXT
 );
+-- 용어 사전(결정적 STT 오인식 교정). config/glossary.ko.json 이 씨앗이고 여기 항목이 위에 얹힌다.
+-- scope='global'(관리자, 회사 공통 인명·제품명) / scope='user'(개인). 같은 source 면 개인이 이긴다.
+-- 비밀이 아니므로 평문 저장. UNIQUE 로 같은 범위 안 중복 등록을 막는다(전역과 개인은 별개 행).
+CREATE TABLE IF NOT EXISTS glossary_terms (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope      TEXT NOT NULL,                   -- 'global' | 'user'
+    owner      TEXT NOT NULL DEFAULT '',        -- scope='user' 면 username, 전역은 ''
+    source     TEXT NOT NULL,                   -- 오인식 표기(찾을 말)
+    target     TEXT NOT NULL,                   -- 정답 표기(바꿀 말)
+    created_by TEXT,                            -- 등록자 username(감사용)
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(scope, owner, source)
+);
+CREATE INDEX IF NOT EXISTS idx_glossary_scope ON glossary_terms(scope, owner);
 """
 
 # 사용자별 claude 자격증명 종류. oauth_token=CLAUDE_CODE_OAUTH_TOKEN(Claude Code CLI 토큰,
@@ -174,6 +189,11 @@ CREATE TABLE IF NOT EXISTS jira_config (
 # 제거돼 신규 저장 경로가 없다. 후방호환(기존에 저장된 api_key 자격증명 동작·주입)을 위해 코드만
 # 남겨두며, 새 기능은 oauth_token 기준으로만 추가한다.
 _CRED_TYPES = ("api_key", "oauth_token")
+
+# 용어 사전 상한. 사전은 전사마다 하나의 정규식으로 합쳐지므로 무제한 등록은 다른 사용자의
+# 처리 속도까지 갉아먹는다. 길이 상한은 "문장을 통째로 등록"하는 오용을 막는다(사전은 토큰용).
+GLOSSARY_MAX_TERMS = 200
+GLOSSARY_MAX_LEN = 40
 
 
 class UserStore:
@@ -1027,6 +1047,81 @@ class UserStore:
             "default_project": cfg["default_project"],
         }
 
+    # ---- 용어 사전(glossary_terms) ----
+    def upsert_glossary_term(
+        self, scope: str, owner: str, source: str, target: str, *, by: str | None = None
+    ) -> dict:
+        """항목 등록/수정. 같은 (scope, owner, source) 면 target 만 갱신한다.
+
+        source/target 은 앞뒤 공백을 제거해 저장한다 — 사용자가 흘린 공백 하나로 매칭이
+        조용히 어긋나는 걸 막는다(사전은 오탐이 아니라 '무반응'으로 실패해 원인 찾기가 어렵다).
+
+        상한(개수·길이)을 **저장 계층에서** 건다. 사전은 모든 전사에서 하나의 정규식으로 합쳐지므로
+        무제한 등록은 남의 회의 처리 속도까지 갉아먹는다(실측: 상한 없이 301건 등록 가능했다).
+        엔드포인트가 아니라 여기서 막아야 향후 다른 호출부가 생겨도 우회되지 않는다.
+        """
+        scope, owner = _norm_scope(scope, owner)
+        source, target = (source or "").strip(), (target or "").strip()
+        if not source or not target:
+            raise ValueError("찾을 말과 바꿀 말이 모두 필요합니다.")
+        if len(source) > GLOSSARY_MAX_LEN or len(target) > GLOSSARY_MAX_LEN:
+            raise ValueError(f"용어는 {GLOSSARY_MAX_LEN}자 이하여야 합니다.")
+        existing = {t["source"] for t in self.list_glossary_terms(scope, owner)}
+        if source not in existing and len(existing) >= GLOSSARY_MAX_TERMS:
+            raise ValueError(
+                f"용어 사전은 최대 {GLOSSARY_MAX_TERMS}개까지 등록할 수 있습니다"
+                " (쓰지 않는 항목을 지운 뒤 다시 시도하세요)."
+            )
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO glossary_terms (scope, owner, source, target, created_by,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(scope, owner, source) DO UPDATE SET "
+                "target=excluded.target, updated_at=excluded.updated_at",
+                (scope, owner, source, target, by, now, now),
+            )
+            self._conn.commit()
+        return {"scope": scope, "owner": owner, "source": source, "target": target,
+                "updatedAt": now}
+
+    def delete_glossary_term(self, scope: str, owner: str, source: str) -> bool:
+        scope, owner = _norm_scope(scope, owner)
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM glossary_terms WHERE scope=? AND owner=? AND source=?",
+                (scope, owner, (source or "").strip()),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def list_glossary_terms(self, scope: str, owner: str = "") -> list[dict]:
+        """한 범위의 항목 목록(최근 수정 순). 사전은 사람이 훑어보는 목록이라 정렬을 고정한다."""
+        scope, owner = _norm_scope(scope, owner)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT source, target, created_by, updated_at FROM glossary_terms "
+                "WHERE scope=? AND owner=? ORDER BY updated_at DESC, source ASC",
+                (scope, owner),
+            ).fetchall()
+        return [
+            {"source": r["source"], "target": r["target"],
+             "createdBy": r["created_by"], "updatedAt": r["updated_at"]}
+            for r in rows
+        ]
+
+
+def _norm_scope(scope: str, owner: str) -> tuple[str, str]:
+    """범위 정규화. 전역은 owner 를 항상 '' 로 눕힌다 — 안 그러면 같은 전역 항목이
+    owner 별로 중복 저장돼 UNIQUE 제약이 무력해진다."""
+    scope = (scope or "").strip()
+    if scope not in ("global", "user"):
+        raise ValueError("scope 는 'global' 또는 'user' 여야 합니다.")
+    owner = "" if scope == "global" else (owner or "").strip()
+    if scope == "user" and not owner:
+        raise ValueError("개인 사전에는 owner(username)가 필요합니다.")
+    return scope, owner
+
 
 def public_user(u: dict) -> dict:
     """프론트 계약 user 객체(id/username/displayName/role). 비번 해시는 절대 노출 안 함."""
@@ -1264,6 +1359,20 @@ def clear_jira_config() -> bool:
 def jira_config_status() -> dict:
     """api_token 비노출 공개 상태."""
     return store().jira_config_status()
+
+
+def upsert_glossary_term(
+    scope: str, owner: str, source: str, target: str, *, by: str | None = None
+) -> dict:
+    return store().upsert_glossary_term(scope, owner, source, target, by=by)
+
+
+def delete_glossary_term(scope: str, owner: str, source: str) -> bool:
+    return store().delete_glossary_term(scope, owner, source)
+
+
+def list_glossary_terms(scope: str, owner: str = "") -> list[dict]:
+    return store().list_glossary_terms(scope, owner)
 
 
 def update_profile(username: str, **fields) -> dict | None:

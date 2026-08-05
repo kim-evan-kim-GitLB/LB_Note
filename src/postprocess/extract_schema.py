@@ -106,6 +106,9 @@ class ExtractResult:
     """추출 스테이지 전체 결과."""
 
     items: list[ActionItem] = field(default_factory=list)
+    # 관측 전용(to_dict 에 싣지 않는다) — MeetingSummary.parse_failed 와 같은 목적.
+    parse_failed: bool = False
+    raw_head: str = ""
 
     def to_dict(self) -> dict:
         return {"action_items": [it.to_dict() for it in self.items]}

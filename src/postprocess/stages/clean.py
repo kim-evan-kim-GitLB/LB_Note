@@ -203,6 +203,7 @@ class CleanStage(Stage):
                         cleaned=cleaned or original,
                         edits=edits,
                         flag=None,
+                        redecoded=bool(seg.get("redecoded")),
                     )
                 )
         # 그룹핑이 순서를 흩뜨릴 수 있으므로 id 기준 정렬(1:1·타임스탬프 정렬 보장).

@@ -49,6 +49,9 @@ class CriticResult:
     reasons: dict[str, str] = field(default_factory=dict)
     prompt_version: str = ""
     backend: str = ""
+    # 관측 전용 — MeetingSummary.parse_failed 와 같은 목적.
+    parse_failed: bool = False
+    raw_head: str = ""
 
     @classmethod
     def empty(cls) -> "CriticResult":
@@ -181,7 +184,11 @@ class CriticStage:
             result = parse_critic_output(raw)
         except (json.JSONDecodeError, ValueError):
             # 판정 파싱 실패 → 판정 없음(전부 keep). 검증 실패가 산출을 죽이지 않는다.
-            return CriticResult.empty()
+            # 다만 실백엔드에서의 실패는 조용히 넘기지 않는다(상위가 감사로그로 올린다).
+            out = CriticResult.empty()
+            out.parse_failed = backend.name != "passthrough"
+            out.raw_head = (raw or "")[:200]
+            return out
         result.prompt_version = load_critic_prompt_version(self._prompt_path)
         result.backend = backend.name
         return result

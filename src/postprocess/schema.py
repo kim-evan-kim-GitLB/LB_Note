@@ -8,6 +8,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 
 
+# STT 가 붙인 판정 신호 중 다운스트림까지 살려 보낼 키(값이 falsy 면 싣지 않는다).
+# 계약을 넓히지 않으려고 화이트리스트로만 통과시킨다.
+_PASSTHROUGH_KEYS = ("redecoded", "flag")
+
+
 def normalize_segments(segments: list[dict]) -> list[dict]:
     """입력 계약 정규화 (설계 §5 입력계약). 프로듀서 둘의 필드명을 흡수한다.
 
@@ -17,6 +22,10 @@ def normalize_segments(segments: list[dict]) -> list[dict]:
 
     무음 폴백 금지(설계 §5): start/start_sec, end/end_sec 가 둘 다 없으면 0.0 으로
     조용히 채우지 않고 ValueError 를 던진다(타임스탬프 침묵 손실 방지).
+
+    출처 신호 보존(2026-08-05): STT 가 붙인 판정 신호는 여기서 버리지 않는다. 예전에는
+    {id,start,end,text} 만 남겨 `redecoded`(적응형 재디코딩으로 교체된 구간) 같은 정보가
+    게이트·관측·UI 어디에도 도달하지 못했다. 화이트리스트로만 통과시켜 계약은 좁게 유지한다.
     """
     out: list[dict] = []
     for i, seg in enumerate(segments):
@@ -36,14 +45,16 @@ def normalize_segments(segments: list[dict]) -> list[dict]:
             raise ValueError(
                 f"segment[{i}] 에 end/end_sec 가 없음 — 타임스탬프 무음 폴백 금지(설계 §5)."
             )
-        out.append(
-            {
-                "id": i,
-                "start": float(start),
-                "end": float(end),
-                "text": str(seg.get("text", "")),
-            }
-        )
+        entry = {
+            "id": i,
+            "start": float(start),
+            "end": float(end),
+            "text": str(seg.get("text", "")),
+        }
+        for key in _PASSTHROUGH_KEYS:
+            if seg.get(key):
+                entry[key] = seg[key]
+        out.append(entry)
     return out
 
 
@@ -59,6 +70,9 @@ class CleanedSegment:
     edits: list[str] = field(default_factory=list)  # 분류 태그(filler_removed 등)
     edit_ratio: float = 0.0  # original→cleaned 편집비율(설계 §5 스키마). 사람 diff 검토 거친 가드.
     flag: str | None = None  # "확인필요" | None
+    # STT 적응형 재디코딩으로 텍스트가 교체된 구간. 게이트·관측·UI 가 "이 구간은 한 번 구제됐다"를
+    # 알 수 있어야 한다(예전에는 정규화 단계에서 버려져 후단에 도달하지 못했다).
+    redecoded: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

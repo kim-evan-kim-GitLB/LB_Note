@@ -85,7 +85,13 @@ class SummarizeStage:
             summary = parse_summarize_output(raw)
         except (json.JSONDecodeError, ValueError):
             # passthrough/비-JSON 백엔드 → 빈 요약(요약은 JSON mode 백엔드/핸드오프 전제).
-            return MeetingSummary.empty()
+            # 실백엔드에서 이 분기를 타면 **비정상**이다 — 응답이 잘렸거나 형식이 깨진 것.
+            # 예전에는 이 둘을 구분할 수 없어 "요약이 왜 비었는지"를 진단할 수 없었다.
+            # 로깅은 상위(web 계층)가 한다 — stages 는 src.web 을 import 하지 않는다(계층 역전 방지).
+            out = MeetingSummary.empty()
+            out.parse_failed = backend.name != "passthrough"
+            out.raw_head = (raw or "")[:200]
+            return out
         summary.prompt_version = load_summarize_prompt_version(self._prompt_path)
         summary.backend = backend.name
         return summary

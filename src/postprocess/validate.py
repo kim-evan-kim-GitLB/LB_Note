@@ -206,6 +206,7 @@ def repair_or_degrade(
             edits=[],
             edit_ratio=0.0,  # degrade 시 cleaned==original → 편집비율 0
             flag=FLAG_REVIEW,
+            redecoded=seg.redecoded,  # 출처 신호는 degrade 해도 잃지 않는다
         )
     seg.edit_ratio = round(edit_ratio(seg.original, seg.cleaned), 4)
     return seg

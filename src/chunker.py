@@ -21,7 +21,12 @@ DEFAULT_CHUNK_SEC = 60.0
 DEFAULT_OVERLAP_SEC = 10.0
 
 # --- VAD 분할 청킹 기본값 (tools/vad_chunk_ax_clova.py 의 '되는 버전' 상수) ---
-DEFAULT_TARGET_SEC = 30.0        # < max_audio_clip_s(35) → 모델 내부 청커 재분할 없음
+# 모델 내부 재분할 임계는 max_audio_clip_s(35) 가 아니라 **30.0** 이다
+# (= max_audio_clip_s - overlap_chunk_second, 등호 포함이라 30.0 자체는 안전).
+# 기본값이 그 경계와 정확히 같아 여유가 없다 — 넘기면 출력 행 수가 입력 청크 수보다 많아져
+# 배치 경로가 조용히 어긋난다(pipeline._assert_chunk_alignment 가 최후 방어).
+# 운영 조정은 config.STT_TARGET_SEC 로 하며 거기서 모델 config 기준으로 클램프된다.
+DEFAULT_TARGET_SEC = 30.0
 DEFAULT_PAD_SEC = 0.2            # 발화 구간 앞뒤 여유
 DEFAULT_SEG_OVERLAP_SEC = 2.0    # 초장발화 hard-split 시에만 사용(겹침+dedup)
 SEAM_DEDUP_MAX_WORDS = 12        # overlap seam 단어 중복제거 탐색 한도
@@ -136,6 +141,51 @@ def vad_segment_chunks(
             is_overlap_seam=seam,
         ))
     return chunks
+
+
+def subdivide_chunk(
+    chunk: AudioChunk,
+    regions: list[tuple[float, float]] | None = None,
+    sr: int = 16000,
+    target_sec: float = 8.0,
+) -> list[np.ndarray]:
+    """청크 1개 → 더 짧은 하위 파형 리스트(적응형 재디코딩용).
+
+    긴 청크에서 모델이 언어를 이탈했을 때 같은 오디오를 짧게 다시 디코딩하기 위한 분할이다.
+    컷은 가능한 한 **발화 사이 무음**에 떨어뜨린다 — 단어 중간을 자르면 재디코딩이 더 나빠진다.
+
+    regions 는 전체 오디오 기준 (start_sec, end_sec) 목록(원본 VAD 결과)을 그대로 받는다.
+    이 청크 구간과 겹치는 것만 골라 청크 로컬 시간으로 옮긴 뒤 vad_segment_chunks 로 다시 나눈다.
+    청크 안에 발화 구간 정보가 없거나(regions 없음/겹침 없음) 분할이 1개로 끝나면
+    고정 길이로 균등 분할한다(하위 청크 수가 같아지도록 나눠 마지막 조각이 너무 짧지 않게 한다).
+
+    반환은 파형 배열만이다 — 재디코딩 결과는 원래 청크 1개의 텍스트로 다시 합쳐지므로
+    하위 청크의 타임스탬프는 쓰이지 않는다.
+    """
+    samples = chunk.samples
+    dur = len(samples) / float(sr)
+    if dur <= target_sec:
+        return [samples]
+
+    local: list[tuple[float, float]] = []
+    for s, e in regions or []:
+        a = max(s, chunk.start_sec) - chunk.start_sec
+        b = min(e, chunk.end_sec) - chunk.start_sec
+        if b - a > 0.05:                      # 겹침이 사실상 없는 구간은 버린다
+            local.append((max(0.0, a), min(dur, b)))
+
+    if local:
+        sub = vad_segment_chunks(
+            samples, sr=sr, regions=local, target_sec=target_sec,
+            pad_sec=0.0,                      # 원본에서 이미 pad 가 적용된 파형이다
+            overlap_sec=0.0,                  # 재디코딩 결과는 단순 연결 — 겹치면 중복 텍스트가 된다
+        )
+        if len(sub) > 1:
+            return [c.samples for c in sub]
+
+    n = max(2, int(np.ceil(dur / target_sec)))
+    step = int(np.ceil(len(samples) / n))
+    return [samples[i:i + step] for i in range(0, len(samples), step) if len(samples[i:i + step]) > 0]
 
 
 def merge_vad_segments(segments: list[Segment]) -> list[Segment]:

@@ -63,6 +63,21 @@ _DIRECTIVE_STRICT_CRITIC = (
 )
 
 
+# 삼켜진 실패 카운터 — run_meeting_core 1회 실행 범위.
+# 여기서 세는 실패들은 전부 "회의 전체를 죽이지 않기 위해" 의도적으로 흡수하는 것들이다.
+# 그런데 흡수만 하고 흔적을 안 남기면 산출이 빈약할 때 원인을 알 수 없다(실제 사고 사례).
+# ContextVar 를 쓰는 이유: _run_parallel 이 contextvars.copy_context() 로 워커를 돌리므로
+# 워커에서도 같은 dict 객체가 보이고, 회의 두 건이 동시 실행돼도 서로 섞이지 않는다.
+_FAILURES: contextvars.ContextVar[dict] = contextvars.ContextVar("core_failures")
+
+
+def _count_failure(kind: str) -> None:
+    try:
+        _FAILURES.get()[kind] = _FAILURES.get().get(kind, 0) + 1
+    except LookupError:
+        pass  # run_meeting_core 밖에서 호출된 경우(도구·테스트) — 세지 않는다
+
+
 def _directives(plan: meeting_profile.Plan, *, for_critic: bool = False) -> str:
     """Plan → 프롬프트에 덧붙일 지시문(없으면 빈 문자열)."""
     parts: list[str] = []
@@ -97,6 +112,7 @@ def _run_parallel(tasks: list) -> list:
             raise
         except Exception:  # noqa: BLE001 — 한 창의 실패가 회의 전체를 죽이지 않는다
             traceback.print_exc()
+            _count_failure("worker")   # 삼킨 실패를 세어 coreMeta 로 올린다(관측)
             return None
 
     if len(tasks) == 1:
@@ -296,6 +312,7 @@ def _enforce_korean(
             raise
         except Exception:  # noqa: BLE001 — 수리 실패는 아래 결정적 마감으로 흡수
             traceback.print_exc()
+            _count_failure("localize")
             fixed = {}
         for t in list(bad):
             new = fixed.get(t["id"])
@@ -359,6 +376,10 @@ def run_meeting_core(
     백엔드가 없거나 passthrough 면 그 단계를 건너뛴다(기존 폴백 정책 유지).
     critic_backend 미지정 시 요약 백엔드를 재사용한다.
     """
+    # 이 실행에서 삼켜지는 실패를 모을 자리(관측). 워커 스레드에서도 같은 dict 가 보인다.
+    failures: dict[str, int] = {}
+    _FAILURES.set(failures)
+
     kept, low_conf, excluded = language_gate.partition(segments)
     profile = meeting_profile.profile_meeting(kept, low_conf, excluded)
     plan = meeting_profile.route(profile, kept)
@@ -412,7 +433,17 @@ def run_meeting_core(
     results = _run_parallel(tasks)
     sum_parts = [r for r in results[:n_sum] if r is not None]
     ex_parts = [r for r in results[n_sum:] if r is not None]
+    # `calls` 는 **계획된** 콜 수다(실행 전 태스크 수). 성공 수와 구분하지 않으면
+    # "calls=3" 을 보고 "요약이 실행됐다"로 오독하게 된다 — 실제 사고 사례.
     meta["calls"] = {"summarize": n_sum, "extract": len(tasks) - n_sum, "reduce": 0, "critic": 0}
+    meta["callsOk"] = {"summarize": len(sum_parts), "extract": len(ex_parts)}
+    # JSON 파싱 실패는 예외가 아니라 빈 결과로 돌아온다 → 스테이지가 표시한 플래그를 여기서 센다.
+    for part in sum_parts:
+        if getattr(part, "parse_failed", False):
+            _count_failure("summarizeParse")
+    for part in ex_parts:
+        if getattr(part, "parse_failed", False):
+            _count_failure("extractParse")
 
     # ---------- Stage 3: 병합(reduce) ----------
     summary: MeetingSummary | None = None
@@ -433,6 +464,7 @@ def run_meeting_core(
                     raise
                 except Exception:  # noqa: BLE001 — 병합 실패는 결정적 폴백으로 흡수
                     traceback.print_exc()
+                    _count_failure("reduce")
                     reduced = None
             if reduced is not None and reduced.agenda:
                 summary = reduced
@@ -459,7 +491,10 @@ def run_meeting_core(
                 raise
             except Exception:  # noqa: BLE001 — 검증 실패가 산출을 죽이지 않는다
                 traceback.print_exc()
+                _count_failure("critic")
                 critic_result = CriticResult.empty()
+            if getattr(critic_result, "parse_failed", False):
+                _count_failure("criticParse")
             if not critic_result.is_empty:
                 summary_obj, actions, stats = _apply_critic(
                     summary or MeetingSummary.empty(), actions, critic_result, s_map, a_map
@@ -490,6 +525,9 @@ def run_meeting_core(
     action_items = _action_items_from_payload({"action_items": actions})
     # summary 는 항상 dict 로 돌려준다(빈 구조체) — 호출부(웹 계약·재요약 미리보기)가 None 분기를
     # 따로 갖지 않게 한다. "요약이 비었다"는 신호는 coreMeta 로 판단한다.
+    # 삼켜진 실패는 여기서만 드러난다 — 비어 있으면 필드를 싣지 않아 평시 로그를 깨끗이 둔다.
+    if failures:
+        meta["failures"] = dict(failures)
     return {
         "summary": summary.to_dict() if summary is not None else MeetingSummary.empty().to_dict(),
         "actionItems": action_items,

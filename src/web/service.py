@@ -57,10 +57,14 @@ def _suffix_for(mime_type: str | None, filename: str | None) -> str:
 
 def transcribe_bytes(
     audio_bytes: bytes, *, mime_type: str | None = None, filename: str | None = None
-) -> tuple[list[dict], float | None]:
-    """오디오 bytes → (STT segments[{start,end,text}], duration_seconds).
+) -> tuple[list[dict], float | None, dict]:
+    """오디오 bytes → (STT segments[{start,end,text}], duration_seconds, stt_meta).
 
     bytes 를 임시파일로 떨군 뒤 기존 run_pipeline(파일 기반 STT 단일 진입점)을 재사용한다.
+
+    stt_meta 는 STT 단계의 관측 신호다(계약 필드 아님 — 로깅·진단용).
+    특히 적응형 재디코딩의 `skipped_reason` 은 "왜 안 살아났는지"를 운영에서 알 수 있는 유일한
+    단서인데, 예전에는 임시 디렉토리와 함께 사라졌다.
     """
     suffix = _suffix_for(mime_type, filename)
     with tempfile.TemporaryDirectory() as td:
@@ -69,17 +73,32 @@ def transcribe_bytes(
         audio_path.write_bytes(audio_bytes)
         payload = run_pipeline(audio_path=audio_path, out_dir=tdp / "out")
     duration = payload.get("audio", {}).get("duration_seconds")
-    return payload.get("segments", []), duration
+    chunking = payload.get("chunking") or {}
+    stt_meta = {
+        "redecode": chunking.get("redecode") or {},
+        "repetitionGuard": payload.get("repetition_guard") or {},
+        "chunkCount": chunking.get("chunk_count"),
+        "targetSec": chunking.get("target_sec"),
+    }
+    return payload.get("segments", []), duration, stt_meta
 
 
-def clean_segments(raw_segments: list[dict], backend_name: str = "passthrough") -> CleanResult:
+def clean_segments(
+    raw_segments: list[dict],
+    backend_name: str = "passthrough",
+    glossary: dict[str, str] | None = None,
+) -> CleanResult:
     """STT segments → 정제 결과(CleanResult). run_postprocess의 in-memory 경로 재사용.
 
     [A]glossary(결정적 교정) → CleanStage(backend) → [D]게이트. 파일 입출력 없음.
+
+    glossary 를 넘기면 그것을 쓰고(웹 잡이 전역+개인 병합본을 전달), 없으면 파일 씨앗을 읽는다
+    — 도구·테스트·구 호출부의 동작을 그대로 두기 위한 기본값이다.
     """
     segments = normalize_segments(raw_segments)
     backend = get_llm_backend(backend_name)
-    glossary = load_glossary(None)
+    if glossary is None:
+        glossary = load_glossary(None)
     corrected, applied_per_seg = _apply_glossary(segments, glossary)
     stage = CleanStage()
     result = stage.run(
@@ -166,21 +185,28 @@ def transcribe_to_segments(
     mime_type: str | None = None,
     filename: str | None = None,
     backend_name: str = "passthrough",
-) -> tuple[list[dict], float | None]:
-    """[1단계: GPU] 오디오 bytes → STT + 정제 → (seg_dicts, duration).
+    glossary: dict[str, str] | None = None,
+) -> tuple[list[dict], float | None, dict]:
+    """[1단계: GPU] 오디오 bytes → STT + 정제 → (seg_dicts, duration, stt_meta).
 
     process_audio_to_contract 의 전반부. 호출부(웹 잡)가 GPU 세마포어 아래에서 이 함수만 돌리고,
     LLM 단계(enrich_to_contract)는 별도 세마포어로 돌려 "A 요약 중 B STT 시작"을 가능하게 한다.
     """
-    raw_segments, duration = transcribe_bytes(
+    raw_segments, duration, stt_meta = transcribe_bytes(
         audio_bytes, mime_type=mime_type, filename=filename
     )
-    final = clean_segments(raw_segments, backend_name=backend_name)
+    final = clean_segments(raw_segments, backend_name=backend_name, glossary=glossary)
     seg_dicts = [
-        {"id": s.id, "start": s.start, "end": s.end, "cleaned": s.cleaned, "text": s.original}
+        {
+            "id": s.id, "start": s.start, "end": s.end,
+            "cleaned": s.cleaned, "text": s.original,
+            # 적응형 재디코딩으로 구제된 구간 표시 — 게이트·관측·UI 가 쓸 수 있어야 한다.
+            **({"redecoded": True} if s.redecoded else {}),
+        }
         for s in final.segments
     ]
-    return seg_dicts, duration
+    stt_meta["redecodedSegments"] = sum(1 for s in final.segments if s.redecoded)
+    return seg_dicts, duration, stt_meta
 
 
 def core_segments(seg_dicts: list[dict]) -> list[dict]:
@@ -194,6 +220,7 @@ def core_segments(seg_dicts: list[dict]) -> list[dict]:
             "start": s["start"],
             "end": s["end"],
             "text": (s.get("cleaned") or s.get("text") or ""),
+            **({"redecoded": True} if s.get("redecoded") else {}),
         }
         for s in seg_dicts
     ]
@@ -296,6 +323,7 @@ def process_audio_to_contract(
     backend_name: str = "passthrough",
     extract_backend_name: str | None = None,
     summarize_backend_name: str | None = None,
+    glossary: dict[str, str] | None = None,
 ) -> dict:
     """오디오 bytes → 웹 Meeting 계약 {summary, actionItems, transcript} (+ _duration_seconds).
 
@@ -307,8 +335,9 @@ def process_audio_to_contract(
     내부적으로 transcribe_to_segments(GPU) → enrich_to_contract(LLM) 2단계 합성이다 — 웹 잡은
     세마포어를 단계별로 달리 쥐기 위해 두 함수를 직접 쓰고, 도구/테스트는 이 합성 진입점을 쓴다.
     """
-    seg_dicts, duration = transcribe_to_segments(
-        audio_bytes, mime_type=mime_type, filename=filename, backend_name=backend_name
+    seg_dicts, duration, _stt_meta = transcribe_to_segments(
+        audio_bytes, mime_type=mime_type, filename=filename, backend_name=backend_name,
+        glossary=glossary,
     )
     return enrich_to_contract(
         seg_dicts,
