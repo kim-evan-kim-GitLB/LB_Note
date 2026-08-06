@@ -21,7 +21,70 @@ import uuid
 from pathlib import Path
 
 from src.postprocess.extract_schema import seconds_to_timestamp
+from src.postprocess.language_gate import reason_label
 from src.postprocess.summarize_schema import MeetingSummary
+
+# 화면에 실어 보낼 제외 구간 개수 상한. 게이트가 대량으로 걸린 회의(전체가 영어 등)에서
+# 응답이 비대해지는 것을 막는다. 넘치면 개수만 정확히 알리고 목록은 잘라 보낸다.
+GATE_SUMMARY_MAX_ITEMS = 50
+
+
+def build_gate_summary(
+    core_meta: dict | None,
+    segments: list[dict],
+    *,
+    min_excluded: int = 1,
+) -> dict:
+    """언어 게이트 판정을 사용자에게 보여줄 형태로 요약한다.
+
+    **제외는 삭제가 아니다.** 제외된 구간은 요약·액션 생성 입력에서만 빠지고 transcript 본문에는
+    그대로 남는다. 화면 문구가 이걸 흐리면 "내 회의록이 지워졌다"로 읽히므로, 계약이 개수·구간
+    목록만 주고 문구는 프론트가 고정 문안으로 쓴다.
+
+    `notable` 을 서버가 계산해 내려보내는 이유: 표시 임계가 프론트에 흩어지면 백엔드 게이트를
+    조정했을 때 화면이 따라오지 않는다. 적응형 재디코딩 도입 후 제외가 12→0 건이 된 것처럼
+    임계는 앞으로도 움직인다.
+    """
+    gate = (core_meta or {}).get("gate") or {}
+    excluded = gate.get("excluded") or {}
+    low_conf = gate.get("lowConf") or {}
+    starts: dict[int, float] = {}
+    for seg in segments or []:
+        try:
+            starts[int(seg.get("id"))] = float(seg.get("start") or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+    def _entry(sid: str, code: str) -> dict:
+        out = {"segmentId": int(sid), "reason": code, "label": reason_label(code)}
+        if int(sid) in starts:
+            out["timestamp"] = seconds_to_timestamp(starts[int(sid)])
+        return out
+
+    items = []
+    for sid, code in excluded.items():
+        try:
+            items.append(_entry(sid, code))
+        except (TypeError, ValueError):
+            continue
+    items.sort(key=lambda e: e["segmentId"])
+    reasons: dict[str, int] = {}
+    for code in excluded.values():
+        reasons[code] = reasons.get(code, 0) + 1
+    return {
+        "excludedCount": len(excluded),
+        "lowConfCount": len(low_conf),
+        "totalSegments": len(segments or []),
+        "reasons": [
+            {"reason": c, "label": reason_label(c), "count": n}
+            for c, n in sorted(reasons.items(), key=lambda kv: -kv[1])
+        ],
+        "excluded": items[:GATE_SUMMARY_MAX_ITEMS],
+        "truncated": len(items) > GATE_SUMMARY_MAX_ITEMS,
+        # 저신뢰는 알리지 않는다 — 요약에 **쓰이고 있고**, 숫자만 보이면 근거 없는 불안이 된다.
+        # min_excluded <= 0 은 "안내 끔"이다(운영에서 소음이 되면 잠글 수 있게).
+        "notable": min_excluded > 0 and len(excluded) >= min_excluded,
+    }
 
 
 def _summary_or_empty(summary: dict | None) -> dict:

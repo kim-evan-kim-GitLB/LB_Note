@@ -54,6 +54,7 @@ from src.postprocess.backends.agent_cli import (
 from src.postprocess.web_contract import (
     SummaryStructureError,
     TranscriptStructureError,
+    build_gate_summary,
     ensure_action_item_ids,
     merge_preserve_edited,
     validate_summary_edit,
@@ -1305,6 +1306,9 @@ def _run_ai_job(
             "actionItems": contract.get("actionItems", []),
             "transcript": contract.get("transcript", []),
             "duration": _fmt_duration(contract.get("_duration_seconds")),
+            # 요약 근거에서 빠진 구간 안내(전사 본문은 그대로 있다). 회의와 함께 저장돼야
+            # 새로고침 후에도 "왜 이 구간이 요약에 없나"에 답할 수 있다.
+            "gateSummary": contract.get("gateSummary"),
         }
         # STT 단계 관측 신호 — 특히 적응형 재디코딩이 건너뛴 사유(skipped_reason)는
         # "왜 안 살아났는지"를 운영에서 알 수 있는 유일한 단서다.
@@ -1757,6 +1761,10 @@ def _run_regenerate_job(
             finally:
                 _inflight_delta("llm", -1)
         result = {"summary": summary, "actionItems": action_items}
+        # 재요약도 게이트를 다시 돈다 → 안내도 같이 갱신해야 새 요약과 설명이 어긋나지 않는다.
+        result["gateSummary"] = build_gate_summary(
+            core_meta, segments, min_excluded=stt_config.GATE_NOTICE_MIN_EXCLUDED
+        )
         _audit_core_meta(job_id, core_meta)
         _mark_job(job_id, {"status": "done", "result": result})
     except OperationCancelled:  # STT 배치 경계 취소 + agent_cli 취소(하위 타입) 공통
@@ -1848,8 +1856,14 @@ def regenerate_apply(
         action_items = ensure_action_item_ids(action_items)  # 병합 후 item_id 무결성 재보장
     parsed = _parse_if_match(if_match)
     expected = None if parsed is _IF_MATCH_ANY else parsed
+    # 미리보기가 함께 내려준 게이트 안내를 같이 확정한다. 없으면(구 클라이언트) 현행 유지.
+    gate_summary = payload.get("gateSummary")
+    if not isinstance(gate_summary, dict):
+        gate_summary = None
     try:
-        updated = store.apply_regenerate(meeting_id, summary, action_items, expected)
+        updated = store.apply_regenerate(
+            meeting_id, summary, action_items, expected, gate_summary=gate_summary
+        )
     except PreconditionFailedError as e:
         observability.audit("regenerate.conflict_412", meeting_id=meeting_id)
         if e.current_updated_at:
