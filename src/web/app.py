@@ -839,6 +839,70 @@ def verify_claude_credential_now(user: dict = Depends(require_user_active)) -> d
     return status
 
 
+# 요약 불가 사유 코드 → 사용자 문구. 화면이 문구를 다시 만들지 않게 **서버가 확정**한다
+# (게이트 label·reasonHint 와 같은 규약). 사유를 추가하고 여기 문구를 빠뜨리면 화면이 빈다.
+SUMMARY_UNAVAILABLE_MESSAGES = {
+    "backend_off": "이 서버는 자동 요약이 꺼져 있습니다 — 관리자 설정 확인이 필요합니다.",
+    "not_configured": (
+        "AI 자동 요약이 지금 동작하지 않습니다. 설정 > Claude AI 인증에서 토큰을 등록한 뒤 "
+        "[AI 재요약]을 눌러 주세요."
+    ),
+    "invalid": (
+        "Claude 인증이 만료되어 AI 자동 요약이 지금 동작하지 않습니다. 설정 > Claude AI 인증에서 "
+        "토큰을 갱신한 뒤 [AI 재요약]을 눌러 주세요."
+    ),
+    "decrypt_failed": (
+        "저장된 Claude 인증을 읽을 수 없어 AI 자동 요약이 지금 동작하지 않습니다 — 토큰을 다시 "
+        "등록하거나 관리자에게 문의해 주세요."
+    ),
+}
+
+
+@app.get("/api/ai/summary-availability")
+def ai_summary_availability(user: dict = Depends(require_user_active)) -> dict:
+    """지금 이 사용자가 자동 요약을 쓸 수 있는지 + 못 쓰면 사용자 문구.
+
+    저장된 회의록에는 "요약이 왜 비었는지"(_core_meta·diag)가 남지 않는다 — 잡 폴링 응답에만
+    실린다. 그래서 검토 화면은 **과거 원인을 댈 수 없다.** 대신 현재 상태를 정확히 알려 사용자가
+    스스로 고칠 수 있게 한다: 미등록·만료는 설정에서 1분이면 끝나는데, 종전에는 "전사만 제공하는
+    버전"이라는 낡은 안내가 떠서 고칠 방법조차 알 수 없었다.
+
+    available 은 "시도할 수 있는 상태로 보인다"는 뜻이다. 요약이 실제로 채워질지는 회의 내용·
+    품질에 달렸으므로 여기서 보장하지 않는다.
+    """
+    if not SUMMARIZE_BACKEND or SUMMARIZE_BACKEND == "passthrough":
+        return {
+            "available": False,
+            "reason": "backend_off",
+            "message": SUMMARY_UNAVAILABLE_MESSAGES["backend_off"],
+        }
+    # claude 가 아닌 백엔드(로컬 LLM 등)는 사용자별 자격증명과 무관하다 — 인증 안내를 띄우면 거짓이다.
+    if SUMMARIZE_BACKEND != "agent_cli":
+        return {"available": True, "reason": "ok", "message": None}
+    if not auth.credential_status(user["username"]).get("configured"):
+        return {
+            "available": False,
+            "reason": "not_configured",
+            "message": SUMMARY_UNAVAILABLE_MESSAGES["not_configured"],
+        }
+    with _cred_health_lock:
+        health = _claude_cred_health.get(user["username"])
+    # 아직 스윕 전이면 유효성을 모른다 → 안 되는 것으로 단정하지 않는다(거짓 경고 방지).
+    if health is None:
+        return {"available": True, "reason": "unchecked", "message": None}
+    if health.get("reason") == "decrypt_failed":
+        reason = "decrypt_failed"
+    elif health.get("valid") is False:
+        reason = "invalid"
+    else:
+        return {"available": True, "reason": "ok", "message": None}
+    return {
+        "available": False,
+        "reason": reason,
+        "message": SUMMARY_UNAVAILABLE_MESSAGES[reason],
+    }
+
+
 @app.get("/api/admin/claude-credential-health")
 def admin_claude_credential_health(user: dict = Depends(require_admin)) -> dict:
     """관리자용 자격증명 헬스 집계(secret 없음) — '1명 vs 전체' 영향 범위 판단용.
