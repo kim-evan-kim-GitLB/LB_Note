@@ -264,12 +264,17 @@ class MeetingStore:
         summary: dict,
         action_items: list,
         expected_updated_at: str | None,
+        gate_summary: dict | None = None,
     ) -> dict | None:
         """재요약 결과(summary+actionItems) 전면 교체 — 적용 직전 현행을 meeting_backup 에 스냅샷.
 
         구조 전면 교체이므로 summary 편집(text-only) 검증을 거치지 않는 별도 경로다. compare(If-Match)
         +백업+교체를 단일 _lock 구간에서 원자 수행한다(undo 안전·lost-update 방지). ownerId/transcript/
         title 등 다른 필드는 보존하고 summary·actionItems·updatedAt 만 갱신한다. 없으면 None.
+
+        gate_summary 는 재요약이 게이트를 다시 돌린 결과다. 같이 갱신하지 않으면 화면의 "요약
+        근거에서 제외된 구간" 안내가 옛 판정을 가리켜, 새 요약과 어긋난 설명을 하게 된다.
+        백업 스냅샷에도 담아 undo 가 요약과 안내를 함께 되돌리게 한다.
         """
         with self._lock:
             row = self._conn.execute(
@@ -284,6 +289,7 @@ class MeetingStore:
             snapshot = {
                 "summary": cur.get("summary"),
                 "actionItems": cur.get("actionItems", []),
+                "gateSummary": cur.get("gateSummary"),
             }
             self._conn.execute(
                 "INSERT INTO meeting_backup (meeting_id, created_at, reason, data) VALUES (?,?,?,?)",
@@ -291,6 +297,8 @@ class MeetingStore:
             )
             cur["summary"] = summary
             cur["actionItems"] = action_items
+            if gate_summary is not None:
+                cur["gateSummary"] = gate_summary
             cur["updatedAt"] = _next_etag(cur.get("updatedAt"))
             self._persist_locked(cur)
             self._conn.commit()
@@ -324,6 +332,10 @@ class MeetingStore:
             snap = json.loads(brow["data"])
             cur["summary"] = snap.get("summary")
             cur["actionItems"] = snap.get("actionItems", [])
+            # 게이트 안내도 함께 되돌린다. 구 백업(이 필드 이전)은 키가 없으므로 현행을 남긴다 —
+            # 없는 값으로 덮어 안내를 지우는 것보다 낫다.
+            if "gateSummary" in snap:
+                cur["gateSummary"] = snap.get("gateSummary")
             cur["updatedAt"] = _next_etag(cur.get("updatedAt"))
             self._persist_locked(cur)
             self._conn.execute("DELETE FROM meeting_backup WHERE id=?", (brow["id"],))

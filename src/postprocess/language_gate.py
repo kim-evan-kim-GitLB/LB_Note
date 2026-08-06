@@ -37,6 +37,20 @@ REASON_SPEECH_RATE = "speech_rate_burst"    # 세그먼트 길이 대비 문자 
 REASON_BOILERPLATE = "boilerplate"          # 자막·영상 상용구(학습데이터 유래)
 REASON_MOSTLY_NON_KO = "mostly_non_korean"  # 비한국어 우세(회색지대)
 
+# 사용자에게 보여줄 한글 사유. 코드 옆에 두는 이유 — 사유를 추가하고 문구를 빠뜨리면
+# 화면에 영문 코드가 그대로 뜬다. 프론트는 이 문구를 **그대로 표시**한다(재가공 금지 규약).
+REASON_LABELS = {
+    REASON_NON_KOREAN: "한국어가 아닌 문장",
+    REASON_MOSTLY_NON_KO: "한국어보다 외국어가 많음",
+    REASON_SPEECH_RATE: "말 속도에 비해 글자가 지나치게 많음",
+    REASON_BOILERPLATE: "자막 상용구(회의 발화 아님)",
+}
+
+
+def reason_label(code: str) -> str:
+    """사유 코드 → 한글 문구. 모르는 코드는 코드를 그대로 보여준다(조용히 감추지 않는다)."""
+    return REASON_LABELS.get(code, code)
+
 _HANGUL_RE = re.compile(r"[가-힣]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 

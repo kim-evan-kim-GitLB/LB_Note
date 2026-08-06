@@ -35,6 +35,7 @@ from src.postprocess.stages.summarize import SummarizeStage
 from src.postprocess.summarize_schema import ground_summary
 from src.postprocess.web_contract import (
     _action_items_from_payload,
+    build_gate_summary,
     build_meeting_contract_from_segments,
 )
 
@@ -256,6 +257,13 @@ def _enrich_with_core(
     contract["_duration_seconds"] = duration
     # 관측용 메타(웹 계약 필드 아님 — 호출부가 로깅·진단에 쓰고 저장 전에 떼어낸다).
     contract["_core_meta"] = core.get("coreMeta") or {}
+    # 게이트 판정은 **공개 계약**이다(_ 접두 아님). 사용자가 "왜 이 구간이 요약에 없나"를
+    # 물었을 때 답할 수 있어야 하고, 회의와 함께 저장돼 새로고침 후에도 남아야 한다.
+    contract["gateSummary"] = build_gate_summary(
+        contract["_core_meta"],
+        core_segments(seg_dicts),
+        min_excluded=config.GATE_NOTICE_MIN_EXCLUDED,
+    )
     return contract
 
 
@@ -312,6 +320,9 @@ def enrich_to_contract(
         seg_dicts, action_items=action_items, summary=summary
     )
     contract["_duration_seconds"] = duration
+    # 레거시 경로에는 언어 게이트가 없다. 필드를 빼면 프론트가 "구버전 응답"과 "제외 0건"을
+    # 구분할 수 없으므로, 같은 모양의 빈 요약을 실어 계약을 일정하게 유지한다.
+    contract["gateSummary"] = build_gate_summary(None, [], min_excluded=0)
     return contract
 
 

@@ -168,6 +168,10 @@ LANG_GATE_LOW_CONF_RATIO = float(os.getenv("LANG_GATE_LOW_CONF_RATIO", "0.45"))
 LANG_OUT_MIN_RATIO = float(os.getenv("LANG_OUT_MIN_RATIO", "0.20"))
 # 비한국어 산출 수리 콜 사용 여부. 끄면 수리 없이 곧바로 드롭/flag 로 처리한다.
 CORE_LOCALIZE_ENABLED = os.getenv("CORE_LOCALIZE_ENABLED", "1") not in ("", "0", "false", "False")
+# 게이트 제외 구간을 회의록 화면에 알리는 최소 개수. 이 값 미만이면 아무것도 표시하지 않는다.
+# 적응형 재디코딩 이후 대부분의 회의에서 제외는 0 건이라, 상시 노출은 근거 없는 불안만 만든다.
+# 0 으로 두면 안내를 끈 것과 같다(운영에서 소음이 되면 여기서 잠근다).
+GATE_NOTICE_MIN_EXCLUDED = int(os.getenv("GATE_NOTICE_MIN_EXCLUDED", "1"))
 
 
 # --- 다중 agent core (라우터 + 병렬 전문 agent + critic 1패스, 2026-07-30 결정) ---
