@@ -15,9 +15,11 @@
 - **판정과 적용을 분리**한다. critic 은 판정만, 적용(드롭·플래그·보강)은 이 모듈이 결정적으로.
 - **어느 단계가 실패해도 회의를 죽이지 않는다**(빈 결과로 degrade). 요약 실패 ≠ 전사 유실.
 
-병렬 실행 주의: 자격증명(agent_cli._active_credential)과 취소 이벤트는 ContextVar 라 새 스레드에
-자동 전파되지 않는다. 그래서 `contextvars.copy_context()` 사본을 워커마다 만들어 그 안에서
-호출한다 — 사본이 아니면 "cannot enter context: already entered" 로 깨진다.
+병렬 실행 주의: 자격증명(agent_cli._active_credential)·취소 이벤트·실패카운터는 ContextVar 라
+새 스레드에 자동 전파되지 않는다. 그래서 **제출 스레드에서** 값을 스냅샷해 워커에서 다시 심는다
+(_run_parallel). 워커 안에서 copy_context() 를 부르면 그 스레드의 빈 컨텍스트를 복사해
+자격증명이 조용히 사라진다 — 실사고 원인이었다. 같은 Context 객체를 동시에 run 하면
+"cannot enter context: already entered" 로 깨지므로 Context.run 도 쓰지 않는다.
 """
 from __future__ import annotations
 
@@ -66,8 +68,8 @@ _DIRECTIVE_STRICT_CRITIC = (
 # 삼켜진 실패 카운터 — run_meeting_core 1회 실행 범위.
 # 여기서 세는 실패들은 전부 "회의 전체를 죽이지 않기 위해" 의도적으로 흡수하는 것들이다.
 # 그런데 흡수만 하고 흔적을 안 남기면 산출이 빈약할 때 원인을 알 수 없다(실제 사고 사례).
-# ContextVar 를 쓰는 이유: _run_parallel 이 contextvars.copy_context() 로 워커를 돌리므로
-# 워커에서도 같은 dict 객체가 보이고, 회의 두 건이 동시 실행돼도 서로 섞이지 않는다.
+# ContextVar 를 쓰는 이유: _run_parallel 이 제출 스레드의 값을 워커에 다시 심으므로 워커에서도
+# 같은 dict 객체가 보이고, 회의 두 건이 동시 실행돼도 서로 섞이지 않는다.
 _FAILURES: contextvars.ContextVar[dict] = contextvars.ContextVar("core_failures")
 
 
@@ -93,8 +95,13 @@ def _directives(plan: meeting_profile.Plan, *, for_critic: bool = False) -> str:
 def _run_parallel(tasks: list) -> list:
     """thunk 목록을 병렬 실행하고 입력 순서로 결과를 돌려준다(개별 실패는 None).
 
-    ContextVar(자격증명·취소)를 워커에 넘기기 위해 컨텍스트 **사본**에서 실행한다
-    (같은 Context 를 동시에 run 하면 "cannot enter context" 로 깨진다).
+    ContextVar(자격증명·취소·실패카운터)를 워커에 넘긴다. **반드시 제출 스레드에서 값을
+    스냅샷**하고 워커에서 다시 심는다 — 스레드는 컨텍스트를 상속하지 않으므로, 워커 안에서
+    copy_context() 를 부르면 그 스레드의 **빈** 컨텍스트를 복사해 자격증명이 조용히 사라진다.
+    (실사고 2026-08-06: 배포에서 요약/추출이 전부 빈 값. 워커가 전역 폴백으로 떨어져 실패했고,
+    같은 이유로 _FAILURES 까지 소실돼 감사로그에 failures=none 이 남아 원인이 안 보였다.
+    dev 는 전역 claude 로그인이 폴백을 성공시켜 이 버그를 가린다 — 테스트로 고정할 것.)
+    같은 Context 객체를 동시에 run 하면 "cannot enter context" 로 깨지므로 Context.run 은 쓰지 않는다.
     max_workers 는 회의 1건 내 상한(CORE_MAX_PARALLEL) — 서버 전체 동시성은 상위 세마포어 담당.
 
     단, 인증 만료(AgentCLIAuthError)와 취소(OperationCancelled)는 **삼키지 않고 전파**한다.
@@ -104,16 +111,23 @@ def _run_parallel(tasks: list) -> list:
     if not tasks:
         return []
 
+    # 제출 스레드의 ContextVar 값 스냅샷(자격증명·취소 이벤트·실패카운터 등 전부).
+    snapshot = list(contextvars.copy_context().items())
+
     def _call(thunk):
-        ctx = contextvars.copy_context()
+        # 워커 스레드에 값을 심고, 끝나면 원복한다(풀 스레드가 재사용되므로 누수 금지).
+        tokens = [(var, var.set(val)) for var, val in snapshot]
         try:
-            return ctx.run(thunk)
+            return thunk()
         except _PROPAGATE:
             raise
         except Exception:  # noqa: BLE001 — 한 창의 실패가 회의 전체를 죽이지 않는다
             traceback.print_exc()
             _count_failure("worker")   # 삼킨 실패를 세어 coreMeta 로 올린다(관측)
             return None
+        finally:
+            for var, token in reversed(tokens):
+                var.reset(token)
 
     if len(tasks) == 1:
         return [_call(tasks[0])]
