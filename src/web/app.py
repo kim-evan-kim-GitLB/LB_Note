@@ -45,6 +45,7 @@ from src.web import (
 )
 
 from src.cancellation import OperationCancelled
+from src.progress import use_progress
 from src.postprocess.backends.agent_cli import (
     AgentCLIAuthError,
     claude_auth_status,
@@ -1117,8 +1118,31 @@ def _set_phase(job_id: str, phase: str) -> None:
             }
         m["phase"] = phase
         m["phase_at"] = now
+        m.pop("progress", None)  # 단계가 바뀌면 이전 단계의 세부 진행은 무효다(옛 "창 3/8" 잔상 방지)
         if phase in ("transcribing", "summarizing") and m["started_at"] is None:
             m["started_at"] = now
+
+
+def _progress_reporter(job_id: str):
+    """core 진행 이벤트를 잡 메타에 기록하는 콜백(src.progress 채널에 심는다).
+
+    요약/추출은 회의 1건에 십수 분이 걸릴 수 있고, 그동안 phase 는 'summarizing' 하나로 고정된다.
+    세부 진행이 없으면 화면이 "멈춤"과 "오래 걸림"을 구분할 수 없어 사용자가 새로고침·재시도로
+    같은 회의를 두 번 돌린다(실사고 2026-08-06: 12.7분 무정보 대기).
+
+    문구는 만들지 않는다 — 단계/개수만 저장하고 사용자 문구는 _job_reason_hint 가 확정한다.
+    _jobs_lock 하에서만 만지고, 잡이 이미 purge 된 경우는 조용히 무시한다.
+    """
+
+    def _report(event: dict) -> None:
+        with _jobs_lock:
+            m = _job_meta.get(job_id)
+            if m is None:  # purge 된 잡 — 기록할 곳이 없다(보고는 실패해선 안 되므로 조용히)
+                return
+            m["progress"] = dict(event)
+            m["progress_at"] = time.monotonic()
+
+    return _report
 
 
 def _job_phase(job_id: str) -> str | None:
@@ -1355,7 +1379,11 @@ def _run_ai_job(
             _set_phase(job_id, "summarizing")  # LLM 슬롯 확보 → 요약/추출 진행
             _inflight_delta("llm", 1)
             try:
-                with use_credential(credential), use_cancel_event(cancel):
+                with (
+                    use_credential(credential),
+                    use_cancel_event(cancel),
+                    use_progress(_progress_reporter(job_id)),
+                ):
                     contract = enrich_to_contract(
                         seg_dicts,
                         duration,
@@ -1499,6 +1527,10 @@ def ai_job(job_id: str, user: dict = Depends(require_user_active)) -> dict:
             if j.get("status") in ("queued", "processing"):
                 out["elapsedSec"] = round(now - m["created_at"], 1)  # 접수 후 총 경과
                 out["phaseElapsedSec"] = round(now - m["phase_at"], 1)  # 현 단계 경과
+                # 단계 내 세부 진행(요약 창 k/n 등). 프론트는 이 값이 **변하는지**로 잡의 생존을
+                # 판단해 폴링 마감을 연장한다 — 없으면 오래 걸리는 회의를 살아있는데도 끊는다.
+                if m.get("progress"):
+                    out["progress"] = dict(m["progress"])
             # STT 슬롯 대기 중이면 '내 앞에 몇 건'인지 — 경합(누가 쓰는 중) 여부를 사용자가 알 수 있게.
             if j.get("status") == "queued" and m["phase"] == "waiting_stt":
                 created = m["created_at"]
@@ -1631,9 +1663,37 @@ def _job_reason_hint(out: dict) -> str | None:
         if phase == "transcribing":
             return "전사(STT) 진행 중입니다."
         if phase == "summarizing":
-            return "요약/추출 진행 중입니다."
+            return _summarizing_hint(out.get("progress"))
         return "처리 중입니다."
     return None
+
+
+# core 진행 단계 → 사용자 문구. 문구는 **서버가 확정**한다(게이트 label 과 같은 규약).
+# 단계를 추가하고 여기 문구를 빠뜨리면 아래 기본 문구로 떨어진다(빈 문구는 나가지 않는다).
+_SUMMARIZING_STAGE_MESSAGES = {
+    "reduce": "부분 요약을 하나로 병합하는 중입니다.",
+    "critic": "요약·액션의 근거를 검증하는 중입니다.",
+    "localize": "한국어 출력을 정리하는 중입니다.",
+    "finalize": "근거·타임스탬프를 맞추고 마무리하는 중입니다.",
+}
+
+
+def _summarizing_hint(prog: object) -> str:
+    """요약 단계의 세부 진행 → 한 줄 문구. 진행 정보가 없으면 기존 문구를 유지한다.
+
+    긴 회의는 이 단계에서 십수 분을 쓴다. "창 3/8" 처럼 움직이는 숫자를 주지 않으면 사용자가
+    멈춘 것으로 보고 새로고침해 같은 회의를 두 번 돌린다.
+    """
+    base = "요약/추출 진행 중입니다."
+    if not isinstance(prog, dict):
+        return base
+    stage = prog.get("stage")
+    if stage == "analyze":
+        total, done = prog.get("total"), prog.get("done")
+        if isinstance(total, int) and isinstance(done, int) and total > 0:
+            return f"{base} 구간 {done}/{total} 완료."
+        return base
+    return _SUMMARIZING_STAGE_MESSAGES.get(stage, base)
 
 
 @app.post("/api/ai/jobs/{job_id}/cancel")
@@ -1801,7 +1861,11 @@ def _run_regenerate_job(
             _set_phase(job_id, "summarizing")  # LLM 슬롯 확보 → 재요약 진행
             _inflight_delta("llm", 1)
             try:
-                with use_credential(credential), use_cancel_event(cancel):
+                with (
+                    use_credential(credential),
+                    use_cancel_event(cancel),
+                    use_progress(_progress_reporter(job_id)),
+                ):
                     if stt_config.CORE_ENABLED:
                         # 재요약도 초기 처리와 **같은 core** 를 탄다(언어 게이트·라우팅·critic 동일).
                         # 두 경로가 갈리면 "재요약하면 결과가 달라진다"는 혼선이 생긴다.

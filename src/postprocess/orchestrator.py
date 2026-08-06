@@ -24,10 +24,11 @@
 from __future__ import annotations
 
 import contextvars
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from src import config
+from src import config, progress
 from src.cancellation import OperationCancelled
 from src.postprocess import language_gate, meeting_profile
 from src.postprocess.backends import get_llm_backend
@@ -92,8 +93,12 @@ def _directives(plan: meeting_profile.Plan, *, for_critic: bool = False) -> str:
     return "\n\n".join(parts)
 
 
-def _run_parallel(tasks: list) -> list:
+def _run_parallel(tasks: list, *, on_done=None) -> list:
     """thunk 목록을 병렬 실행하고 입력 순서로 결과를 돌려준다(개별 실패는 None).
+
+    on_done: 태스크 1개가 끝날 때마다(성공·실패 무관) 호출 — 진행 표시용. 여러 워커에서
+    동시에 불리므로 호출부가 잠금을 책임진다. 여기서 세지 않는 이유는 "몇 개 시도가 끝났나"가
+    호출부의 단계 개념(창 k/n)과 같아야 하기 때문이다.
 
     ContextVar(자격증명·취소·실패카운터)를 워커에 넘긴다. **반드시 제출 스레드에서 값을
     스냅샷**하고 워커에서 다시 심는다 — 스레드는 컨텍스트를 상속하지 않으므로, 워커 안에서
@@ -118,13 +123,22 @@ def _run_parallel(tasks: list) -> list:
         # 워커 스레드에 값을 심고, 끝나면 원복한다(풀 스레드가 재사용되므로 누수 금지).
         tokens = [(var, var.set(val)) for var, val in snapshot]
         try:
-            return thunk()
-        except _PROPAGATE:
-            raise
-        except Exception:  # noqa: BLE001 — 한 창의 실패가 회의 전체를 죽이지 않는다
-            traceback.print_exc()
-            _count_failure("worker")   # 삼킨 실패를 세어 coreMeta 로 올린다(관측)
-            return None
+            try:
+                return thunk()
+            except _PROPAGATE:
+                raise
+            except Exception:  # noqa: BLE001 — 한 창의 실패가 회의 전체를 죽이지 않는다
+                traceback.print_exc()
+                _count_failure("worker")   # 삼킨 실패를 세어 coreMeta 로 올린다(관측)
+                return None
+            finally:
+                # 원복 **전에** 부른다 — 진행 보고도 ContextVar(리포터)를 타므로, 원복 뒤에
+                # 부르면 워커에서는 리포터가 사라져 진행 표시가 조용히 멈춘다(실측).
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception:  # noqa: BLE001 — 보고 실패가 회의를 죽이지 않는다
+                        traceback.print_exc()
         finally:
             for var, token in reversed(tokens):
                 var.reset(token)
@@ -444,7 +458,20 @@ def run_meeting_core(
                     ctx={"extra_directives": directives, "low_conf_ids": low_conf},
                 )
             )
-    results = _run_parallel(tasks)
+    # 진행 표시: 이 단계가 회의 시간의 대부분을 쓴다(창 수 x LLM 콜). 창 하나가 끝날 때마다
+    # 보고해 사용자가 "멈춘 것"과 "오래 걸리는 것"을 구분할 수 있게 한다.
+    done_lock = threading.Lock()
+    done_count = 0
+
+    def _task_done() -> None:
+        nonlocal done_count
+        with done_lock:
+            done_count += 1
+            n = done_count
+        progress.report("analyze", done=n, total=len(tasks))
+
+    progress.report("analyze", done=0, total=len(tasks))
+    results = _run_parallel(tasks, on_done=_task_done)
     sum_parts = [r for r in results[:n_sum] if r is not None]
     ex_parts = [r for r in results[n_sum:] if r is not None]
     # `calls` 는 **계획된** 콜 수다(실행 전 태스크 수). 성공 수와 구분하지 않으면
@@ -468,6 +495,7 @@ def run_meeting_core(
             reduced = None
             if sum_on:
                 meta["calls"]["reduce"] = 1
+                progress.report("reduce")
                 try:
                     reduced = ReduceStage().run(
                         [p.to_dict() for p in sum_parts],
@@ -493,6 +521,7 @@ def run_meeting_core(
         items, s_map, a_map = _items_for_critic(summary or MeetingSummary.empty(), actions)
         if items["summary_items"] or items["action_items"]:
             meta["calls"]["critic"] = 1
+            progress.report("critic")
             body = transcript_with_ids(kept, low_conf)
             try:
                 critic_result = CriticStage().run(
@@ -523,6 +552,7 @@ def run_meeting_core(
                     meta["critic"]["actionsAdded"] = len(critic_result.missing_actions)
 
     # ---------- Stage 4a: 출력 언어 보장(결정적 검사 → 필요 시 수리 1콜 → 드롭/flag) ----------
+    progress.report("localize")
     summary, actions, lang_stats = _enforce_korean(
         summary,
         actions,
@@ -533,6 +563,7 @@ def run_meeting_core(
     meta["language"] = lang_stats
 
     # ---------- Stage 4b: 결정적 적용·그라운딩 ----------
+    progress.report("finalize")
     if summary is not None:
         summary = ground_summary(summary, kept, low_conf)
     actions = _ground_actions(actions, kept, low_conf)
