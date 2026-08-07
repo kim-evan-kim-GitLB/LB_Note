@@ -323,3 +323,62 @@ def test_http_apply_stale_if_match_412():
             headers={**h, "If-Match": '"stale"'},
         )
         assert r.status_code == 412, r.text
+
+
+# ---------- 빈 산출 진단(diag/reasonHint) ----------
+# 실사고 후속(2026-08-07): 재요약 완료 지점이 diag 를 싣지 않아, 재요약 결과가 비어도
+# _empty_output_hint 가 발동할 수 없었다(그 함수는 diag 를 읽는다). 재요약은 "요약이 비었다" 를
+# 되살리는 복구 경로이므로, 여기서 원인이 안 보이면 사고가 그대로 반복된다.
+def _poll(client, h, job_id, tries=200):
+    for _ in range(tries):
+        jr = client.get(f"/api/ai/jobs/{job_id}", headers=h).json()
+        if jr["status"] in ("done", "error", "cancelled"):
+            return jr
+        time.sleep(0.05)
+    raise AssertionError("재요약 잡이 끝나지 않았습니다")
+
+
+def test_http_regenerate_done_carries_diag():
+    """업로드 경로와 **같은 진단 키**가 재요약 응답에도 실려야 한다."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _h(auth, appmod)
+        m = _make(client, h)
+        job_id = client.post(f"/api/meetings/{m['id']}/regenerate", headers=h).json()["jobId"]
+        jr = _poll(client, h, job_id)
+        assert jr["status"] == "done", jr
+        assert jr.get("diag") is not None, "재요약 응답에 diag 가 없다(원인 판별 불가)"
+        assert set(jr["diag"]) >= {"summaryEmpty", "actionsEmpty", "failures", "callsOk", "cases"}
+
+
+def test_http_regenerate_empty_output_explains_itself():
+    """passthrough(요약 미호출) → 산출이 비고, 그 이유가 reasonHint 로 내려온다."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _h(auth, appmod)
+        m = _make(client, h)
+        job_id = client.post(f"/api/meetings/{m['id']}/regenerate", headers=h).json()["jobId"]
+        jr = _poll(client, h, job_id)
+        assert jr["diag"]["summaryEmpty"] is True, jr["diag"]
+        hint = jr.get("reasonHint")
+        assert hint, "빈 산출인데 원인 문구가 없다 — 사용자가 지난 사고와 똑같이 이유를 알 수 없다"
+        assert "설정" in hint or "실패" in hint, hint
+
+
+def test_http_regenerate_success_has_no_false_hint():
+    """산출이 정상이면 힌트를 붙이지 않는다 — 성공한 재요약에 거짓 경고가 뜨면 안 된다."""
+    with tempfile.TemporaryDirectory() as td, _client_for(Path(td), "admin:pw1") as (auth, appmod, client):
+        h = _h(auth, appmod)
+        m = _make(client, h)
+        orig = appmod.run_meeting_core
+        appmod.run_meeting_core = lambda *a, **k: {
+            "summary": {"agenda": [{"title": "안건1", "items": []}], "backend": "fake"},
+            "actionItems": [{"text": "할 일"}],
+            "coreMeta": {"failures": {}, "callsOk": {"summarize": 1, "extract": 1}, "plan": {"cases": []}},
+        }
+        try:
+            job_id = client.post(f"/api/meetings/{m['id']}/regenerate", headers=h).json()["jobId"]
+            jr = _poll(client, h, job_id)
+        finally:
+            appmod.run_meeting_core = orig
+        assert jr["status"] == "done", jr
+        assert jr["diag"]["summaryEmpty"] is False and jr["diag"]["actionsEmpty"] is False
+        assert jr.get("reasonHint") is None, f"정상 산출인데 힌트가 붙었다: {jr.get('reasonHint')}"
