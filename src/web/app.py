@@ -1894,7 +1894,14 @@ def _run_regenerate_job(
             core_meta, segments, min_excluded=stt_config.GATE_NOTICE_MIN_EXCLUDED
         )
         _audit_core_meta(job_id, core_meta)
-        _mark_job(job_id, {"status": "done", "result": result})
+        # 업로드 경로와 **같은 진단**을 실어야 한다 — 재요약은 "요약이 비었다" 를 되살리는
+        # 복구 경로다. 여기에 diag 가 없으면 _empty_output_hint 가 발동할 수 없어(diag 를 읽는다)
+        # 재요약 결과가 또 비어도 사용자는 지난번과 똑같이 이유를 알 수 없다(2026-08-07).
+        # _job_diag 는 계약 dict 의 '_core_meta' 키를 보므로 core_meta 를 그 형태로 감싼다.
+        _mark_job(
+            job_id,
+            {"status": "done", "result": result, "diag": _job_diag({"_core_meta": core_meta}, result)},
+        )
     except OperationCancelled:  # STT 배치 경계 취소 + agent_cli 취소(하위 타입) 공통
         _mark_job(job_id, {"status": "cancelled"})
     except AgentCLIAuthError as e:
